@@ -1,8 +1,10 @@
 package orchestrator
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,7 +33,7 @@ func (n *NotificationAdapter) Name() string {
 
 // Notify implements the NotificationChannel interface
 func (n *NotificationAdapter) Notify(ctx context.Context, stats *BackupStats) error {
-	n.logger.Info("%s: starting", n.notifier.Name())
+	n.logger.Info("%s: starting...", n.notifier.Name())
 	n.logger.Debug("=== NotificationAdapter.Notify() called for '%s' notifier ===", n.notifier.Name())
 
 	if !n.notifier.IsEnabled() {
@@ -119,17 +121,7 @@ func (n *NotificationAdapter) convertBackupStatsToNotificationData(stats *Backup
 	}
 
 	// Determine storage statuses
-	localStatus := strings.TrimSpace(stats.LocalStatus)
-	if localStatus == "" {
-		switch notify.StatusFromExitCode(stats.ExitCode) {
-		case notify.StatusSuccess:
-			localStatus = "ok"
-		case notify.StatusWarning:
-			localStatus = "warning"
-		default:
-			localStatus = "error"
-		}
-	}
+	localStatus := EffectiveLocalStatus(stats)
 
 	secondaryStatus := strings.TrimSpace(stats.SecondaryStatus)
 	if secondaryStatus == "" {
@@ -155,13 +147,9 @@ func (n *NotificationAdapter) convertBackupStatsToNotificationData(stats *Backup
 
 	// Email/Telegram status summaries
 	emailStatus := stats.EmailStatus
-	if emailStatus == "" {
-		emailStatus = "disabled"
-	}
+	emailStatus = cmp.Or(emailStatus, "disabled")
 	telegramStatus := stats.TelegramStatus
-	if telegramStatus == "" {
-		telegramStatus = "N/A"
-	}
+	telegramStatus = cmp.Or(telegramStatus, "N/A")
 
 	// Use precomputed compression ratio (savings %) if available
 	compressionRatio := stats.CompressionSavingsPercent
@@ -184,6 +172,8 @@ func (n *NotificationAdapter) convertBackupStatsToNotificationData(stats *Backup
 		secondaryPercent = formatPercentString(calculateUsagePercent(stats.SecondaryUsedSpace, stats.SecondaryTotalSpace))
 	}
 
+	pbs := convertPBSTarget(stats)
+
 	// Issue counts and categories are snapshotted immediately before the
 	// notification group starts, so all notifiers see the same pre-notification
 	// totals. Re-parsing the log here per-notifier would over-count warnings
@@ -191,6 +181,11 @@ func (n *NotificationAdapter) convertBackupStatsToNotificationData(stats *Backup
 	errorCount := stats.ErrorCount
 	warningCount := stats.WarningCount
 	logCategories := append([]notify.LogCategory(nil), stats.LogCategories...)
+	if cat, ok := unloggedUpdateNotice(stats); ok {
+		logCategories = append(logCategories, cat)
+		sortLogCategories(logCategories)
+		warningCount++
+	}
 	totalIssues := errorCount + warningCount
 
 	// Extract filename from full path for email display
@@ -234,19 +229,16 @@ func (n *NotificationAdapter) convertBackupStatsToNotificationData(stats *Backup
 		LocalUsagePercent:  calculateUsagePercent(stats.LocalUsedSpace, stats.LocalTotalSpace),
 
 		// Local retention info
-		LocalRetentionPolicy:   stats.LocalRetentionPolicy,
-		LocalRetentionLimit:    stats.MaxLocalBackups,
-		LocalGFSDaily:          stats.LocalGFSDaily,
-		LocalGFSWeekly:         stats.LocalGFSWeekly,
-		LocalGFSMonthly:        stats.LocalGFSMonthly,
-		LocalGFSYearly:         stats.LocalGFSYearly,
-		LocalGFSCurrentDaily:   stats.LocalGFSCurrentDaily,
-		LocalGFSCurrentWeekly:  stats.LocalGFSCurrentWeekly,
-		LocalGFSCurrentMonthly: stats.LocalGFSCurrentMonthly,
-		LocalGFSCurrentYearly:  stats.LocalGFSCurrentYearly,
-		LocalBackups:           stats.LocalBackups,
+		LocalRetentionPolicy: stats.LocalRetentionPolicy,
+		LocalRetentionLimit:  stats.MaxLocalBackups,
+		LocalGFSDaily:        stats.LocalGFSDaily,
+		LocalGFSWeekly:       stats.LocalGFSWeekly,
+		LocalGFSMonthly:      stats.LocalGFSMonthly,
+		LocalGFSYearly:       stats.LocalGFSYearly,
+		LocalBackups:         stats.LocalBackups,
 
-		SecondaryEnabled:       stats.SecondaryEnabled,
+		// Configured: in the run, or on in backup.env and failed at startup.
+		SecondaryEnabled:       stats.SecondaryEnabled || stats.SecondaryStartupFailed,
 		SecondaryStatus:        secondaryStatus,
 		SecondaryStatusSummary: secondaryStatusSummary,
 		SecondaryCount:         stats.SecondaryBackups,
@@ -257,35 +249,44 @@ func (n *NotificationAdapter) convertBackupStatsToNotificationData(stats *Backup
 		SecondaryUsagePercent:  calculateUsagePercent(stats.SecondaryUsedSpace, stats.SecondaryTotalSpace),
 
 		// Secondary retention info
-		SecondaryRetentionPolicy:   stats.SecondaryRetentionPolicy,
-		SecondaryRetentionLimit:    stats.MaxSecondaryBackups,
-		SecondaryGFSDaily:          stats.SecondaryGFSDaily,
-		SecondaryGFSWeekly:         stats.SecondaryGFSWeekly,
-		SecondaryGFSMonthly:        stats.SecondaryGFSMonthly,
-		SecondaryGFSYearly:         stats.SecondaryGFSYearly,
-		SecondaryGFSCurrentDaily:   stats.SecondaryGFSCurrentDaily,
-		SecondaryGFSCurrentWeekly:  stats.SecondaryGFSCurrentWeekly,
-		SecondaryGFSCurrentMonthly: stats.SecondaryGFSCurrentMonthly,
-		SecondaryGFSCurrentYearly:  stats.SecondaryGFSCurrentYearly,
-		SecondaryBackups:           stats.SecondaryBackups,
+		SecondaryRetentionPolicy: stats.SecondaryRetentionPolicy,
+		SecondaryRetentionLimit:  stats.MaxSecondaryBackups,
+		SecondaryGFSDaily:        stats.SecondaryGFSDaily,
+		SecondaryGFSWeekly:       stats.SecondaryGFSWeekly,
+		SecondaryGFSMonthly:      stats.SecondaryGFSMonthly,
+		SecondaryGFSYearly:       stats.SecondaryGFSYearly,
+		SecondaryBackups:         stats.SecondaryBackups,
 
-		CloudEnabled:       stats.CloudEnabled,
+		CloudEnabled:       stats.CloudEnabled || stats.CloudStartupFailed,
 		CloudStatus:        cloudStatus,
 		CloudStatusSummary: cloudStatusSummary,
 		CloudCount:         stats.CloudBackups,
 
 		// Cloud retention info
-		CloudRetentionPolicy:   stats.CloudRetentionPolicy,
-		CloudRetentionLimit:    stats.MaxCloudBackups,
-		CloudGFSDaily:          stats.CloudGFSDaily,
-		CloudGFSWeekly:         stats.CloudGFSWeekly,
-		CloudGFSMonthly:        stats.CloudGFSMonthly,
-		CloudGFSYearly:         stats.CloudGFSYearly,
-		CloudGFSCurrentDaily:   stats.CloudGFSCurrentDaily,
-		CloudGFSCurrentWeekly:  stats.CloudGFSCurrentWeekly,
-		CloudGFSCurrentMonthly: stats.CloudGFSCurrentMonthly,
-		CloudGFSCurrentYearly:  stats.CloudGFSCurrentYearly,
-		CloudBackups:           stats.CloudBackups,
+		CloudRetentionPolicy: stats.CloudRetentionPolicy,
+		CloudRetentionLimit:  stats.MaxCloudBackups,
+		CloudGFSDaily:        stats.CloudGFSDaily,
+		CloudGFSWeekly:       stats.CloudGFSWeekly,
+		CloudGFSMonthly:      stats.CloudGFSMonthly,
+		CloudGFSYearly:       stats.CloudGFSYearly,
+		CloudBackups:         stats.CloudBackups,
+
+		PBSEnabled:       pbs.enabled,
+		PBSStatus:        pbs.status,
+		PBSStatusSummary: pbs.summary,
+		PBSCount:         pbs.count,
+		PBSFree:          pbs.free,
+		PBSUsed:          pbs.used,
+		PBSPercent:       pbs.percent,
+		PBSSpaceBytes:    pbs.spaceBytes,
+		PBSUsagePercent:  pbs.usagePercent,
+
+		PBSRetentionPolicy: pbs.policy,
+		PBSRetentionLimit:  stats.MaxPBSTargetBackups,
+		PBSGFSDaily:        pbs.gfsDaily,
+		PBSGFSWeekly:       pbs.gfsWeekly,
+		PBSGFSMonthly:      pbs.gfsMonthly,
+		PBSGFSYearly:       pbs.gfsYearly,
 
 		EmailStatus:    emailStatus,
 		TelegramStatus: telegramStatus,
@@ -293,6 +294,7 @@ func (n *NotificationAdapter) convertBackupStatsToNotificationData(stats *Backup
 		LocalPath:     stats.LocalPath,
 		SecondaryPath: stats.SecondaryPath,
 		CloudPath:     stats.CloudPath,
+		PBSStorageID:  stats.PBSTargetStorage,
 
 		ErrorCount:    errorCount,
 		WarningCount:  warningCount,
@@ -305,6 +307,83 @@ func (n *NotificationAdapter) convertBackupStatsToNotificationData(stats *Backup
 		CurrentVersion:      stats.CurrentVersion,
 		LatestVersion:       stats.LatestVersion,
 	}
+}
+
+// unloggedUpdateNotice returns the issue-list entry of an available update the run did not log.
+// A host whose daemon reports updates to healthchecks keeps the notice out of the run log, so it
+// does not raise the exit code the daemon hands to the backup check (issue #334); the
+// notifications still list it, built the way the log parser builds a logged WARNING. Where the
+// run did log it, the parsed categories already carry it and ok is false.
+func unloggedUpdateNotice(stats *BackupStats) (notify.LogCategory, bool) {
+	if stats == nil || !stats.NewVersionAvailable || stats.UpdateNoticeLogged || strings.TrimSpace(stats.LatestVersion) == "" {
+		return notify.LogCategory{}, false
+	}
+	label, example := splitCategoryAndExample(UpdateNoticeMessage(stats.LatestVersion, stats.CurrentVersion))
+	return notify.LogCategory{Label: label, Type: "WARNING", Count: 1, Example: example}, true
+}
+
+// EffectiveLocalStatus is the Local status the notifications and the dashboard outcome
+// show: the one step [6] wrote or, for a run that never reached it, the one the exit
+// code gives (0 ok, 1 warning, anything else error).
+func EffectiveLocalStatus(stats *BackupStats) string {
+	if stats == nil {
+		return ""
+	}
+	if status := strings.TrimSpace(stats.LocalStatus); status != "" {
+		return status
+	}
+	switch notify.StatusFromExitCode(stats.ExitCode) {
+	case notify.StatusSuccess:
+		return "ok"
+	case notify.StatusWarning:
+		return "warning"
+	default:
+		return "error"
+	}
+}
+
+// pbsNotification is the PBS part of the NotificationData.
+type pbsNotification struct {
+	enabled                                    bool
+	status, summary, policy                    string
+	count                                      int
+	free, used, percent                        string
+	spaceBytes                                 uint64
+	usagePercent                               float64
+	gfsDaily, gfsWeekly, gfsMonthly, gfsYearly int
+}
+
+// convertPBSTarget reads the outcome of the PBS block. PBS off (no outcome) is
+// "disabled" with the summary of a destination switched off, "0/<MAX_PBS_TARGET_BACKUPS>".
+// A count the block never got stays -1, so the summary reads "?/<M>"; a datastore space
+// it never read (no total) has no value.
+func convertPBSTarget(stats *BackupStats) pbsNotification {
+	r := stats.PBSTarget
+	if r == nil {
+		return pbsNotification{
+			status:  "disabled",
+			summary: formatBackupStatusSummary("", 0, stats.MaxPBSTargetBackups),
+		}
+	}
+	pbs := pbsNotification{
+		enabled:    true,
+		status:     strings.TrimSpace(r.Status),
+		summary:    formatBackupStatusSummary(r.RetentionPolicy, r.Backups, r.MaxBackups),
+		policy:     r.RetentionPolicy,
+		count:      r.Backups,
+		gfsDaily:   r.GFSDaily,
+		gfsWeekly:  r.GFSWeekly,
+		gfsMonthly: r.GFSMonthly,
+		gfsYearly:  r.GFSYearly,
+	}
+	if r.TotalBytes > 0 {
+		pbs.free = formatBytesHR(r.FreeBytes)
+		pbs.used = formatBytesHR(r.UsedBytes)
+		pbs.usagePercent = calculateUsagePercent(r.UsedBytes, r.TotalBytes)
+		pbs.percent = formatPercentString(pbs.usagePercent)
+		pbs.spaceBytes = r.FreeBytes
+	}
+	return pbs
 }
 
 // formatBytesHR formats bytes in human-readable format (using uint64)
@@ -365,19 +444,23 @@ func formatPercentString(percent float64) string {
 }
 
 func formatBackupStatusSummary(policy string, count, max int) string {
+	// A count never read (negative: a destination that failed at startup, a PBS block
+	// that got no count) is "?" in every form.
+	backups := strconv.Itoa(count)
+	if count < 0 {
+		backups = "?"
+	}
+
 	// GFS mode: show X/- (no fixed limit)
 	if policy == "gfs" {
-		return fmt.Sprintf("%d/-", count)
+		return backups + "/-"
 	}
 
 	// Simple mode: show X/Y or X/?
 	if max <= 0 {
-		if count <= 0 {
-			return "0/?"
-		}
-		return fmt.Sprintf("%d/?", count)
+		return backups + "/?"
 	}
-	return fmt.Sprintf("%d/%d", count, max)
+	return fmt.Sprintf("%s/%d", backups, max)
 }
 
 func (n *NotificationAdapter) recordNotifierStatus(stats *BackupStats, result *notify.NotificationResult) {
@@ -388,9 +471,7 @@ func (n *NotificationAdapter) recordNotifierStatus(stats *BackupStats, result *n
 	switch n.notifier.Name() {
 	case "Telegram":
 		base := strings.TrimSpace(stats.TelegramStatus)
-		if base == "" {
-			base = "unknown"
-		}
+		base = cmp.Or(base, "unknown")
 		statusDetail := describeNotificationResult(result)
 		if sub := telegramDeliverySubstate(result); sub != "" {
 			statusDetail = statusDetail + ", " + sub
@@ -425,6 +506,10 @@ func (n *NotificationAdapter) recordNotifierStatus(stats *BackupStats, result *n
 
 // setNotifyResult records channel -> severity into stats.NotifyResults, lazily allocating
 // the map. Safe on a nil stats / empty name.
+// notifyResultFiltered is the handoff severity of a channel NOTIFY_ON kept quiet this run: the daemon
+// does not ping it and keeps its row, where "disabled" (switched off) also prunes the row.
+const notifyResultFiltered = "filtered"
+
 func setNotifyResult(stats *BackupStats, name, severity string) {
 	if stats == nil || name == "" {
 		return

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -51,6 +52,9 @@ type networkRollbackHandle struct {
 	logPath    string
 	armedAt    time.Time
 	timeout    time.Duration
+	// beforeSnapshot is the network snapshot taken before the apply, in the
+	// diagnostics directory: the IP the rollback restores is read from it.
+	beforeSnapshot string
 }
 
 func (h *networkRollbackHandle) remaining(now time.Time) time.Duration {
@@ -102,7 +106,11 @@ func extractIPFromSnapshot(path, iface string) string {
 		}
 
 		fields := strings.Fields(line)
-		if len(fields) < 3 || fields[0] != iface {
+		if len(fields) < 3 {
+			continue
+		}
+		// iproute2 prints a VLAN link as name@parent (vmbr0.10@vmbr0).
+		if name, _, _ := strings.Cut(fields[0], "@"); name != iface {
 			continue
 		}
 
@@ -125,9 +133,7 @@ func extractIPFromSnapshot(path, iface string) string {
 			if parsed.To4() != nil {
 				return token
 			}
-			if firstIPv6 == "" {
-				firstIPv6 = token
-			}
+			firstIPv6 = cmp.Or(firstIPv6, token)
 		}
 		if firstIPv6 != "" {
 			return firstIPv6
@@ -180,9 +186,14 @@ func buildNetworkApplyNotCommittedError(ctx context.Context, logger *logging.Log
 	if handle != nil {
 		rollbackLog = strings.TrimSpace(handle.logPath)
 		rollbackMarker = strings.TrimSpace(handle.markerPath)
-		// Read original IP from before.txt snapshot (IP that will be restored by rollback)
-		if strings.TrimSpace(handle.workDir) != "" {
-			beforePath := filepath.Join(handle.workDir, "before.txt")
+		// Read original IP from the before snapshot (IP that will be restored by
+		// rollback): the diagnostics directory's before.txt, where the UI flow writes
+		// it, or the work directory's.
+		beforePath := strings.TrimSpace(handle.beforeSnapshot)
+		if beforePath == "" && strings.TrimSpace(handle.workDir) != "" {
+			beforePath = filepath.Join(handle.workDir, "before.txt")
+		}
+		if beforePath != "" {
 			originalIP = extractIPFromSnapshot(beforePath, iface)
 			logging.DebugStep(logger, "build not-committed error", "Original IP from %s: %s", beforePath, originalIP)
 		}
@@ -295,11 +306,15 @@ func armNetworkRollback(ctx context.Context, logger *logging.Logger, backupPath 
 		return nil, fmt.Errorf("create rollback directory: %w", err)
 	}
 	timestamp := nowRestore().Format("20060102_150405")
+	logPath, err := rollbackLogPath(fmt.Sprintf("network_rollback_%s.log", timestamp))
+	if err != nil {
+		return nil, err
+	}
 	handle = &networkRollbackHandle{
 		workDir:    baseDir,
 		markerPath: filepath.Join(baseDir, fmt.Sprintf("network_rollback_pending_%s", timestamp)),
 		scriptPath: filepath.Join(baseDir, fmt.Sprintf("network_rollback_%s.sh", timestamp)),
-		logPath:    filepath.Join(baseDir, fmt.Sprintf("network_rollback_%s.log", timestamp)),
+		logPath:    logPath,
 		armedAt:    time.Now(),
 		timeout:    timeout,
 	}
@@ -318,10 +333,7 @@ func armNetworkRollback(ctx context.Context, logger *logging.Logger, backupPath 
 	}
 	logging.DebugStep(logger, "arm network rollback", "Script written successfully (%d bytes)", len(script))
 
-	timeoutSeconds := int(timeout.Seconds())
-	if timeoutSeconds < 1 {
-		timeoutSeconds = 1
-	}
+	timeoutSeconds := max(int(timeout.Seconds()), 1)
 
 	if commandAvailable("systemd-run") {
 		logging.DebugStep(logger, "arm network rollback", "Arm timer via systemd-run (%ds)", timeoutSeconds)
@@ -473,7 +485,8 @@ func repairNICNamesWithUI(ctx context.Context, ui nicRepairUI, logger *logging.L
 		logging.DebugStep(logger, "NIC repair", "Conflicts detected: %d", len(plan.Conflicts))
 		var b strings.Builder
 		b.WriteString("Detected NIC name conflicts.\n\n")
-		b.WriteString("These interface names exist on the current system but map to different NICs in the backup inventory:\n\n")
+		b.WriteString(nicConflictsHeader(plan.Conflicts))
+		b.WriteString("\n\n")
 		for i, conflict := range plan.Conflicts {
 			if i >= 32 {
 				logging.DebugStep(logger, "NIC repair", "Conflict details truncated (showing first 32)")
@@ -519,13 +532,6 @@ func repairNICNamesWithUI(ctx context.Context, ui nicRepairUI, logger *logging.L
 		}
 	}
 	return result
-}
-
-// maybeRepairNICNamesCLI runs the shared NIC-name repair through a CLI UI. It
-// remains a thin entry point for tests that drive the flow with a bufio.Reader;
-// production code calls repairNICNamesWithUI via cliWorkflowUI.RepairNICNames.
-func maybeRepairNICNamesCLI(ctx context.Context, reader *bufio.Reader, logger *logging.Logger, archivePath string) *nicRepairResult {
-	return repairNICNamesWithUI(ctx, newCLIWorkflowUI(reader, logger), logger, archivePath)
 }
 
 func applyNetworkConfig(ctx context.Context, logger *logging.Logger) error {
@@ -678,7 +684,10 @@ func rollbackNetworkFilesNow(ctx context.Context, logger *logging.Logger, backup
 	timestamp := nowRestore().Format("20060102_150405")
 	markerPath := filepath.Join(baseDir, fmt.Sprintf("network_rollback_now_pending_%s", timestamp))
 	scriptPath := filepath.Join(baseDir, fmt.Sprintf("network_rollback_now_%s.sh", timestamp))
-	logPath = filepath.Join(baseDir, fmt.Sprintf("network_rollback_now_%s.log", timestamp))
+	logPath, err = rollbackLogPath(fmt.Sprintf("network_rollback_now_%s.log", timestamp))
+	if err != nil {
+		return "", err
+	}
 
 	logging.DebugStep(logger, "rollback network files", "Write rollback marker: %s", markerPath)
 	if err := restoreFS.WriteFile(markerPath, []byte("pending\n"), 0o640); err != nil {
@@ -693,7 +702,9 @@ func rollbackNetworkFilesNow(ctx context.Context, logger *logging.Logger, backup
 	}
 
 	logging.DebugStep(logger, "rollback network files", "Run rollback script now: %s", scriptPath)
-	output, runErr := restoreCmd.Run(ctx, "sh", scriptPath)
+	// The rollback runs even when ctx is cancelled: it is what undoes a network apply
+	// that a Ctrl+C or SIGTERM interrupted, and with the cancelled ctx it never started.
+	output, runErr := restoreCmd.Run(context.WithoutCancel(ctx), "sh", scriptPath)
 	if len(output) > 0 {
 		logger.Debug("Rollback script output: %s", strings.TrimSpace(string(output)))
 	}
@@ -713,6 +724,7 @@ func buildRollbackScript(markerPath, backupPath, logPath string, restartNetworki
 		"#!/bin/sh",
 		"set -eu",
 		fmt.Sprintf("LOG=%s", shellQuote(logPath)),
+		rollbackLogProbe,
 		fmt.Sprintf("MARKER=%s", shellQuote(markerPath)),
 		fmt.Sprintf("BACKUP=%s", shellQuote(backupPath)),
 		// RUNNING signals that the revert is actually in progress: it is written
@@ -905,13 +917,11 @@ func buildRollbackScript(markerPath, backupPath, logPath string, restartNetworki
 	return strings.Join(lines, "\n") + "\n"
 }
 
+// shellQuote single-quotes value for /bin/sh; an embedded single quote closes the
+// quoting, is escaped and reopens it. Every value is quoted: quoting only those with
+// whitespace or one of "'\$&;|<> let a BASE_DIR with ( ) or a backtick make every
+// rollback script a syntax error.
 func shellQuote(value string) string {
-	if value == "" {
-		return "''"
-	}
-	if !strings.ContainsAny(value, " \t\n\"'\\$&;|<>") {
-		return value
-	}
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 

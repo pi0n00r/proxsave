@@ -669,10 +669,6 @@ func TestApplyCollectorOverridesCopiesConfig(t *testing.T) {
 		CorosyncConfigPath: "/etc/corosync/corosync.conf",
 		VzdumpConfigPath:   "/etc/vzdump.conf",
 		PBSDatastorePaths:  []string{"/mnt/pbs1", "/mnt/pbs2"},
-
-		PBSRepository:  "pbs@pam!token",
-		PBSPassword:    "secret",
-		PBSFingerprint: "fingerprint",
 	}
 
 	var cc backup.CollectorConfig
@@ -720,9 +716,6 @@ func TestApplyCollectorOverridesCopiesConfig(t *testing.T) {
 	}
 	if len(cc.PBSDatastorePaths) != len(cfg.PBSDatastorePaths) || cc.PBSDatastorePaths[0] != cfg.PBSDatastorePaths[0] {
 		t.Fatalf("PBSDatastorePaths not copied correctly: %#v", cc.PBSDatastorePaths)
-	}
-	if cc.PBSRepository != cfg.PBSRepository || cc.PBSPassword != cfg.PBSPassword || cc.PBSFingerprint != cfg.PBSFingerprint {
-		t.Fatalf("PBS auth fields not copied correctly")
 	}
 }
 
@@ -935,7 +928,7 @@ func TestRunGoBackup_BundleAndDispatchFailure(t *testing.T) {
 	if _, err := os.Stat(rawArchivePath); err == nil || !os.IsNotExist(err) {
 		t.Fatalf("expected raw archive to be removed, stat err=%v", err)
 	}
-	if !strings.Contains(buf.String(), "Policy: simple") {
+	if !strings.Contains(buf.String(), "Retention policy: simple") {
 		t.Fatalf("expected retention policy log, got: %s", buf.String())
 	}
 }

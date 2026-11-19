@@ -1347,7 +1347,7 @@ func TestMaybeRepairNICNamesCLI_MoreThan32ConflictsTriggersTruncationBranch(t *t
 	sysClassNetPath = sysDir
 
 	var ifaceJSON []string
-	for i := 0; i < 33; i++ {
+	for i := range 33 {
 		oldName := fmt.Sprintf("eno%d", i)
 		newName := fmt.Sprintf("enp%d", i)
 		mac := fmt.Sprintf("aa:bb:cc:dd:ee:%02x", i)
@@ -1430,7 +1430,7 @@ func TestMaybeRepairNICNamesCLI_SurfacesApplyError(t *testing.T) {
 		t.Fatalf("write interfaces: %v", err)
 	}
 
-	restoreFS = mkdirAllFailFS{FS: fakeFS, failPath: "/tmp/proxsave", err: errors.New("boom")}
+	restoreFS = mkdirAllFailFS{FS: fakeFS, failPath: RestoreRunDir(), err: errors.New("boom")}
 
 	reader := bufio.NewReader(strings.NewReader(""))
 	// B/C2: an apply error must NOT be swallowed - surface it as a Failed result
@@ -1668,8 +1668,7 @@ func TestWaitForCommit_TimeoutShowsRollbackGuidance(t *testing.T) {
 	t.Run("timeout shows guidance", func(t *testing.T) {
 		ui := &fakeRestoreWorkflowUI{networkCommitErr: context.DeadlineExceeded}
 		err := makeFlow(ui).waitForCommit()
-		var notCommitted *NetworkApplyNotCommittedError
-		if !errors.As(err, &notCommitted) {
+		if _, ok := errors.AsType[*NetworkApplyNotCommittedError](err); !ok {
 			t.Fatalf("err=%v; want *NetworkApplyNotCommittedError", err)
 		}
 		if len(ui.shownMessages) == 0 {
@@ -1764,7 +1763,7 @@ func TestRollbackNetworkFilesNow_ErrorCasesAndScriptFailure(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if logPath != "/work/network_rollback_now_20260201_123456.log" {
+		if logPath != filepath.Join(RestoreRunDir(), "network_rollback_now_20260201_123456.log") {
 			t.Fatalf("logPath=%q", logPath)
 		}
 	})
@@ -1782,7 +1781,7 @@ func TestRollbackNetworkFilesNow_ErrorCasesAndScriptFailure(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "rollback script failed") {
 			t.Fatalf("err=%v want rollback script failed", err)
 		}
-		if logPath != "/work/network_rollback_now_20260201_123456.log" {
+		if logPath != filepath.Join(RestoreRunDir(), "network_rollback_now_20260201_123456.log") {
 			t.Fatalf("logPath=%q", logPath)
 		}
 	})
@@ -1813,7 +1812,9 @@ func TestRollbackNetworkFilesNow_DefaultWorkDirUsesTmpProxsave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rollbackNetworkFilesNow error: %v", err)
 	}
-	if logPath != "/tmp/proxsave/network_rollback_now_20260201_123456.log" {
+	// The script stays in the /tmp/proxsave work dir; its log goes to the restore's
+	// own directory, which survives the reboot the restore recommends.
+	if logPath != filepath.Join(RestoreRunDir(), "network_rollback_now_20260201_123456.log") {
 		t.Fatalf("logPath=%q", logPath)
 	}
 }
@@ -1835,7 +1836,7 @@ func TestShellQuote(t *testing.T) {
 	if got := shellQuote(""); got != "''" {
 		t.Fatalf("shellQuote empty=%q", got)
 	}
-	if got := shellQuote("simple"); got != "simple" {
+	if got := shellQuote("simple"); got != "'simple'" {
 		t.Fatalf("shellQuote simple=%q", got)
 	}
 	want := `'a b '\''c'\'''`
@@ -1868,4 +1869,11 @@ func TestRunCommandLogged_SuccessAndFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "false") || !strings.Contains(err.Error(), "failed") {
 		t.Fatalf("err=%v want wrapped failure", err)
 	}
+}
+
+// maybeRepairNICNamesCLI runs the shared NIC-name repair through a CLI UI. It
+// remains a thin entry point for tests that drive the flow with a bufio.Reader;
+// production code calls repairNICNamesWithUI via cliWorkflowUI.RepairNICNames.
+func maybeRepairNICNamesCLI(ctx context.Context, reader *bufio.Reader, logger *logging.Logger, archivePath string) *nicRepairResult {
+	return repairNICNamesWithUI(ctx, newCLIWorkflowUI(reader, logger), logger, archivePath)
 }

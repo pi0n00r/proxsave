@@ -16,14 +16,16 @@ import (
 
 func stubPreparedRestoreBundle(archivePath string, manifest *backup.Manifest) func(context.Context, *config.Config, *logging.Logger, string, RestoreWorkflowUI) (*backupCandidate, *preparedBundle, error) {
 	return func(ctx context.Context, cfg *config.Config, logger *logging.Logger, version string, ui RestoreWorkflowUI) (*backupCandidate, *preparedBundle, error) {
-		return &backupCandidate{
-				DisplayBase: "test",
-				Manifest:    manifest,
-			}, &preparedBundle{
-				ArchivePath: archivePath,
-				Manifest:    backup.Manifest{ArchivePath: archivePath},
-				cleanup:     func() {},
-			}, nil
+		candidate := &backupCandidate{
+			DisplayBase: "test",
+			Manifest:    manifest,
+		}
+		bundle := &preparedBundle{
+			ArchivePath: archivePath,
+			Manifest:    backup.Manifest{ArchivePath: archivePath},
+			cleanup:     func() {},
+		}
+		return candidate, bundle, nil
 	}
 }
 
@@ -40,20 +42,22 @@ func TestRunRestoreWorkflow_CleansPreparedBundleWhenPlanningFails(t *testing.T) 
 	restoreSystem = fakeSystemDetector{systemType: SystemTypePVE}
 	cleanupCalls := 0
 	prepareRestoreBundleFunc = func(ctx context.Context, cfg *config.Config, logger *logging.Logger, version string, ui RestoreWorkflowUI) (*backupCandidate, *preparedBundle, error) {
-		return &backupCandidate{
-				DisplayBase: "test",
-				Manifest: &backup.Manifest{
-					CreatedAt:     time.Unix(1700000000, 0),
-					ProxmoxType:   "pve",
-					ScriptVersion: "vtest",
-				},
-			}, &preparedBundle{
-				ArchivePath: "/bundle.tar",
-				Manifest:    backup.Manifest{ArchivePath: "/bundle.tar"},
-				cleanup: func() {
-					cleanupCalls++
-				},
-			}, nil
+		candidate := &backupCandidate{
+			DisplayBase: "test",
+			Manifest: &backup.Manifest{
+				CreatedAt:     time.Unix(1700000000, 0),
+				ProxmoxType:   "pve",
+				ScriptVersion: "vtest",
+			},
+		}
+		bundle := &preparedBundle{
+			ArchivePath: "/bundle.tar",
+			Manifest:    backup.Manifest{ArchivePath: "/bundle.tar"},
+			cleanup: func() {
+				cleanupCalls++
+			},
+		}
+		return candidate, bundle, nil
 	}
 	analyzeRestoreArchiveFunc = func(archivePath string, logger *logging.Logger) ([]Category, *RestoreDecisionInfo, error) {
 		return nil, &RestoreDecisionInfo{BackupType: SystemTypePVE}, nil
@@ -64,7 +68,7 @@ func TestRunRestoreWorkflow_CleansPreparedBundleWhenPlanningFails(t *testing.T) 
 	cfg := &config.Config{BaseDir: "/base"}
 	ui := &fakeRestoreWorkflowUI{modeErr: wantErr}
 
-	err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui)
+	err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, "")
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("err=%v; want %v", err, wantErr)
 	}
@@ -77,14 +81,12 @@ func TestRunRestoreWorkflow_ClusterPromptUsesArchivePayloadNotManifest(t *testin
 	origRestoreFS := restoreFS
 	origRestoreCmd := restoreCmd
 	origRestoreSystem := restoreSystem
-	origCompatFS := compatFS
 	origPrepare := prepareRestoreBundleFunc
 	origSafetyFS := safetyFS
 	t.Cleanup(func() {
 		restoreFS = origRestoreFS
 		restoreCmd = origRestoreCmd
 		restoreSystem = origRestoreSystem
-		compatFS = origCompatFS
 		prepareRestoreBundleFunc = origPrepare
 		safetyFS = origSafetyFS
 	})
@@ -92,7 +94,6 @@ func TestRunRestoreWorkflow_ClusterPromptUsesArchivePayloadNotManifest(t *testin
 	fakeFS := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(fakeFS.Root) })
 	restoreFS = fakeFS
-	compatFS = fakeFS
 	safetyFS = fakeFS
 	restoreCmd = runOnlyRunner{}
 	restoreSystem = fakeSystemDetector{systemType: SystemTypePVE}
@@ -134,7 +135,7 @@ func TestRunRestoreWorkflow_ClusterPromptUsesArchivePayloadNotManifest(t *testin
 		clusterMode:    ClusterRestoreSafe,
 	}
 
-	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui); err != nil {
+	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, ""); err != nil {
 		t.Fatalf("runRestoreWorkflowWithUI error: %v", err)
 	}
 	if ui.clusterRestoreModeCalls != 1 {
@@ -146,14 +147,12 @@ func TestRunRestoreWorkflow_CompatibilityUsesArchivePayloadNotManifest(t *testin
 	origRestoreFS := restoreFS
 	origRestoreCmd := restoreCmd
 	origRestoreSystem := restoreSystem
-	origCompatFS := compatFS
 	origPrepare := prepareRestoreBundleFunc
 	origSafetyFS := safetyFS
 	t.Cleanup(func() {
 		restoreFS = origRestoreFS
 		restoreCmd = origRestoreCmd
 		restoreSystem = origRestoreSystem
-		compatFS = origCompatFS
 		prepareRestoreBundleFunc = origPrepare
 		safetyFS = origSafetyFS
 	})
@@ -161,7 +160,6 @@ func TestRunRestoreWorkflow_CompatibilityUsesArchivePayloadNotManifest(t *testin
 	fakeFS := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(fakeFS.Root) })
 	restoreFS = fakeFS
-	compatFS = fakeFS
 	safetyFS = fakeFS
 	restoreCmd = runOnlyRunner{}
 	restoreSystem = fakeSystemDetector{systemType: SystemTypePVE}
@@ -203,7 +201,7 @@ func TestRunRestoreWorkflow_CompatibilityUsesArchivePayloadNotManifest(t *testin
 		confirmCompatible: false,
 	}
 
-	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui); err != nil {
+	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, ""); err != nil {
 		t.Fatalf("runRestoreWorkflowWithUI error: %v", err)
 	}
 	if ui.confirmCompatibilityCalls != 0 {
@@ -215,7 +213,6 @@ func TestRunRestoreWorkflow_CompatibilityWarnsOnArchiveMismatchDespiteManifest(t
 	origRestoreFS := restoreFS
 	origRestoreCmd := restoreCmd
 	origRestoreSystem := restoreSystem
-	origCompatFS := compatFS
 	origPrepare := prepareRestoreBundleFunc
 	origAnalyze := analyzeRestoreArchiveFunc
 	origSafetyFS := safetyFS
@@ -223,7 +220,6 @@ func TestRunRestoreWorkflow_CompatibilityWarnsOnArchiveMismatchDespiteManifest(t
 		restoreFS = origRestoreFS
 		restoreCmd = origRestoreCmd
 		restoreSystem = origRestoreSystem
-		compatFS = origCompatFS
 		prepareRestoreBundleFunc = origPrepare
 		analyzeRestoreArchiveFunc = origAnalyze
 		safetyFS = origSafetyFS
@@ -232,7 +228,6 @@ func TestRunRestoreWorkflow_CompatibilityWarnsOnArchiveMismatchDespiteManifest(t
 	fakeFS := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(fakeFS.Root) })
 	restoreFS = fakeFS
-	compatFS = fakeFS
 	safetyFS = fakeFS
 	restoreCmd = runOnlyRunner{}
 	restoreSystem = fakeSystemDetector{systemType: SystemTypePVE}
@@ -274,7 +269,7 @@ func TestRunRestoreWorkflow_CompatibilityWarnsOnArchiveMismatchDespiteManifest(t
 		confirmCompatible: true,
 	}
 
-	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui); err != nil {
+	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, ""); err != nil {
 		t.Fatalf("runRestoreWorkflowWithUI error: %v", err)
 	}
 	if ui.confirmCompatibilityCalls != 1 {
@@ -289,7 +284,6 @@ func TestRunRestoreWorkflow_CompatibilityWarningStillRunsBeforeFullFallbackOnAna
 	origRestoreFS := restoreFS
 	origRestoreCmd := restoreCmd
 	origRestoreSystem := restoreSystem
-	origCompatFS := compatFS
 	origPrepare := prepareRestoreBundleFunc
 	origAnalyze := analyzeRestoreArchiveFunc
 	origSafetyFS := safetyFS
@@ -297,7 +291,6 @@ func TestRunRestoreWorkflow_CompatibilityWarningStillRunsBeforeFullFallbackOnAna
 		restoreFS = origRestoreFS
 		restoreCmd = origRestoreCmd
 		restoreSystem = origRestoreSystem
-		compatFS = origCompatFS
 		prepareRestoreBundleFunc = origPrepare
 		analyzeRestoreArchiveFunc = origAnalyze
 		safetyFS = origSafetyFS
@@ -306,7 +299,6 @@ func TestRunRestoreWorkflow_CompatibilityWarningStillRunsBeforeFullFallbackOnAna
 	fakeFS := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(fakeFS.Root) })
 	restoreFS = fakeFS
-	compatFS = fakeFS
 	safetyFS = fakeFS
 	restoreCmd = runOnlyRunner{}
 	restoreSystem = fakeSystemDetector{systemType: SystemTypePVE}
@@ -346,7 +338,7 @@ func TestRunRestoreWorkflow_CompatibilityWarningStillRunsBeforeFullFallbackOnAna
 		confirmCompatible: true,
 	}
 
-	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui); err != nil {
+	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, ""); err != nil {
 		t.Fatalf("runRestoreWorkflowWithUI error: %v", err)
 	}
 	if ui.confirmCompatibilityCalls != 1 {

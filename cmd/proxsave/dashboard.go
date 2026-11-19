@@ -14,6 +14,7 @@ import (
 
 	"github.com/tis24dev/proxsave/internal/cli"
 	"github.com/tis24dev/proxsave/internal/config"
+	"github.com/tis24dev/proxsave/internal/cron"
 	"github.com/tis24dev/proxsave/internal/health"
 	"github.com/tis24dev/proxsave/internal/input"
 	"github.com/tis24dev/proxsave/internal/installer"
@@ -78,12 +79,12 @@ const whatsnewScreenTimeout = 10 * time.Minute
 // (context.DeadlineExceeded) or Esc (shell.ErrAborted) is a non-nil error and must leave
 // the flag untouched, so the write sits inside `if err == nil`, never in a
 // defer/teardown (SCRN-03, SCRN-04, Pitfall 9).
-func maybeShowWhatsnew(ctx context.Context, session *shell.Session, baseDir, toolVersion string) {
-	show, body := whatsnewResolve(baseDir, toolVersion)
+func maybeShowWhatsnew(ctx context.Context, session *shell.Session, loc whatsnew.Location, toolVersion string) {
+	show, body := whatsnewResolve(loc, toolVersion)
 	if !show {
 		return
 	}
-	whatsnewRender(ctx, session, baseDir, toolVersion, body)
+	whatsnewRender(ctx, session, loc, toolVersion, body)
 }
 
 // whatsnewResolve makes the Screen 0 SHOW/skip decision WITHOUT touching any TTY, so a
@@ -96,11 +97,16 @@ func maybeShowWhatsnew(ctx context.Context, session *shell.Session, baseDir, too
 // args.DryRun), so the self-heal write can never coexist with --dry-run. Callers MUST NOT
 // start a session unless this returns show=true: starting one only to Close it on a no-op
 // leaks the terminal's async capability-query responses (mode 2026/2027) into the shell.
-func whatsnewResolve(baseDir, toolVersion string) (show bool, body string) {
-	show, body, err := whatsnewDecide(baseDir, toolVersion)
+//
+// It is also where the dashboard and --show-whatsnew drop the identity/ copies of .daemon.pid
+// and .daemon_info.json the daemon wrote for the previous release's upgrade verification
+// (removeLegacyDaemonCopies), silently: the dashboard has no visible log.
+func whatsnewResolve(loc whatsnew.Location, toolVersion string) (show bool, body string) {
+	removeLegacyDaemonCopies(loc.BaseDir, nil)
+	show, body, err := whatsnewDecide(loc, toolVersion)
 	if err != nil {
 		if errors.Is(err, whatsnew.ErrStateParse) {
-			_ = whatsnewSaveSeen(baseDir, toolVersion)
+			_ = whatsnewSaveSeen(loc, toolVersion)
 		}
 		return false, ""
 	}
@@ -108,16 +114,61 @@ func whatsnewResolve(baseDir, toolVersion string) (show bool, body string) {
 }
 
 // whatsnewRender pushes Screen 0 (body) onto session, bounded by the total
-// whatsnewScreenTimeout, and clears the seen-flag ONLY on an explicit continue
-// (err == nil): a timeout (context.DeadlineExceeded) or Esc (shell.ErrAborted) is a
-// non-nil error and leaves the flag untouched, so the write stays out of any
-// defer/teardown and the fallback warning keeps firing next run (SCRN-03/04, Pitfall 9).
-func whatsnewRender(ctx context.Context, session *shell.Session, baseDir, toolVersion, body string) {
+// whatsnewScreenTimeout, and marks the notes seen once the screen has been shown,
+// HOWEVER the operator left it: continue or Ctrl+C (shell.ErrClosed).
+//
+// It used to write only on an explicit continue, so reading the notes and closing
+// with Esc or Ctrl+C, which is what most people do, left the flag unwritten. The
+// next scheduled backup then logged "has unseen release notes" as a WARNING,
+// ParseLogCounts counted it, and applyIssueExitCode promoted an otherwise clean
+// run to exit 1, which the daemon reports to Healthchecks as down (issue #305).
+// Demanding a specific keystroke to DISARM THAT is not a gate, it is a trap.
+//
+// Screen 0 has since dropped esc and q (WithPagerNoAbort), so enter is the only
+// key that closes it. That is not the trap above coming back: the trap was the
+// flag going unwritten behind a gesture people did not know they owed, and this
+// function writes it on every exit that reaches it. Requiring one key to LEAVE a
+// screen costs a keystroke; requiring one to disarm a warning cost a red backup.
+//
+// Nothing is lost by dropping the confirmation, because presence is established
+// BEFORE this point and not by which key was pressed: showWhatsnewScreen and
+// maybeShowWhatsnew both gate on a real terminal (dashboardIsInteractive), the
+// post-upgrade hand-off gates on whatsnewAfterUpgradeInteractive, and --dry-run
+// returns before rendering. An unattended run never reaches this function, so
+// reaching it means a person saw the screen.
+func whatsnewRender(ctx context.Context, session *shell.Session, loc whatsnew.Location, toolVersion, body string) {
 	wnCtx, cancel := context.WithTimeout(ctx, whatsnewScreenTimeout)
 	defer cancel()
-	if whatsnewRun(wnCtx, session, body) == nil {
-		_ = whatsnewSaveSeen(baseDir, toolVersion)
+	err := whatsnewRun(wnCtx, session, body)
+	// A torn-down PARENT means the screen never really ran: an external SIGINT or
+	// SIGTERM, which setupRunContextWithSignals maps to ctx cancellation. A Ctrl+C
+	// typed INTO the screen does not land here, because the terminal is in raw mode
+	// and bubbletea reads it as a key the router turns into tea.Interrupt.
+	if ctx.Err() != nil {
+		return
 	}
+	// The 10-minute timeout is the other exit that does not count, and it is the only
+	// one the interactivity gate cannot rule out. isTerminalInteractive proves a
+	// TERMINAL, not a person: a detached tmux window, an expect script or an `ssh -t`
+	// from a wrapper all carry a real TTY. Every OTHER resolution is a keystroke, so
+	// it is evidence a person was there; sitting untouched for ten minutes is the
+	// opposite.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	// The last exit that does not count, and the one the timeout check cannot cover:
+	// shell.Ask returns ErrClosed for a program that DIED as well as for ctrl+c, so
+	// saving on every non-timeout error marked the notes seen after a renderer or
+	// terminal failure the operator never got to read past. Only an interrupt is a
+	// person; every other closed session is the UI going away on its own.
+	//
+	// Esc and q reach nothing at all now: the pager swallows them (WithPagerNoAbort),
+	// so they neither resolve nor arrive here, and narrowing this arm cannot re-arm
+	// the warning for the keystrokes issue #305 was about.
+	if errors.Is(err, shell.ErrClosed) && !shell.IsUserInterrupt(err) {
+		return
+	}
+	_ = whatsnewSaveSeen(loc, toolVersion)
 }
 
 // showWhatsnewScreen runs ONLY Screen 0 (what's new) and returns, without the dashboard
@@ -151,7 +202,12 @@ func showWhatsnewScreen(ctx context.Context, args *cli.Args, toolVersion string)
 	// which then leak into the parent shell as stray input ("2026: command not found"). So
 	// a not-unseen verdict (or a corrupt-flag self-heal) must never spin up a TTY at all.
 	baseDir, _ := detectedBaseDirOrFallback()
-	show, body := whatsnewResolve(baseDir, toolVersion)
+	configPath := ""
+	if args != nil {
+		configPath = args.ConfigPath
+	}
+	loc := whatsnewLocation(configPath, baseDir)
+	show, body := whatsnewResolve(loc, toolVersion)
 	if !show {
 		return
 	}
@@ -164,10 +220,6 @@ func showWhatsnewScreen(ctx context.Context, args *cli.Args, toolVersion string)
 		if strings.TrimSpace(buildSig) == "" {
 			buildSig = "n/a"
 		}
-		configPath := ""
-		if args != nil {
-			configPath = args.ConfigPath
-		}
 		session = shell.Start(ctx, shell.Config{
 			AppName:    "ProxSave",
 			Subtitle:   "Dashboard",
@@ -179,7 +231,7 @@ func showWhatsnewScreen(ctx context.Context, args *cli.Args, toolVersion string)
 	}
 	defer func() { _ = session.Close() }()
 
-	whatsnewRender(ctx, session, baseDir, toolVersion, body)
+	whatsnewRender(ctx, session, loc, toolVersion, body)
 }
 
 // dashboardBareInvocationCheck: only a completely bare `proxsave` (no flags
@@ -201,6 +253,14 @@ func isTerminalInteractive() bool {
 	}
 	return true
 }
+
+type dashboardActionDisposition uint8
+
+const (
+	dashboardActionUnhandled dashboardActionDisposition = iota
+	dashboardActionHandled
+	dashboardActionReload
+)
 
 // maybeRunDashboard shows the interactive dashboard when proxsave is invoked
 // completely bare (no flags at all) on an interactive terminal. The chosen
@@ -239,10 +299,10 @@ func maybeRunDashboard(ctx context.Context, args *cli.Args, bootstrap *logging.B
 	// bare-invocation check is needed here -- reaching this line already guarantees
 	// bare + interactive (the early return at the top of maybeRunDashboard), so
 	// Screen 0 stays bare-interactive-only (SCRN-02/05). The base is resolved via the
-	// same detectedBaseDirOrFallback the install seed uses, so write-path == read-path
-	// (open question A1).
+	// same detectedBaseDirOrFallback the install seed uses and LOG_PATH comes from the
+	// same configuration, so write-path == read-path (open question A1).
 	baseDir, _ := detectedBaseDirOrFallback()
-	maybeShowWhatsnew(ctx, session, baseDir, toolVersion)
+	maybeShowWhatsnew(ctx, session, whatsnewLocation(args.ConfigPath, baseDir), toolVersion)
 
 	for {
 		// Idle timeout: a pty-allocating wrapper (script, tmux, ssh -tt) that
@@ -281,10 +341,16 @@ func maybeRunDashboard(ctx context.Context, args *cli.Args, bootstrap *logging.B
 		// and loop back to the menu. These never leave the dashboard, so the flag
 		// dispatch below is untouched.
 		diagCtx, cancelDiag := withDashboardIdle(ctx)
-		handledDiag := runDashboardDiagnostic(diagCtx, session, action, args, bootstrap)
+		disposition := runDashboardDiagnostic(diagCtx, session, action, args, bootstrap)
 		cancelDiag()
-		if handledDiag {
+		switch disposition {
+		case dashboardActionHandled:
 			continue
+		case dashboardActionReload:
+			keepAlive = true
+			// The reloaded dashboard's own exit code, not a blanket success: the
+			// operator's session happened in THAT process.
+			return closeDashboardAndRelaunch(ctx, session, getExecInfo().ExecPath, bootstrap), true
 		}
 
 		switch action {
@@ -365,8 +431,8 @@ const (
 func runDashboardInstallChoice(ctx context.Context, session *shell.Session) (menu.Action, bool) {
 	errBack := errors.New("install: back")
 	items := []components.SelectorItem[installChoice]{
-		{Label: "Edit install", Description: "re-run the interactive installation/setup (--install)", Value: installEdit},
-		{Label: "Wipe install", Description: "wipe the install directory (keep build/env/identity) then re-run the installer (--new-install)", Value: installWipe},
+		{Label: "Edit install", Description: "re-run the interactive installation/setup", Value: installEdit},
+		{Label: "Wipe install", Description: "wipe and re-install, keeping build/daemon_state/env/guards/identity/restore", Value: installWipe},
 		{Label: "Back", Description: "return to the dashboard menu", Value: installBack},
 	}
 	choice, err := shell.Ask(ctx, session, components.NewSelector(
@@ -388,14 +454,15 @@ func runDashboardInstallChoice(ctx context.Context, session *shell.Session) (men
 }
 
 // runDashboardDiagnostic runs the check screen for a diagnostics-group action in
-// the live dashboard session and reports whether it handled the action (so the
-// dashboard loops back to the menu). Non-diagnostic actions return false, leaving
+// the live dashboard session and reports how it handled the action. Ordinary
+// diagnostics loop back to the menu; a successful upgrade requests a process reload.
+// Non-diagnostic actions return dashboardActionUnhandled, leaving
 // them for the normal flag dispatch. Every screen already exists and is reused
 // verbatim; each is non-blocking (errors are swallowed - a failed check must never
 // abort the dashboard). When a setup screen is not eligible (that feature is not
 // configured on this host) it renders nothing, so a short notice is shown instead
 // of a blank flicker.
-func runDashboardDiagnostic(ctx context.Context, session *shell.Session, action menu.Action, args *cli.Args, bootstrap *logging.BootstrapLogger) bool {
+func runDashboardDiagnostic(ctx context.Context, session *shell.Session, action menu.Action, args *cli.Args, bootstrap *logging.BootstrapLogger) dashboardActionDisposition {
 	configPath := ""
 	if args != nil {
 		configPath = args.ConfigPath
@@ -425,7 +492,7 @@ func runDashboardDiagnostic(ctx context.Context, session *shell.Session, action 
 		_, _ = dashboardRunPostInstallAudit(ctx, session, getExecInfo().ExecPath, configPath)
 	case menu.ActionCheckUpgrade:
 		logging.DebugStepBootstrap(bootstrap, "dashboard", "action=check-upgrade")
-		runDashboardUpgradeMenu(ctx, session, configPath)
+		return runDashboardUpgradeMenu(ctx, session, configPath)
 	case menu.ActionDaemonSetup:
 		logging.DebugStepBootstrap(bootstrap, "dashboard", "action=daemon-setup")
 		runDashboardDaemonAdmin(ctx, session, true, configPath, baseDir)
@@ -442,9 +509,9 @@ func runDashboardDiagnostic(ctx context.Context, session *shell.Session, action 
 		logging.DebugStepBootstrap(bootstrap, "dashboard", "action=cleanup-guards")
 		runDashboardCleanupGuards(ctx, session)
 	default:
-		return false
+		return dashboardActionUnhandled
 	}
-	return true
+	return dashboardActionHandled
 }
 
 // Seams so the daemon admin ops can be stubbed in tests (they otherwise run real
@@ -538,6 +605,36 @@ const daemonResultActionBack daemonResultAction = iota
 // a Subtle explanation) above a single Back item. It loops to Back/esc and is non-blocking on
 // any UI failure, mirroring runDashboardDaemonStatus. This is the single styled result renderer
 // shared by every daemon action result, so they can never disagree visually with the status screen.
+// showDaemonResultScreenFn is the seam over the daemon result screen. It exists because
+// this screen is the ONLY channel that reaches a TUI operator on these paths - the global
+// logger is swapped for a discarding one and the bootstrap console is muted for the whole
+// op - so what it carries is behaviour, not presentation, and behaviour has to be
+// assertable. Driving the real screen instead means matching a string that
+// orchestrator.BuildStatusPrompt has already reflowed to the terminal width, which passes
+// or fails on where a line happened to wrap.
+var showDaemonResultScreenFn = showDaemonResultScreen
+
+// daemonFailureScreenText is the body of the generic daemon failure screen: the one fact the
+// operator cannot get from the error string, then the error itself indented under it, which is
+// the shape buildCronRevertScreen already uses for a teardown error.
+//
+// The fact is worth a line because installDaemonService fails in four places and they leave
+// two different hosts behind. Validating the exec/config tokens and writing the unit file
+// leave nothing (the write is atomic, so there is no half-file); daemon-reload and
+// enable --now fail with the unit file already on disk. Told only the error, the operator
+// could not tell whether there was something to clean up before retrying.
+//
+// The sentence claims exactly what daemonUnitInstalled measures, which is one os.Stat of the
+// unit path. Not "enabled", not "not started": the probe cannot see either, and this screen is
+// reached from the disable direction too, where a leftover unit means the opposite thing.
+func daemonFailureScreenText(opErr error) string {
+	unit := "Daemon service: no unit file on disk."
+	if daemonInstalledProbe() {
+		unit = "Daemon service: the unit file is on disk."
+	}
+	return unit + "\n  " + opErr.Error()
+}
+
 func showDaemonResultScreen(ctx context.Context, session *shell.Session, title string, level orchestrator.HealthcheckSetupLevel, keyword, explanation string) {
 	errDaemonResultEsc := errors.New("daemon result: esc")
 	prompt := orchestrator.BuildStatusPrompt(level, keyword, explanation)
@@ -570,8 +667,8 @@ func showDaemonResultScreen(ctx context.Context, session *shell.Session, title s
 func runDashboardDaemonAdmin(ctx context.Context, session *shell.Session, install bool, configPath, baseDir string) {
 	cfg, err := daemonStatusLoadConfig(configPath, baseDir)
 	if err != nil || cfg == nil {
-		showDaemonResultScreen(ctx, session, "Daemon change failed", orchestrator.HealthcheckSetupLevelError,
-			"CONFIG UNREADABLE", "Could not read the configuration to apply the scheduler change.")
+		showDaemonResultScreenFn(ctx, session, "Daemon change failed", orchestrator.HealthcheckSetupLevelError,
+			"CONFIG UNREADABLE", "Configuration: unreadable, the scheduler change was not applied.")
 		return
 	}
 
@@ -589,39 +686,239 @@ func runDashboardDaemonAdmin(ctx context.Context, session *shell.Session, instal
 	work := "Reverting to the cron scheduler..."
 	doneTitle := "Daemon disabled"
 	doneKeyword := "REVERTED TO CRON"
-	doneMsg := "Reverted to the cron scheduler and removed the daemon service. Future upgrades will not reinstall it."
+	doneLevel := orchestrator.HealthcheckSetupLevelOk
+	// doneMsg for the revert is completed after the op: "future upgrades will not reinstall it"
+	// is a claim about a config write that is best-effort, so it may only be made once that
+	// write is known to have landed.
+	doneMsg := ""
 	if install {
 		title = "Installing daemon"
 		work = "Installing and enabling " + daemonUnitName + "..."
 		doneTitle = "Daemon installed"
 		doneKeyword = "INSTALLED"
-		doneMsg = "The resident daemon (" + daemonUnitName + ") is active. The cron entry was removed."
+		// doneMsg for the install path is deliberately NOT set here. It has to state what
+		// the cron removal actually did, and that is only known after the op below runs.
 	}
 	execToken := daemonSelfExecPath()
 	var opErr error
+	var cronOutcome cronRemovalOutcome
+	var revert cronRevertReport
 	_ = components.RunTask(ctx, session, title, work, func(taskCtx context.Context, report func(string)) error {
 		if install {
-			opErr = daemonApplyDaemonMode(taskCtx, cfg, configPath, execToken, bl)
+			cronOutcome, opErr = daemonApplyDaemonMode(taskCtx, cfg, configPath, execToken, bl)
 		} else {
-			opErr = daemonApplyCronMode(taskCtx, cfg, configPath, execToken, bl, true)
+			revert, opErr = daemonApplyCronMode(taskCtx, cfg, configPath, execToken, bl)
 		}
 		return nil
 	})
 
 	if opErr != nil {
 		if errors.Is(opErr, errDaemonTeardownBackupRunning) {
-			showDaemonResultScreen(ctx, session, "Daemon disable deferred", orchestrator.HealthcheckSetupLevelWarn,
-				"DEFERRED - BACKUP RUNNING", "A backup is in progress; the daemon was NOT removed. Try again once the backup finishes.")
+			showDaemonResultScreenFn(ctx, session, "Daemon disable deferred", orchestrator.HealthcheckSetupLevelWarn,
+				"DEFERRED - BACKUP RUNNING", "Daemon service: NOT removed, a backup is in progress.\nTry again once the backup finishes.")
 			return
 		}
-		showDaemonResultScreen(ctx, session, title+" failed", orchestrator.HealthcheckSetupLevelError, "FAILED", opErr.Error())
+		// A failed TEARDOWN arrives with a populated report, and the generic screen below
+		// discards it: the duplicate-schedule finding, the /etc advisory and the config-write
+		// fact were all lost on the one path whose logger is muted for the whole operation and
+		// never flushed. A revert abandoned because the cron entry could not be written
+		// (errCronRevertCronNotWritten) arrives with the read-back facts and goes to the same
+		// renderer, which tells the two apart by the sentinel.
+		//
+		// The guard keys on the SENTINEL rather than on the report looking empty, because
+		// applyCronMode's two sentinels abort before anything is written and hand back a ZERO
+		// value whose fields are defaults and not measurements - and a teardown failure on a host
+		// with no cron line, no config write and no findings produces a report byte-identical to
+		// it. The install direction has nothing to lose either way: applyDaemonMode's single error
+		// return is installDaemonService's, which fires before any cron or config work.
+		if !install && !errors.Is(opErr, errDaemonTeardownConfigUnreadable) {
+			level, keyword, text := buildCronRevertScreen(revert, opErr)
+			showDaemonResultScreenFn(ctx, session, "Daemon disable failed", level, keyword, text)
+			return
+		}
+		showDaemonResultScreenFn(ctx, session, title+" failed", orchestrator.HealthcheckSetupLevelError, "FAILED", daemonFailureScreenText(opErr))
 		return
 	}
-	showDaemonResultScreen(ctx, session, doneTitle, orchestrator.HealthcheckSetupLevelOk, doneKeyword, doneMsg)
+	// The result screen is the only channel that reaches the operator here (console logging
+	// and the bootstrap console are muted for the whole op above), so it must carry the same
+	// verified crontab fact the CLI log line carries. On a host whose backup is scheduled
+	// through a wrapper there was no proxsave cron entry to remove, and claiming one was
+	// removed is how issue #298 stayed invisible on both front-ends at once.
+	if install {
+		// Same shape as the revert screen: one fact per line behind a fixed label. The removal
+		// clause keeps its own wording, since three CLI call sites print the identical sentence
+		// and the point of that renderer is that all four front-ends say the same thing.
+		doneMsg = "Daemon service: active (" + daemonUnitName + ").\nCron entry: " + cronRemovalScreenClause(cronOutcome)
+		// The install direction had no channel for the #298 finding at all: the warning it
+		// produces goes through the bootstrap logger muted above, and the screen said INSTALLED
+		// in green over a host that now runs the backup twice. The removal clause cannot carry
+		// it either - "no proxsave cron entry was present to remove" is exactly what a clean
+		// install says - so on a finding the screen states the duplication instead and the
+		// level goes yellow.
+		// An unverified removal already SAYS a proxsave entry may still be scheduled next to the
+		// daemon just installed. Under a green tick that reads as reassurance, so the level has
+		// to carry the same doubt the sentence does. The duplicate finding is stronger evidence
+		// and wins the keyword when both hold.
+		//
+		// The keyword states what HAPPENED, not what survives. Verified=false means the crontab
+		// could not be checked, which is not the same as knowing an entry is still there, and a
+		// keyword asserting one would claim more than the sentence under it.
+		if !cronOutcome.Verified {
+			doneLevel = orchestrator.HealthcheckSetupLevelWarn
+			doneKeyword = "INSTALLED - NO CRON ENTRY REMOVED"
+		}
+		if cronOutcome.UnmanagedSchedules > 0 {
+			doneLevel = orchestrator.HealthcheckSetupLevelWarn
+			doneKeyword = "INSTALLED - DUPLICATE SCHEDULE"
+			// ADDED, not swapped in: replacing the message threw away the line saying what the
+			// removal actually did, on the screen that is the only channel this path has.
+			doneMsg += "\nCheck your crons to remove duplication."
+		}
+	}
+	if !install {
+		doneLevel, doneKeyword, doneMsg = buildCronRevertScreen(revert, nil)
+	}
+	showDaemonResultScreenFn(ctx, session, doneTitle, doneLevel, doneKeyword, doneMsg)
 }
 
-// dashboardDaemonState decides which daemon command the menu offers, from the
-// on-disk scheduler mode + opt-out tombstone. Unreadable config -> only Status.
+// buildCronRevertScreen renders the revert's result screen: the level, the keyword and the whole
+// text, including the two habitats' advisories. It is a pure function of the report and of
+// whether the teardown failed, so the wording is assertable without a TUI driver and without a
+// 60-second deadline.
+//
+// It exists because the FAILURE path needs the same facts and the same advisory append as the
+// success path, and the append used to sit below the early return that discarded them. Extracting
+// it first means the failure arm is a wiring change rather than a second copy of thirty lines
+// that can drift from the original.
+//
+// teardownErr is nil on every path that got as far as removing the daemon service. When it is
+// set, everything the report established BEFORE the teardown is still true and is stated;
+// everything the failed teardown killed is dropped. See the arm itself for which is which.
+// When it is errCronRevertCronNotWritten there was no teardown at all: the revert stopped at the
+// cron write, and the screen says the daemon was left in place.
+func buildCronRevertScreen(revert cronRevertReport, teardownErr error) (orchestrator.HealthcheckSetupLevel, string, string) {
+	// One fact per LINE, each behind the label that names what it is about, in the same order on
+	// every screen. The daemon-status screen already reads this way ("Scheduler mode:", "Daemon
+	// service (...):", "Service state (...):"), and these screens did not: they were one
+	// paragraph the box wrapped wherever it ran out of width, up to 296 characters on the
+	// teardown-failure arm, sitting directly above advisory blocks that are already one line per
+	// finding. Two styles in one screen, and the operator hunting for "did the cron entry get
+	// written" inside prose.
+	lines := []string{}
+	daemon := "Daemon service: removed."
+	cron := "Cron entry: in the crontab."
+	config := "Configuration: SCHEDULER_MODE=cron recorded."
+	if !revert.ModeRecorded {
+		// cronModeRecordClause's own failure wording ends "...while no daemon is installed",
+		// which the teardown arm below disproves, so the screen states the config fact itself and
+		// leaves that clause to the CLI, where it is true.
+		config = "Configuration: NOT updated, it still records the daemon engine."
+	}
+	found := len(revert.UnmanagedAdvisory) > 0 || len(revert.SystemCronAdvisory) > 0
+
+	// THE REVERT WAS ABANDONED before anything changed: the cron entry that has to replace the
+	// daemon was not written, or was not read back. applyCronMode returned before the advisories,
+	// the config write and the teardown, so the daemon keeps scheduling the backup and the
+	// configuration still records the daemon engine (ModeRecorded is false).
+	//
+	// The cron line states what is known. A write the writer itself reported as failed is "NOT
+	// written" whatever the read-back says; a write it believed landed but that the crontab could
+	// not confirm is "could not be checked"; a readable crontab without the line is "NOT written".
+	if errors.Is(teardownErr, errCronRevertCronNotWritten) {
+		cron = "Cron entry: NOT written."
+		if revert.CronWritten && !revert.CronVerified {
+			cron = "Cron entry: could not be checked, the crontab was unreadable."
+		}
+		lines = append(lines, "Daemon service: left in place, it keeps scheduling the backup.", cron, config)
+		return orchestrator.HealthcheckSetupLevelError, "DAEMON NOT REMOVED", appendCronRevertAdvisories(strings.Join(lines, "\n"), revert)
+	}
+
+	// A FAILED TEARDOWN. removeDaemonServiceFn is the last thing applyCronMode does, so
+	// everything the report carries was established before it and none of it is invalidated by
+	// it: the cron line was read back from the crontab (applyCronMode reaches the teardown only
+	// after that read-back succeeded, so the line is always there), the wrapper lines were read
+	// from the crontab ProxSave never edits, the config write already returned, and the /etc scan
+	// runs after the teardown by design. What the failure DOES kill is the claim that the service was
+	// removed, and that is the only line this arm rewrites.
+	//
+	// The host is left with a unit file still on disk (os.Remove failed) or deleted but not
+	// reloaded (daemon-reload failed); the preceding "systemctl disable --now" is best-effort and
+	// its failure is only Debug-logged, so the process may or may not still be alive. "May still
+	// be running" over-warns on the host where it really did stop, which costs the operator one
+	// check; claiming the daemon is gone when it is not is the expensive direction and is the bug
+	// class this area keeps producing. See backup_notifications.go on a failed teardown leaving a
+	// live, transmitting daemon on a host whose config already reads cron.
+	if teardownErr != nil {
+		// Two schedulers at the same minute: the daemon runs at SCHEDULER_TIME and that is the
+		// time the cron line carries. The per-run lock makes the loser exit 16, i.e. a failed
+		// backup reported every night - the third duplicate source in issue #298. The duplicate
+		// takes the keyword because it is what changes tonight. There is no "cron entry not
+		// written" variant here: a revert whose line was not read back stops at the cron gate
+		// above and never reaches the teardown.
+		level := orchestrator.HealthcheckSetupLevelError
+		keyword := "DAEMON NOT REMOVED - DUPLICATE SCHEDULE"
+		cron = "Cron entry: in the crontab, so the backup may run twice."
+		lines = append(lines,
+			"Daemon service: NOT removed, may still be running.",
+			// Indented on its own line: it is an external tool's message, not a sentence of ours,
+			// and inside the prose it used to end up mid-paragraph between two facts.
+			"  "+teardownErr.Error(),
+			cron, config)
+		return level, keyword, appendCronRevertAdvisories(strings.Join(lines, "\n"), revert)
+	}
+
+	level := orchestrator.HealthcheckSetupLevelOk
+	keyword := "REVERTED TO CRON"
+	if !revert.ModeRecorded {
+		level = orchestrator.HealthcheckSetupLevelWarn
+		keyword = "REVERTED - CONFIG NOT UPDATED"
+	}
+	// The revert writes its cron line even when something unmanaged already schedules ProxSave,
+	// so it creates this duplicate itself and has to say so. The keyword takes precedence over
+	// the config one because this is what changes tonight; the config fact keeps its own line
+	// either way.
+	//
+	// BOTH habitats raise it. The CLI already emits a WARNING for the root crontab wrappers and
+	// for the /etc findings alike, so a screen that reacted to only one handed the same host two
+	// different levels depending on which channel the operator read.
+	if found {
+		level = orchestrator.HealthcheckSetupLevelWarn
+		keyword = "REVERTED - DUPLICATE SCHEDULE"
+	}
+	// There is no "nothing scheduled" arm here any more: applyCronMode reaches the teardown only
+	// after reading its own cron line back, so a revert that comes back without an error always
+	// left that line in the crontab.
+	lines = append(lines, daemon, cron, config)
+	if len(revert.UnmanagedAdvisory) > 0 {
+		lines = append(lines, "Check your crons to remove duplication.")
+	}
+	return level, keyword, appendCronRevertAdvisories(strings.Join(lines, "\n"), revert)
+}
+
+// appendCronRevertAdvisories appends the two habitats' pre-rendered advisory lines to the
+// revert's message. The revert has the same problem in its own direction: applyCronMode emits its /etc
+// schedule advisory through the bootstrap logger, which is console-quiet here and is
+// never flushed, so the operator used to get a green "REVERTED TO CRON" over a host that
+// may now be scheduled twice - the CLI said it, the TUI did not. Appending the lines to
+// the result screen is the only channel left open on this path.
+// BOTH habitats are listed, in the order the CLI prints them: the root crontab ProxSave owns
+// and just rewrote, then the /etc files it may only read.
+func appendCronRevertAdvisories(msg string, revert cronRevertReport) string {
+	for _, advisory := range [][]string{revert.UnmanagedAdvisory, revert.SystemCronAdvisory} {
+		if len(advisory) > 0 {
+			msg = strings.TrimSpace(msg + "\n\n" + strings.Join(advisory, "\n"))
+		}
+	}
+	return msg
+}
+
+// dashboardDaemonState decides which daemon command the menu offers, from the on-disk
+// scheduler mode alone. Unreadable config -> only Status.
+//
+// It used to consult DAEMON_OPT_OUT as well, purely to label the same command "Re-enable"
+// rather than "Install" on a host that had reverted. Both rows ran ActionDaemonSetup and the
+// difference was never one the operator could act on, so the retired tombstone leaves nothing
+// behind here: cron is cron however the host got there.
 func dashboardDaemonState(args *cli.Args) menu.DaemonState {
 	configPath := ""
 	if args != nil {
@@ -632,14 +929,10 @@ func dashboardDaemonState(args *cli.Args) menu.DaemonState {
 	if err != nil || cfg == nil {
 		return menu.DaemonStateUnknown
 	}
-	switch {
-	case cfg.SchedulerMode == "daemon":
+	if cfg.SchedulerMode == "daemon" {
 		return menu.DaemonStateActive
-	case cfg.DaemonOptOut:
-		return menu.DaemonStateDisabled
-	default:
-		return menu.DaemonStateOnCron
 	}
+	return menu.DaemonStateOnCron
 }
 
 // daemonStatusAction is the choice on the daemon-status screen: re-run the state check,
@@ -661,48 +954,25 @@ const (
 func runDashboardDaemonStatus(ctx context.Context, session *shell.Session, configPath, baseDir string) {
 	errDaemonStatusEsc := errors.New("daemon status: esc")
 	for {
-		mode := "unknown"
-		optOut := "unknown"
-		var interval time.Duration
-		if cfg, err := daemonStatusLoadConfig(configPath, baseDir); err == nil && cfg != nil {
-			mode = cfg.SchedulerMode
-			optOut = "no"
-			if cfg.DaemonOptOut {
-				optOut = "yes"
-			}
-			interval = cfg.HealthcheckHeartbeatInterval
-			if strings.TrimSpace(cfg.BaseDir) != "" {
-				baseDir = cfg.BaseDir
+		// cfgErr is kept, not discarded: this is the ONE screen that reaches the
+		// collector without a configuration, and the personal-script block says so.
+		// Without the cause it could only report that the file was unreadable, never
+		// which file or why - the same half-answer runDashboardDaemonAdmin refuses.
+		var cfg *config.Config
+		loaded, cfgErr := daemonStatusLoadConfig(configPath, baseDir)
+		if cfgErr == nil && loaded != nil {
+			cfg = loaded
+			if strings.TrimSpace(loaded.BaseDir) != "" {
+				baseDir = loaded.BaseDir
 			}
 		}
-		unit := "not installed"
-		if daemonUnitInstalled() {
-			unit = "installed"
-		}
-		active := daemonUnitActiveState(ctx)
-		if active == "" {
-			active = "unknown"
-		}
-
-		// Combined verdict via the SHARED daemon-state checker (systemd existence refined onto the
-		// heartbeat, plus on-disk binary alignment). probeProxsaveDaemonAlive is the stricter signal-0
-		// + /proc/cmdline liveness gate. The raw unit/active words stay from the direct probes so the
-		// systemctl vocabulary is shown verbatim. This is IDENTICAL to before -- presentation only.
-		ds := health.CheckDaemonState(health.DaemonStateInput{
-			BaseDir:           baseDir,
-			SchedulerMode:     mode,
-			HeartbeatInterval: interval,
-			Now:               time.Now(),
-			Presence:          daemonPresenceProbe(ctx),
-			ProcAlive:         probeProxsaveDaemonAlive,
-			ProcStale:         procBinaryStaleProbe,
-		})
-		level, keyword, explanation := daemonStatusStyle(ds)
+		diagnostics := daemonDiagnosticsCollector(ctx, cfg, cfgErr, baseDir)
 		// Dashboard "Status:" keywords are ALL-CAPS (the house convention across every
 		// dashboard Status screen). daemonStatusStyle is shared with the plain-text
 		// --daemon-status CLI line, so uppercase HERE (the graphical consumer) rather than at
 		// the source, keeping the CLI/log readout in its natural case.
-		prompt := buildDaemonStatusPrompt(level, strings.ToUpper(keyword), explanation, mode, unit, active, optOut, ds)
+		diagnostics.Keyword = strings.ToUpper(diagnostics.Keyword)
+		prompt := buildDaemonStatusPrompt(diagnostics)
 
 		items := []components.SelectorItem[daemonStatusAction]{
 			{Label: "Re-check", Description: "re-run the daemon state check", Value: daemonStatusActionCheck},
@@ -738,20 +1008,20 @@ func renderDaemonStatusLevel(level orchestrator.HealthcheckSetupLevel, text stri
 // buildHealthcheckPrompt): a short intro, a two-line Status block (a colored keyword + a Subtle
 // explanation), then a Details block with the scheduler/service facts. The wording/logic of the
 // detail lines is unchanged from the old Notice body; only the presentation moved into the prompt.
-func buildDaemonStatusPrompt(level orchestrator.HealthcheckSetupLevel, keyword, explanation, mode, unit, active, optOut string, ds health.DaemonState) string {
+func buildDaemonStatusPrompt(diagnostics daemonDiagnostics) string {
 	// Every dynamic segment below carries text from outside this file (keyword/explanation from
 	// daemonStatusStyle, mode from the config file, active from systemctl, Version/Commit RAW from
 	// .daemon_info.json), so each is SanitizeText-scrubbed before theme rendering to keep raw
 	// ANSI/OSC/C0/C1 escapes out of the verbatim WithSelectorPromptStyled path. Compile-time
-	// literals (unit/optOut, the "Binary alignment" verdict) are left as-is: sanitizing them is a
+	// literals (unit, the "Binary alignment" verdict) are left as-is: sanitizing them is a
 	// no-op.
 	var b strings.Builder
 	b.WriteString(theme.Text.Render("Resident backup daemon (runs scheduled backups + healthchecks reporting)."))
 	b.WriteString("\n\n")
 
 	b.WriteString(theme.Text.Render("Status: "))
-	b.WriteString(renderDaemonStatusLevel(level, components.SanitizeText(keyword)))
-	if exp := components.SanitizeText(explanation); exp != "" {
+	b.WriteString(renderDaemonStatusLevel(diagnostics.Level, components.SanitizeText(diagnostics.Keyword)))
+	if exp := components.SanitizeText(diagnostics.Explanation); exp != "" {
 		b.WriteString("\n")
 		b.WriteString(theme.Subtle.Render(exp))
 	}
@@ -759,26 +1029,24 @@ func buildDaemonStatusPrompt(level orchestrator.HealthcheckSetupLevel, keyword, 
 	b.WriteString("\n\n")
 	b.WriteString(theme.Text.Render("Details:"))
 	b.WriteString("\n")
-	b.WriteString(theme.Text.Render("Scheduler mode: " + components.SanitizeText(mode)))
+	b.WriteString(theme.Text.Render("Scheduler mode: " + components.SanitizeText(diagnostics.Mode)))
 	b.WriteString("\n")
-	b.WriteString(theme.Text.Render("Daemon service (" + daemonUnitName + "): " + unit))
+	b.WriteString(theme.Text.Render("Daemon service (" + daemonUnitName + "): " + diagnostics.Unit))
 	b.WriteString("\n")
-	b.WriteString(theme.Text.Render("Service state (systemctl is-active): " + components.SanitizeText(active)))
-	b.WriteString("\n")
-	b.WriteString(theme.Text.Render("Opted out of auto-migration (--daemon-remove): " + optOut))
+	b.WriteString(theme.Text.Render("Service state (systemctl is-active): " + components.SanitizeText(diagnostics.Active)))
 	// The running version comes from the identity record (HaveInfo). The alignment verdict comes from
 	// the record-independent /proc probe, so show it whenever AlignChecked -- a live daemon on a
 	// replaced binary reads "Binary alignment: BEHIND". Binary alignment is known only when
 	// AlignChecked; otherwise it is UNKNOWN -- report "unknown" rather than imply "aligned" or a false
 	// "behind".
-	if ds.HaveInfo {
+	if diagnostics.State.HaveInfo {
 		b.WriteString("\n")
-		b.WriteString(theme.Text.Render("Running version: " + components.SanitizeText(ds.Version) + " (" + components.SanitizeText(ds.Commit) + ")"))
+		b.WriteString(theme.Text.Render("Running version: " + components.SanitizeText(diagnostics.State.Version) + " (" + components.SanitizeText(diagnostics.State.Commit) + ")"))
 	}
-	if ds.HaveInfo || ds.AlignChecked {
+	if diagnostics.State.HaveInfo || diagnostics.State.AlignChecked {
 		align := "unknown"
-		if ds.AlignChecked {
-			if ds.Aligned {
+		if diagnostics.State.AlignChecked {
+			if diagnostics.State.Aligned {
 				align = "aligned"
 			} else {
 				align = "BEHIND (restart needed)"
@@ -787,7 +1055,166 @@ func buildDaemonStatusPrompt(level orchestrator.HealthcheckSetupLevel, keyword, 
 		b.WriteString("\n")
 		b.WriteString(theme.Text.Render("Binary alignment: " + align))
 	}
+	if diagnostics.Runtime.Availability == daemonRuntimeAvailable {
+		b.WriteString("\n")
+		b.WriteString(theme.Text.Render("Running daemon configuration: " + components.SanitizeText(diagnostics.Runtime.ConfigPath)))
+		b.WriteString("\n")
+		b.WriteString(theme.Text.Render("Running daemon loaded at: " + time.Unix(diagnostics.Runtime.StartTS, 0).Format(time.RFC3339)))
+	} else if diagnostics.Runtime.Availability != daemonRuntimeNotApplicable {
+		b.WriteString("\n")
+		b.WriteString(theme.WarningText.Render("Running daemon personal-script state: UNAVAILABLE"))
+		if reason := components.SanitizeText(diagnostics.Runtime.Reason); reason != "" {
+			b.WriteString(theme.Subtle.Render(" (" + reason + ")"))
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString(buildDashboardBackupSchedule(diagnostics.Schedule))
+	b.WriteString("\n")
+	b.WriteString(buildDashboardPersonalScriptComparison("Personal pre-run script", diagnostics.Runtime, diagnostics.ScriptComparisons.Pre))
+	b.WriteString("\n")
+	b.WriteString(buildDashboardPersonalScriptComparison("Personal post-run script", diagnostics.Runtime, diagnostics.ScriptComparisons.Post))
 	return b.String()
+}
+
+// buildDashboardBackupSchedule is the dashboard form of the backup schedule block (todo points
+// 30-31, part C): values in the normal colour with their detail in grey, IN SYNC green, OUT OF
+// SYNC and the unavailable states yellow, PENDING normal, NOT RUNNING and NOT APPLICABLE grey.
+func buildDashboardBackupSchedule(c scheduleComparison) string {
+	value := func(cad cron.Cadence) string {
+		keyword, detail := scheduleStatusValue(cad)
+		return theme.Text.Render(keyword) + theme.Subtle.Render(" ("+detail+")")
+	}
+	var b strings.Builder
+	b.WriteString(theme.Text.Render("Backup schedule:"))
+	b.WriteString("\n")
+	b.WriteString(theme.Text.Render("  Daemon now: "))
+	switch c.RunningState {
+	case scheduleSideNotRunning:
+		b.WriteString(theme.Subtle.Render("NOT RUNNING"))
+	case scheduleSideUnavailable:
+		b.WriteString(theme.WarningText.Render("UNAVAILABLE") + theme.Subtle.Render(" ("+components.SanitizeText(c.RunningReason)+")"))
+	default:
+		b.WriteString(value(c.Running))
+	}
+	b.WriteString("\n")
+	b.WriteString(theme.Text.Render("  Configuration: "))
+	switch c.CurrentState {
+	case scheduleSideInvalid:
+		b.WriteString(theme.WarningText.Render("INVALID") + theme.Subtle.Render(" ("+components.SanitizeText(c.CurrentReason)+")"))
+	case scheduleSideUnknown:
+		b.WriteString(theme.WarningText.Render("UNKNOWN") + theme.Subtle.Render(": "+components.SanitizeText(c.CurrentReason)))
+	default:
+		b.WriteString(value(c.Current))
+	}
+	b.WriteString("\n")
+	b.WriteString(theme.Text.Render("  Synchronization: "))
+	reason := components.SanitizeText(c.SyncReason)
+	switch c.Sync {
+	case scheduleInSync:
+		b.WriteString(theme.SuccessText.Render("IN SYNC"))
+	case scheduleOutOfSync:
+		b.WriteString(theme.WarningText.Render("OUT OF SYNC") + theme.Subtle.Render(" ("+reason+")"))
+	case schedulePending:
+		b.WriteString(theme.Text.Render("PENDING") + theme.Subtle.Render(" ("+reason+")"))
+	case scheduleSyncNotApplicable:
+		b.WriteString(theme.Subtle.Render("NOT APPLICABLE"))
+	default:
+		b.WriteString(theme.WarningText.Render("UNKNOWN") + theme.Subtle.Render(" ("+reason+")"))
+	}
+	return b.String()
+}
+
+func buildDashboardPersonalScriptComparison(label string, runtime daemonRuntimeDiagnostic, comparison personalScriptComparison) string {
+	var b strings.Builder
+	b.WriteString(theme.Text.Render(label + ":"))
+	b.WriteString("\n")
+	switch runtime.Availability {
+	case daemonRuntimeAvailable:
+		b.WriteString(buildDashboardPersonalScriptLine("  Daemon now", comparison.Running))
+	case daemonRuntimeNotApplicable:
+		b.WriteString(theme.Subtle.Render("  Daemon now: NOT RUNNING"))
+	default:
+		reason := components.SanitizeText(runtime.Reason)
+		b.WriteString(theme.WarningText.Render("  Daemon now: UNAVAILABLE"))
+		if reason != "" {
+			b.WriteString(theme.Subtle.Render(" (" + reason + ")"))
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString(buildDashboardPersonalScriptLine("  Configuration", comparison.Current))
+	b.WriteString("\n")
+	b.WriteString(buildDashboardPersonalScriptSynchronization(comparison))
+	return b.String()
+}
+
+func buildDashboardPersonalScriptSynchronization(comparison personalScriptComparison) string {
+	reason := components.SanitizeText(comparison.SyncReason)
+	prefix := theme.Text.Render("  Synchronization: ")
+	switch comparison.Synchronization {
+	case personalScriptInSync:
+		return prefix + theme.SuccessText.Render("IN SYNC")
+	case personalScriptConfigurationDrift:
+		return prefix + theme.WarningText.Render("OUT OF SYNC") + theme.Subtle.Render(" ("+reason+")")
+	case personalScriptPathStateChanged:
+		return prefix + theme.WarningText.Render("PATH STATE CHANGED SINCE STARTUP") + theme.Subtle.Render(" ("+reason+")")
+	case personalScriptRuntimeUnavailable, personalScriptCurrentUnavailable:
+		return prefix + theme.WarningText.Render("UNKNOWN") + theme.Subtle.Render(" ("+reason+")")
+	case personalScriptSyncNotApplicable:
+		return prefix + theme.Subtle.Render("NOT APPLICABLE")
+	default:
+		return prefix + theme.WarningText.Render("UNKNOWN")
+	}
+}
+
+func buildDashboardPersonalScriptLine(label string, diagnostic personalScriptDiagnostic) string {
+	line := theme.Text.Render(label + ": ")
+	path := components.SanitizeText(diagnostic.Path)
+	reason := components.SanitizeText(diagnostic.Reason)
+	switch diagnostic.State {
+	case personalScriptReady:
+		line += theme.SuccessText.Render("READY")
+		if path != "" {
+			line += theme.Subtle.Render(" (" + path + ")")
+		}
+	case personalScriptReadyWithWarning:
+		line += theme.WarningText.Render("READY WITH WARNING")
+		if path != "" {
+			line += theme.Subtle.Render(" (" + path + ")")
+		}
+		if reason != "" {
+			line += theme.Subtle.Render(": " + reason)
+		}
+		// The mitigation the accepted ancestor RESTS ON, on its own line under the
+		// verdict, exactly where logPersonalScriptDiagnostic puts it. Leaving it out
+		// showed the trust decision without what stands behind it, on the screen an
+		// operator is most likely to be reading.
+		if advisory := components.SanitizeText(diagnostic.HardlinkAdvisory); advisory != "" {
+			style := theme.WarningText
+			if diagnostic.HardlinkProtectionInForce {
+				style = theme.Subtle
+			}
+			line += "\n" + theme.Text.Render(label+": ") + style.Render(advisory)
+		}
+	case personalScriptRefused:
+		line += theme.ErrorText.Render("REFUSED")
+		if path != "" {
+			line += theme.Subtle.Render(" (" + path + ")")
+		}
+		if reason != "" {
+			line += theme.Subtle.Render(": " + reason)
+		}
+	case personalScriptUnknown:
+		line += theme.WarningText.Render("UNKNOWN")
+		if reason != "" {
+			line += theme.Subtle.Render(": " + reason)
+		}
+	default:
+		line += theme.Subtle.Render("NOT CONFIGURED")
+		if assignment := components.SanitizeText(diagnostic.Assignment); assignment != "" {
+			line += theme.Subtle.Render(" (" + assignment + ")")
+		}
+	}
+	return line
 }
 
 // daemonStatusStyle maps a composed daemon state to a shared HealthcheckSetupLevel (the SAME

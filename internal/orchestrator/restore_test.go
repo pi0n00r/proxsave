@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -212,30 +213,9 @@ func TestParseZpoolImportOutput(t *testing.T) {
 
 	expected := []string{"tank", "backup_ext"}
 	for _, want := range expected {
-		found := false
-		for _, pool := range pools {
-			if pool == want {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(pools, want)
 		if !found {
 			t.Fatalf("expected pool %q to be parsed from output", want)
-		}
-	}
-}
-
-func TestCombinePoolNames(t *testing.T) {
-	got := combinePoolNames([]string{"tank", "pool2"}, []string{"pool2", "pool3"})
-	expected := []string{"pool2", "pool3", "tank"}
-
-	if len(got) != len(expected) {
-		t.Fatalf("expected %d pools, got %d (%v)", len(expected), len(got), got)
-	}
-
-	for i, pool := range expected {
-		if got[i] != pool {
-			t.Fatalf("expected %v, got %v", expected, got)
 		}
 	}
 }
@@ -944,29 +924,6 @@ func TestShortHost(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// sanitizeID tests
-// --------------------------------------------------------------------------
-
-func TestSanitizeID(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"local", "local"},
-		{"local-backup", "local-backup"},
-		{"local/backup", "local_backup"},
-		{"a:b:c", "a_b_c"},
-		{"test@123", "test_123"},
-	}
-
-	for _, tc := range tests {
-		if got := sanitizeID(tc.input); got != tc.expected {
-			t.Fatalf("sanitizeID(%q) = %q, want %q", tc.input, got, tc.expected)
-		}
-	}
-}
-
-// --------------------------------------------------------------------------
 // shouldStopPBSServices tests
 // --------------------------------------------------------------------------
 
@@ -1004,27 +961,6 @@ func TestShouldStopPBSServices(t *testing.T) {
 				t.Fatalf("shouldStopPBSServices() = %v, want %v", got, tc.expected)
 			}
 		})
-	}
-}
-
-// --------------------------------------------------------------------------
-// splitExportCategories tests
-// --------------------------------------------------------------------------
-
-func TestSplitExportCategories(t *testing.T) {
-	categories := []Category{
-		{ID: "ssl", ExportOnly: false},
-		{ID: "pve_cluster", ExportOnly: true},
-		{ID: "network", ExportOnly: false},
-		{ID: "secrets", ExportOnly: true},
-	}
-
-	normal, export := splitExportCategories(categories)
-	if len(normal) != 2 {
-		t.Fatalf("expected 2 normal, got %d", len(normal))
-	}
-	if len(export) != 2 {
-		t.Fatalf("expected 2 export, got %d", len(export))
 	}
 }
 
@@ -1385,16 +1321,11 @@ func TestPveshArgsFromColonConfigLinesStopsAtSectionHeader(t *testing.T) {
 	}
 }
 
-func TestPveshCreateGuestArgsIncludesLXCOstemplate(t *testing.T) {
-	args, err := pveshCreateGuestArgs("node1", vmEntry{VMID: "101", Kind: "lxc"}, []string{"--hostname=ct101", "--ostemplate=local:vztmpl/debian.tar.zst"})
-	if err != nil {
-		t.Fatalf("pveshCreateGuestArgs error = %v", err)
-	}
-	got := strings.Join(args, " ")
-	if !strings.Contains(got, "create /nodes/node1/lxc --vmid=101") || !strings.Contains(got, "--ostemplate=local:vztmpl/debian.tar.zst") {
-		t.Fatalf("unexpected create args: %v", args)
-	}
-}
+// TestPveshCreateGuestArgsIncludesLXCOstemplate is gone with its subject:
+// pveshCreateGuestArgs demanded an ostemplate no real conf carries (the test
+// hand-fed it, an input no backup produces - fable-check bug 3). A missing
+// guest is now registered by writing its staged conf into pmxcfs; see
+// pve_guest_apply_test.go.
 
 // --------------------------------------------------------------------------
 // detectConfiguredZFSPools tests
@@ -1417,4 +1348,8 @@ func TestDetectConfiguredZFSPools_NoUnits(t *testing.T) {
 	if len(pools) != 0 {
 		t.Fatalf("expected 0 pools, got %d", len(pools))
 	}
+}
+
+func sanitizeRestoreEntryTarget(destRoot, entryName string) (string, string, error) {
+	return sanitizeRestoreEntryTargetWithFS(restoreFS, destRoot, entryName)
 }

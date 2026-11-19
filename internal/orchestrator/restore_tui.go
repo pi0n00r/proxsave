@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/tis24dev/proxsave/internal/config"
@@ -23,9 +23,20 @@ var errRestoreBackToMode = errors.New("restore mode back")
 // RunRestoreWorkflowTUI runs the restore workflow using the Charm UI: one
 // long-lived shell.Session whose screens are driven by the same
 // runRestoreWorkflowWithUI engine path the CLI uses.
-func RunRestoreWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logging.Logger, version, configPath, buildSig string) (err error) {
+//
+// runHostname is the name this run resolves as its own; it is what the access
+// control host check compares a restored bundle's hostname against, next to
+// os.Hostname(). Pass "" if it is not known: the check is then strict, which warns
+// more, never less.
+func RunRestoreWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logging.Logger, version, configPath, buildSig, runHostname string) (err error) {
 	if cfg == nil {
 		return fmt.Errorf("configuration not available")
+	}
+	// Before the session: opening it adopts the dashboard's handed-off session and
+	// takes over the screen, for a restore that is not going to run. The engine
+	// refuses too, but only after this entry has opened the session.
+	if cfg.DryRun {
+		return ErrRestoreDryRun
 	}
 	if logger == nil {
 		logger = logging.GetDefaultLogger()
@@ -58,7 +69,7 @@ func RunRestoreWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logg
 	defer func() { _ = session.Close() }()
 
 	ui := newCharmWorkflowUI(session, logger, ErrRestoreAborted)
-	err = runRestoreWorkflowWithUI(ctx, cfg, logger, version, ui)
+	err = runRestoreWorkflowWithUI(ctx, cfg, logger, version, ui, runHostname)
 	closeErr := session.Close()
 	switch {
 	case err != nil:
@@ -88,16 +99,16 @@ func filterAndSortCategoriesForSystem(available []Category, systemType SystemTyp
 	}
 
 	// Sort categories: PVE/PBS first, then common
-	sort.Slice(relevant, func(i, j int) bool {
-		if relevant[i].Type != relevant[j].Type {
-			if relevant[i].Type == CategoryTypeCommon {
-				return false
+	slices.SortFunc(relevant, func(a, b Category) int {
+		if a.Type != b.Type {
+			if a.Type == CategoryTypeCommon {
+				return 1
 			}
-			if relevant[j].Type == CategoryTypeCommon {
-				return true
+			if b.Type == CategoryTypeCommon {
+				return -1
 			}
 		}
-		return relevant[i].Name < relevant[j].Name
+		return strings.Compare(a.Name, b.Name)
 	})
 
 	return relevant

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/tis24dev/proxsave/internal/logging"
@@ -77,17 +78,17 @@ func NewFilesystemDetector(logger *logging.Logger, opts ...DetectorOption) *File
 // This function logs the detected filesystem type in real-time
 func (d *FilesystemDetector) DetectFilesystem(ctx context.Context, path string) (*FilesystemInfo, error) {
 	// Ensure path exists. Bounded so a dead/stale mount does not wedge here.
-	if _, err := safefs.Stat(ctx, path, d.ioTimeout); err != nil {
+	pathInfo, err := safefs.Stat(ctx, path, d.ioTimeout)
+	if err != nil {
 		return nil, fmt.Errorf("path does not exist: %s: %w", path, err)
 	}
 
 	// Get mount point for this path
-	var mountPoint string
-	var err error
+	var mountPoint, linkTarget string
 	if d.mountPointLookup != nil {
 		mountPoint, err = d.mountPointLookup(path)
 	} else {
-		mountPoint, err = d.getMountPoint(path)
+		mountPoint, linkTarget, err = d.getMountPoint(ctx, path, pathInfo)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get mount point for %s: %w", path, err)
@@ -112,6 +113,7 @@ func (d *FilesystemDetector) DetectFilesystem(ctx context.Context, path string) 
 		IsNetworkFS:       fsType.IsNetworkFilesystem(),
 		MountPoint:        mountPoint,
 		Device:            device,
+		LinkTarget:        linkTarget,
 	}
 
 	// Log the detected filesystem in real-time (live output)
@@ -131,16 +133,16 @@ func (d *FilesystemDetector) DetectFilesystem(ctx context.Context, path string) 
 			supportsOwnership := testFn(ctx, path)
 			info.SupportsOwnership = supportsOwnership
 			if supportsOwnership {
-				d.logger.Info("Network filesystem %s supports Unix ownership", fsType)
+				d.logger.Debug("Network filesystem %s supports Unix ownership", fsType)
 			} else {
-				d.logger.Info("Network filesystem %s does NOT support Unix ownership", fsType)
+				d.logger.Debug("Network filesystem %s does NOT support Unix ownership", fsType)
 			}
 		}
 	}
 
 	// Auto-exclude incompatible filesystems
 	if fsType.ShouldAutoExclude() {
-		d.logger.Info("Filesystem %s is incompatible with Unix ownership - will skip chown/chmod", fsType)
+		d.logger.Debug("Filesystem %s is incompatible with Unix ownership - will skip chown/chmod", fsType)
 	}
 
 	return info, nil
@@ -158,32 +160,101 @@ func (d *FilesystemDetector) logFilesystemInfo(info *FilesystemInfo) {
 		network = " [network]"
 	}
 
+	link := ""
+	if info.LinkTarget != "" {
+		link = " [link to: " + info.LinkTarget + "]"
+	}
+
 	// Log in format: "Path: /path/to/backup -> Filesystem: ext4 (supports ownership)" (debug-level, detailed summary printed elsewhere)
-	d.logger.Debug("Path: %s -> Filesystem: %s (%s)%s [mount: %s]",
+	d.logger.Debug("Path: %s -> Filesystem: %s (%s)%s [mount: %s]%s",
 		info.Path,
 		info.Type,
 		ownership,
 		network,
 		info.MountPoint,
+		link,
 	)
 }
 
-// getMountPoint finds the mount point for a given path
-func (d *FilesystemDetector) getMountPoint(path string) (string, error) {
-	// Read /proc/mounts to find mount points
-	data, err := os.ReadFile("/proc/mounts")
-	if err != nil {
-		return "", err
-	}
-
-	lines := strings.Split(string(data), "\n")
-	bestMatch := "/"
-	bestMatchLen := 0
-
+// getMountPoint finds the mount point that holds path, and where path resolves when a
+// symlink is on the way ("" when none is). The mount is found by device: the st_dev of
+// path (the stat follows links) against /proc/self/mountinfo. Matching the path string
+// against /proc/mounts gave a BACKUP_PATH that is a link into an NFS share the type of
+// the filesystem holding the link: ext4 with ownership, so the security check tried to
+// chown the root_squash share and the run stopped with exit 14. A device no mountinfo
+// entry carries (btrfs subvolumes report their own) falls back to the deepest mount
+// whose path holds the resolved path.
+func (d *FilesystemDetector) getMountPoint(ctx context.Context, path string, pathInfo os.FileInfo) (mountPoint, linkTarget string, err error) {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		absPath = path
 	}
+	resolved, rerr := safefs.Run(ctx, "resolve symlinks", absPath, d.ioTimeout, func() (string, error) {
+		return filepath.EvalSymlinks(absPath)
+	})
+	if rerr != nil {
+		d.logger.Debug("Filesystem detection: cannot resolve %s: %v; matching it as written", absPath, rerr)
+		resolved = absPath
+	}
+	if resolved != absPath {
+		linkTarget = resolved
+	}
+
+	if st, ok := pathInfo.Sys().(*syscall.Stat_t); ok {
+		if data, merr := os.ReadFile("/proc/self/mountinfo"); merr == nil {
+			devID := deviceID(uint64(st.Dev))
+			if mp, found := mountPointForDevice(strings.Split(string(data), "\n"), devID, resolved); found {
+				d.logger.Debug("Filesystem detection: %s is on device %s, mounted at %s", path, devID, mp)
+				return mp, linkTarget, nil
+			}
+			d.logger.Debug("Filesystem detection: no mountinfo entry for device %s of %s; matching %s by path", devID, path, resolved)
+		} else {
+			d.logger.Debug("Filesystem detection: cannot read /proc/self/mountinfo: %v; matching %s by path", merr, resolved)
+		}
+	}
+
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return "", "", err
+	}
+	return bestMountPointFor(strings.Split(string(data), "\n"), resolved), linkTarget, nil
+}
+
+// deviceID renders a device number as mountinfo's "major:minor", with glibc's
+// major()/minor() split of the Linux dev_t.
+func deviceID(dev uint64) string {
+	major := (dev>>8)&0xfff | (dev>>32)&^uint64(0xfff)
+	minor := dev&0xff | (dev>>12)&^uint64(0xff)
+	return fmt.Sprintf("%d:%d", major, minor)
+}
+
+// mountPointForDevice picks, among the /proc/self/mountinfo lines of device devID, the
+// deepest mount point that holds resolved; when none does (a bind mount reached through
+// another path), the last entry of the device. found is false when no line has devID.
+func mountPointForDevice(lines []string, devID, resolved string) (mountPoint string, found bool) {
+	best, last := "", ""
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[2] != devID {
+			continue
+		}
+		mp := unescapeOctal(fields[4])
+		last = mp
+		if (mp == "/" || resolved == mp || strings.HasPrefix(resolved, mp+"/")) && len(mp) > len(best) {
+			best = mp
+		}
+	}
+	if best != "" {
+		return best, true
+	}
+	return last, last != ""
+}
+
+// bestMountPointFor picks the deepest mount point owning absPath from /proc/mounts
+// lines, defaulting to "/".
+func bestMountPointFor(lines []string, absPath string) string {
+	bestMatch := "/"
+	bestMatchLen := 0
 
 	for _, line := range lines {
 		fields := strings.Fields(line)
@@ -195,8 +266,10 @@ func (d *FilesystemDetector) getMountPoint(path string) (string, error) {
 		// Unescape octal sequences like \040 (space)
 		mountPoint = unescapeOctal(mountPoint)
 
-		// Check if this path is under this mount point
-		if strings.HasPrefix(absPath, mountPoint) {
+		// Under this mount point by PATH BOUNDARY: a bare prefix check let a
+		// sibling mount whose path is a string prefix win (/mnt/nas vs /mnt/nas2),
+		// and a dead sibling then aborted the backup of a healthy path.
+		if mountPoint == "/" || absPath == mountPoint || strings.HasPrefix(absPath, mountPoint+"/") {
 			if len(mountPoint) > bestMatchLen {
 				bestMatch = mountPoint
 				bestMatchLen = len(mountPoint)
@@ -204,7 +277,7 @@ func (d *FilesystemDetector) getMountPoint(path string) (string, error) {
 		}
 	}
 
-	return bestMatch, nil
+	return bestMatch
 }
 
 // getFilesystemType gets the filesystem type for a mount point using df
@@ -221,22 +294,30 @@ func (d *FilesystemDetector) getFilesystemType(ctx context.Context, mountPoint s
 		return FilesystemUnknown, "", err
 	}
 
-	lines := strings.Split(string(data), "\n")
+	if fsTypeStr, device, ok := lastMountEntryFor(strings.Split(string(data), "\n"), mountPoint); ok {
+		return parseFilesystemType(fsTypeStr), device, nil
+	}
+
+	return FilesystemUnknown, "", fmt.Errorf("filesystem type not found in /proc/mounts")
+}
+
+// lastMountEntryFor returns the type and device of the LAST /proc/mounts entry for
+// mountPoint. The kernel appends mounts in order, so with stacked entries the last
+// one is the filesystem a path actually resolves to - under a systemd automount the
+// autofs placeholder comes first and the triggered real filesystem after it, and
+// answering with the first entry made the backup path look like an Unknown autofs:
+// no network ownership probe, chown/chmod on stored backups silently skipped.
+func lastMountEntryFor(lines []string, mountPoint string) (fsTypeStr, device string, ok bool) {
 	for _, line := range lines {
 		fields := strings.Fields(line)
 		if len(fields) < 3 {
 			continue
 		}
-
-		mount := unescapeOctal(fields[1])
-		if mount == mountPoint {
-			fsTypeStr := fields[2]
-			device := fields[0]
-			return parseFilesystemType(fsTypeStr), device, nil
+		if unescapeOctal(fields[1]) == mountPoint {
+			fsTypeStr, device, ok = fields[2], fields[0], true
 		}
 	}
-
-	return FilesystemUnknown, "", fmt.Errorf("filesystem type not found in /proc/mounts")
+	return fsTypeStr, device, ok
 }
 
 // testOwnershipSupport tests if a filesystem actually supports Unix ownership
@@ -312,6 +393,13 @@ func (d *FilesystemDetector) testOwnershipSupport(ctx context.Context, path stri
 // parseFilesystemType converts a filesystem type string to FilesystemType
 func parseFilesystemType(fsTypeStr string) FilesystemType {
 	fsTypeStr = strings.ToLower(fsTypeStr)
+	// CephFS had no case: the kernel client ("ceph") fell to unknown and ceph-fuse to
+	// the FUSE rule, both "no ownership", so backup permissions were never applied on a
+	// common PVE destination that takes POSIX ownership.
+	switch fsTypeStr {
+	case "ceph", "fuse.ceph-fuse", "fuse.ceph":
+		return FilesystemCeph
+	}
 	if strings.HasPrefix(fsTypeStr, "fuse.") {
 		return FilesystemFUSE
 	}
@@ -341,6 +429,8 @@ func parseFilesystemType(fsTypeStr string) FilesystemType {
 		return FilesystemFAT32
 	case "fat", "fat16":
 		return FilesystemFAT
+	case "msdos":
+		return FilesystemMSDOS
 	case "exfat":
 		return FilesystemExFAT
 	case "ntfs", "ntfs-3g":
@@ -368,7 +458,7 @@ func unescapeOctal(s string) string {
 			// Try to parse octal sequence (exactly 3 octal digits)
 			octal := s[i+1 : i+4]
 			valid := true
-			for j := 0; j < 3; j++ {
+			for j := range 3 {
 				if octal[j] < '0' || octal[j] > '7' {
 					valid = false
 					break
@@ -389,7 +479,39 @@ func unescapeOctal(s string) string {
 	return result.String()
 }
 
-// SetPermissions sets file permissions and ownership, respecting filesystem capabilities
+// PermissionsError is what SetPermissions could not apply to one file: the owner
+// (chown), the mode (chmod), or both. A nil field is an operation that succeeded. The
+// storage blocks print one fact per failed operation, in the order they run
+// ("  Owner failed: ...", then "  Permissions failed: ...").
+type PermissionsError struct {
+	Owner error
+	Mode  error
+}
+
+func (e *PermissionsError) Error() string {
+	var parts []string
+	for _, err := range []error{e.Owner, e.Mode} {
+		if err != nil {
+			parts = append(parts, err.Error())
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (e *PermissionsError) Unwrap() []error {
+	var errs []error
+	for _, err := range []error{e.Owner, e.Mode} {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+// SetPermissions sets file permissions and ownership, respecting filesystem
+// capabilities. A failed chown no longer stops the chmod, and neither is dropped: the
+// result is a *PermissionsError carrying each operation that failed, nil when both
+// succeeded.
 func (d *FilesystemDetector) SetPermissions(ctx context.Context, path string, uid, gid int, mode os.FileMode, fsInfo *FilesystemInfo) error {
 	// If filesystem doesn't support ownership, skip
 	if fsInfo != nil && !fsInfo.SupportsOwnership {
@@ -397,25 +519,33 @@ func (d *FilesystemDetector) SetPermissions(ctx context.Context, path string, ui
 		return nil
 	}
 
+	var failed PermissionsError
+
 	// Try to set ownership (bounded against a dead/stale mount).
 	if _, err := safefs.Run(ctx, "setperm-chown", path, d.ioTimeout, func() (struct{}, error) {
 		return struct{}{}, os.Chown(path, uid, gid)
 	}); err != nil {
-		// On compatible filesystem, this is a warning (not an error)
-		if fsInfo != nil && !fsInfo.Type.ShouldAutoExclude() {
-			d.logger.Warning("Failed to set ownership for %s (filesystem %s): %v", path, fsInfo.Type, err)
-		}
-		// Don't return error - continue with chmod
+		d.logger.Debug("Failed to set ownership for %s (filesystem %s): %v", path, fsTypeLabel(fsInfo), err)
+		// Continue with chmod: the mode is worth setting even when the owner is not.
+		failed.Owner = err
 	}
 
 	// Try to set permissions (bounded against a dead/stale mount).
 	if err := safefs.Chmod(ctx, path, mode, d.ioTimeout); err != nil {
-		// On compatible filesystem, this is a warning (not an error)
-		if fsInfo != nil && !fsInfo.Type.ShouldAutoExclude() {
-			d.logger.Warning("Failed to set permissions for %s (filesystem %s): %v", path, fsInfo.Type, err)
-		}
-		return err
+		d.logger.Debug("Failed to set permissions for %s (filesystem %s): %v", path, fsTypeLabel(fsInfo), err)
+		failed.Mode = err
 	}
 
-	return nil
+	if failed.Owner == nil && failed.Mode == nil {
+		return nil
+	}
+	return &failed
+}
+
+// fsTypeLabel is the filesystem type a DEBUG line names, "unknown" without a detection.
+func fsTypeLabel(fsInfo *FilesystemInfo) string {
+	if fsInfo == nil || fsInfo.Type == "" {
+		return "unknown"
+	}
+	return string(fsInfo.Type)
 }

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tis24dev/proxsave/internal/filelock"
 	"github.com/tis24dev/proxsave/internal/logging"
 )
 
@@ -155,6 +156,18 @@ func (r *TempDirRegistry) Deregister(dir string) error {
 // CleanupOrphaned removes entries whose processes are gone or directories are too old.
 // Returns the number of directories successfully removed.
 func (r *TempDirRegistry) CleanupOrphaned(maxAge time.Duration) (int, error) {
+	return r.sweepOrphaned(maxAge, false)
+}
+
+// CountOrphaned is the dry-run counterpart of CleanupOrphaned: it returns how many
+// directories CleanupOrphaned would remove and removes none of them, keeping their
+// entries. Untrusted entries are still dropped from the registry with the same
+// warning, as in a real run: that touches the registry only, never the filesystem.
+func (r *TempDirRegistry) CountOrphaned(maxAge time.Duration) (int, error) {
+	return r.sweepOrphaned(maxAge, true)
+}
+
+func (r *TempDirRegistry) sweepOrphaned(maxAge time.Duration, dryRun bool) (int, error) {
 	now := time.Now().UTC()
 	cleanedCount := 0
 	err := r.withLock(func(entries []tempDirRecord) ([]tempDirRecord, error) {
@@ -169,6 +182,14 @@ func (r *TempDirRegistry) CleanupOrphaned(maxAge time.Duration) (int, error) {
 						r.logger.Warning("Refusing to remove registry entry %s: not a ProxSave workspace under %s; dropping untrusted entry", entry.Path, workspaceRoot)
 					}
 					// Drop the untrusted entry without touching the filesystem path.
+					continue
+				}
+				if dryRun {
+					if r.logger != nil {
+						r.logger.Debug("[DRY RUN] Would remove orphaned temp dir %s (pid=%d)", entry.Path, entry.PID)
+					}
+					updated = append(updated, entry)
+					cleanedCount++
 					continue
 				}
 				if r.logger != nil {
@@ -209,22 +230,13 @@ func (r *TempDirRegistry) withLock(mutator func([]tempDirRecord) ([]tempDirRecor
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	lockFile, err := os.OpenFile(r.lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	releaseLock, err := filelock.Acquire(r.lockPath)
 	if err != nil {
-		return fmt.Errorf("open registry lock: %w", err)
+		return fmt.Errorf("lock registry: %w", err)
 	}
 	defer func() {
-		if closeErr := lockFile.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close registry lock: %w", closeErr)
-		}
-	}()
-
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock registry: %w", err)
-	}
-	defer func() {
-		if unlockErr := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); unlockErr != nil && err == nil {
-			err = fmt.Errorf("unlock registry: %w", unlockErr)
+		if releaseErr := releaseLock(); releaseErr != nil && err == nil {
+			err = fmt.Errorf("release registry lock: %w", releaseErr)
 		}
 	}()
 

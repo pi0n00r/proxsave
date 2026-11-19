@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -214,13 +215,19 @@ func TestBuildBackupCmdSetsRunIDEnv(t *testing.T) {
 	}, time.Hour)
 
 	// rid set -> PROXSAVE_RUN_ID=rid42 is appended.
-	cmd := d.buildBackupCmd(context.Background(), nil, "rid42")
+	cmd, err := d.buildBackupCmd(context.Background(), nil, "rid42")
+	if err != nil {
+		t.Fatalf("buildBackupCmd: %v", err)
+	}
 	if !envContains(cmd.Env, health.EnvRunID+"=rid42") {
 		t.Fatalf("cmd.Env must carry %s=rid42, got %v", health.EnvRunID, cmd.Env)
 	}
 
 	// rid empty -> no PROXSAVE_RUN_ID entry is added.
-	cmd = d.buildBackupCmd(context.Background(), nil, "")
+	cmd, err = d.buildBackupCmd(context.Background(), nil, "")
+	if err != nil {
+		t.Fatalf("buildBackupCmd: %v", err)
+	}
 	for _, e := range cmd.Env {
 		if strings.HasPrefix(e, health.EnvRunID+"=") {
 			t.Fatalf("empty rid must not add %s, got %q", health.EnvRunID, e)
@@ -229,10 +236,72 @@ func TestBuildBackupCmdSetsRunIDEnv(t *testing.T) {
 }
 
 func envContains(env []string, want string) bool {
-	for _, e := range env {
-		if e == want {
-			return true
-		}
+	return slices.Contains(env, want)
+}
+
+// A channel NOTIFY_ON filtered did not send, so it is not pinged; but it is still configured, so its
+// row keeps the last real delivery instead of being pruned like a switched-off channel. Yesterday's
+// failed send stays visible while the event-driven check on the monitor is still DOWN for it.
+func TestReportNotifyOutcomesKeepsTheRowOfAFilteredChannel(t *testing.T) {
+	base := t.TempDir()
+	rid := "rid-filtered"
+	yesterday := time.Now().Add(-24 * time.Hour).Unix()
+	if err := health.RecordNotifyPing(base, "self", "notify-telegram", yesterday, true, true, nil); err != nil {
+		t.Fatalf("seed telegram: %v", err)
 	}
-	return false
+	if err := health.RecordNotifyPing(base, "self", "notify-webhook", yesterday, true, false, nil); err != nil {
+		t.Fatalf("seed webhook: %v", err)
+	}
+	rep := &fakeReporter{checks: map[string]bool{"notify-email": true, "notify-telegram": true, "notify-webhook": true}}
+	d := notifyDaemon(base, "self")
+	results := map[string]string{"Email": "ok", "Telegram": "filtered", "Webhook": "disabled"}
+	if err := health.WriteNotifyResults(base, rid, time.Now().Unix(), results); err != nil {
+		t.Fatalf("WriteNotifyResults: %v", err)
+	}
+
+	d.reportNotifyOutcomes(context.Background(), rep, rid)
+
+	pings := pingByName(rep.snapshot().pings)
+	if len(pings) != 1 || pings["notify-email"].suffix != "/0" {
+		t.Fatalf("want only the notify-email /0 ping, got %#v", pings)
+	}
+	st, err := health.LoadStatus(base)
+	if err != nil {
+		t.Fatalf("LoadStatus: %v", err)
+	}
+	tg := st.Record("notify-telegram")
+	if tg == nil || !tg.Down || tg.TS != yesterday {
+		t.Fatalf("notify-telegram record = %+v; want yesterday's failed send kept as it was", tg)
+	}
+	if r := st.Record("notify-webhook"); r != nil {
+		t.Fatalf("a switched-off channel is still pruned, got %+v", r)
+	}
+}
+
+// The child hands its results over as a map; the daemon pings and records the channels in
+// channel-name order, so the same results always reach the monitor in the same order.
+func TestReportNotifyOutcomesPingsInChannelNameOrder(t *testing.T) {
+	base := t.TempDir()
+	rid := "rid-order"
+	rep := &fakeReporter{checks: map[string]bool{
+		"notify-email":    true,
+		"notify-gotify":   true,
+		"notify-telegram": true,
+	}}
+	d := notifyDaemon(base, "self")
+	results := map[string]string{"Telegram": "ok", "Email": "error", "Gotify": "warning"}
+	if err := health.WriteNotifyResults(base, rid, time.Now().Unix(), results); err != nil {
+		t.Fatalf("WriteNotifyResults: %v", err)
+	}
+
+	d.reportNotifyOutcomes(context.Background(), rep, rid)
+
+	var got []string
+	for _, p := range rep.snapshot().pings {
+		got = append(got, p.name)
+	}
+	want := []string{"notify-email", "notify-gotify", "notify-telegram"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ping order = %v, want %v", got, want)
+	}
 }

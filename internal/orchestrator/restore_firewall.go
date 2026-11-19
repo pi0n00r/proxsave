@@ -178,7 +178,7 @@ func maybeApplyPVEFirewallWithUI(
 	}
 	logging.DebugStep(logger, "pve firewall restore (ui)", "User choice: applyNow=%v", applyNow)
 	if !applyNow {
-		logger.Info("Skipping PVE firewall apply (you can apply manually later).")
+		logger.Info("PVE firewall - not applied: this host keeps its current firewall configuration")
 		return nil
 	}
 
@@ -453,11 +453,15 @@ func armFirewallRollback(ctx context.Context, logger *logging.Logger, backupPath
 	}
 
 	timestamp := nowRestore().Format("20060102_150405")
+	logPath, err := rollbackLogPath(fmt.Sprintf("firewall_rollback_%s.log", timestamp))
+	if err != nil {
+		return nil, err
+	}
 	handle = &firewallRollbackHandle{
 		workDir:    baseDir,
 		markerPath: filepath.Join(baseDir, fmt.Sprintf("firewall_rollback_pending_%s", timestamp)),
 		scriptPath: filepath.Join(baseDir, fmt.Sprintf("firewall_rollback_%s.sh", timestamp)),
-		logPath:    filepath.Join(baseDir, fmt.Sprintf("firewall_rollback_%s.log", timestamp)),
+		logPath:    logPath,
 		armedAt:    nowRestore(),
 		timeout:    timeout,
 	}
@@ -471,10 +475,7 @@ func armFirewallRollback(ctx context.Context, logger *logging.Logger, backupPath
 		return nil, fmt.Errorf("write rollback script: %w", err)
 	}
 
-	timeoutSeconds := int(timeout.Seconds())
-	if timeoutSeconds < 1 {
-		timeoutSeconds = 1
-	}
+	timeoutSeconds := max(int(timeout.Seconds()), 1)
 
 	if commandAvailable("systemd-run") {
 		handle.unitName = fmt.Sprintf("proxsave-firewall-rollback-%s", timestamp)
@@ -526,6 +527,7 @@ func buildFirewallRollbackScript(markerPath, backupPath, logPath string) string 
 		"#!/bin/sh",
 		"set -eu",
 		fmt.Sprintf("LOG=%s", shellQuote(logPath)),
+		rollbackLogProbe,
 		fmt.Sprintf("MARKER=%s", shellQuote(markerPath)),
 		fmt.Sprintf("BACKUP=%s", shellQuote(backupPath)),
 		`echo "[INFO] ========================================" >> "$LOG"`,

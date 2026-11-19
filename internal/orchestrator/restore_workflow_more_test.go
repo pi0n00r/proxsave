@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -31,7 +32,6 @@ func TestRunRestoreWorkflow_ClusterBackupSafeMode_ExportsClusterAndRestoresNetwo
 	origRestoreCmd := restoreCmd
 	origRestoreSystem := restoreSystem
 	origRestoreTime := restoreTime
-	origCompatFS := compatFS
 	origPrepare := prepareRestoreBundleFunc
 	origSafetyFS := safetyFS
 	origSafetyNow := safetyNow
@@ -40,7 +40,6 @@ func TestRunRestoreWorkflow_ClusterBackupSafeMode_ExportsClusterAndRestoresNetwo
 		restoreCmd = origRestoreCmd
 		restoreSystem = origRestoreSystem
 		restoreTime = origRestoreTime
-		compatFS = origCompatFS
 		prepareRestoreBundleFunc = origPrepare
 		safetyFS = origSafetyFS
 		safetyNow = origSafetyNow
@@ -49,7 +48,6 @@ func TestRunRestoreWorkflow_ClusterBackupSafeMode_ExportsClusterAndRestoresNetwo
 	fakeFS := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(fakeFS.Root) })
 	restoreFS = fakeFS
-	compatFS = fakeFS
 	safetyFS = fakeFS
 
 	fakeNow := &FakeTime{Current: time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)}
@@ -114,7 +112,7 @@ func TestRunRestoreWorkflow_ClusterBackupSafeMode_ExportsClusterAndRestoresNetwo
 		clusterMode:    ClusterRestoreSafe,
 	}
 
-	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui); err != nil {
+	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, ""); err != nil {
 		t.Fatalf("runRestoreWorkflowWithUI error: %v", err)
 	}
 
@@ -143,7 +141,6 @@ func TestRunRestoreWorkflow_PBSStopsServicesAndChecksZFSWhenSelected(t *testing.
 	origRestoreCmd := restoreCmd
 	origRestoreSystem := restoreSystem
 	origRestoreTime := restoreTime
-	origCompatFS := compatFS
 	origPrepare := prepareRestoreBundleFunc
 	origSafetyFS := safetyFS
 	origSafetyNow := safetyNow
@@ -152,7 +149,6 @@ func TestRunRestoreWorkflow_PBSStopsServicesAndChecksZFSWhenSelected(t *testing.
 		restoreCmd = origRestoreCmd
 		restoreSystem = origRestoreSystem
 		restoreTime = origRestoreTime
-		compatFS = origCompatFS
 		prepareRestoreBundleFunc = origPrepare
 		safetyFS = origSafetyFS
 		safetyNow = origSafetyNow
@@ -161,7 +157,6 @@ func TestRunRestoreWorkflow_PBSStopsServicesAndChecksZFSWhenSelected(t *testing.
 	fakeFS := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(fakeFS.Root) })
 	restoreFS = fakeFS
-	compatFS = fakeFS
 	safetyFS = fakeFS
 
 	fakeNow := &FakeTime{Current: time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)}
@@ -235,7 +230,7 @@ func TestRunRestoreWorkflow_PBSStopsServicesAndChecksZFSWhenSelected(t *testing.
 		confirmRestore: true,
 	}
 
-	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui); err != nil {
+	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, ""); err != nil {
 		t.Fatalf("runRestoreWorkflowWithUI error: %v", err)
 	}
 
@@ -259,13 +254,7 @@ func TestRunRestoreWorkflow_PBSStopsServicesAndChecksZFSWhenSelected(t *testing.
 		"systemctl start proxmox-backup",
 	}
 	for _, want := range expected {
-		found := false
-		for _, call := range cmd.Calls {
-			if call == want {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(cmd.Calls, want)
 		if !found {
 			t.Fatalf("missing command call %q; calls=%v", want, cmd.Calls)
 		}
@@ -281,7 +270,6 @@ func TestRunRestoreWorkflow_IncompatibilityAndSafetyBackupFailureCanContinue(t *
 	origRestoreCmd := restoreCmd
 	origRestoreSystem := restoreSystem
 	origRestoreTime := restoreTime
-	origCompatFS := compatFS
 	origPrepare := prepareRestoreBundleFunc
 	origSafetyFS := safetyFS
 	origSafetyNow := safetyNow
@@ -290,7 +278,6 @@ func TestRunRestoreWorkflow_IncompatibilityAndSafetyBackupFailureCanContinue(t *
 		restoreCmd = origRestoreCmd
 		restoreSystem = origRestoreSystem
 		restoreTime = origRestoreTime
-		compatFS = origCompatFS
 		prepareRestoreBundleFunc = origPrepare
 		safetyFS = origSafetyFS
 		safetyNow = origSafetyNow
@@ -299,7 +286,6 @@ func TestRunRestoreWorkflow_IncompatibilityAndSafetyBackupFailureCanContinue(t *
 	restoreSandbox := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(restoreSandbox.Root) })
 	restoreFS = restoreSandbox
-	compatFS = restoreSandbox
 
 	safetySandbox := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(safetySandbox.Root) })
@@ -362,7 +348,7 @@ func TestRunRestoreWorkflow_IncompatibilityAndSafetyBackupFailureCanContinue(t *
 		continueNoSafety:  true,
 	}
 
-	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui); err != nil {
+	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, ""); err != nil {
 		t.Fatalf("runRestoreWorkflowWithUI error: %v", err)
 	}
 
@@ -376,7 +362,6 @@ func TestRunRestoreWorkflow_ClusterRecoveryModeStopsAndRestartsServices(t *testi
 	origRestoreCmd := restoreCmd
 	origRestoreSystem := restoreSystem
 	origRestoreTime := restoreTime
-	origCompatFS := compatFS
 	origPrepare := prepareRestoreBundleFunc
 	origSafetyFS := safetyFS
 	origSafetyNow := safetyNow
@@ -385,7 +370,6 @@ func TestRunRestoreWorkflow_ClusterRecoveryModeStopsAndRestartsServices(t *testi
 		restoreCmd = origRestoreCmd
 		restoreSystem = origRestoreSystem
 		restoreTime = origRestoreTime
-		compatFS = origCompatFS
 		prepareRestoreBundleFunc = origPrepare
 		safetyFS = origSafetyFS
 		safetyNow = origSafetyNow
@@ -394,7 +378,6 @@ func TestRunRestoreWorkflow_ClusterRecoveryModeStopsAndRestartsServices(t *testi
 	fakeFS := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(fakeFS.Root) })
 	restoreFS = fakeFS
-	compatFS = fakeFS
 	safetyFS = fakeFS
 
 	fakeNow := &FakeTime{Current: time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)}
@@ -414,7 +397,7 @@ func TestRunRestoreWorkflow_ClusterRecoveryModeStopsAndRestartsServices(t *testi
 			"umount /etc/pve": errors.New("not mounted"),
 		},
 	}
-	for _, svc := range []string{"pve-cluster", "pvedaemon", "pveproxy", "pvestatd"} {
+	for _, svc := range []string{"pve-ha-lrm", "pve-ha-crm", "pve-cluster", "pvedaemon", "pveproxy", "pvestatd"} {
 		cmd.Outputs["systemctl stop --no-block "+svc] = []byte("ok")
 		cmd.Outputs["systemctl is-active "+svc] = []byte("inactive\n")
 		cmd.Errors["systemctl is-active "+svc] = errors.New("inactive")
@@ -468,11 +451,13 @@ func TestRunRestoreWorkflow_ClusterRecoveryModeStopsAndRestartsServices(t *testi
 		clusterMode:    ClusterRestoreRecovery,
 	}
 
-	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui); err != nil {
+	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, ""); err != nil {
 		t.Fatalf("runRestoreWorkflowWithUI error: %v", err)
 	}
 
-	for _, want := range []string{
+	wantCalls := []string{
+		"systemctl stop --no-block pve-ha-lrm",
+		"systemctl stop --no-block pve-ha-crm",
 		"systemctl stop --no-block pve-cluster",
 		"systemctl stop --no-block pvedaemon",
 		"systemctl stop --no-block pveproxy",
@@ -482,16 +467,15 @@ func TestRunRestoreWorkflow_ClusterRecoveryModeStopsAndRestartsServices(t *testi
 		"systemctl start pvedaemon",
 		"systemctl start pveproxy",
 		"systemctl start pvestatd",
-	} {
-		found := false
-		for _, call := range cmd.Calls {
-			if call == want {
-				found = true
-				break
-			}
-		}
+		"systemctl start pve-ha-crm",
+		"systemctl start pve-ha-lrm",
+	}
+	for _, want := range wantCalls {
+		found := slices.Contains(cmd.Calls, want)
 		if !found {
 			t.Fatalf("missing command call %q; calls=%v", want, cmd.Calls)
 		}
 	}
+	// HA down before pmxcfs goes down, back up only after pmxcfs and the API services.
+	assertCallsInOrder(t, cmd.Calls, wantCalls...)
 }

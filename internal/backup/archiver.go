@@ -393,16 +393,6 @@ func (a *Archiver) writeTar(ctx context.Context, sourceDir string, w io.Writer) 
 	return err
 }
 
-// GetDefaultArchiverConfig returns default archiver configuration
-func GetDefaultArchiverConfig() *ArchiverConfig {
-	return &ArchiverConfig{
-		Compression:      types.CompressionXZ,
-		CompressionLevel: 6, // Balanced compression
-		CompressionMode:  "standard",
-		DryRun:           false,
-	}
-}
-
 func (a *Archiver) wrapEncryptionWriter(base io.Writer) (io.Writer, func() error, error) {
 	if !a.encryptArchive {
 		return base, func() error { return nil }, nil
@@ -556,7 +546,7 @@ func (a *Archiver) createGzipArchive(ctx context.Context, sourceDir, outputPath 
 	a.logger.Debug("Creating gzip archive with level %d (mode %s)", a.compressionLevel, a.CompressionMode())
 
 	// Create output file
-	outFile, err := createBackupOutputFile(outputPath)
+	outFile, err := createArchiveOutputFile(outputPath)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
@@ -598,7 +588,7 @@ func (a *Archiver) createTarArchive(ctx context.Context, sourceDir, outputPath s
 	a.logger.Debug("Creating uncompressed tar archive")
 
 	// Create output file
-	outFile, err := createBackupOutputFile(outputPath)
+	outFile, err := createArchiveOutputFile(outputPath)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
@@ -661,7 +651,7 @@ func (a *Archiver) createLzmaArchive(ctx context.Context, sourceDir, outputPath 
 }
 
 // createXZArchive creates an xz-compressed tar archive using external xz command
-func (a *Archiver) createXZArchive(ctx context.Context, sourceDir, outputPath string) (err error) {
+func (a *Archiver) createXZArchive(ctx context.Context, sourceDir, outputPath string) error {
 	a.logger.Debug("Creating xz archive with level %d (mode %s)", a.compressionLevel, a.CompressionMode())
 
 	args := buildXZArgs(a.compressionLevel, a.compressionThreads, a.CompressionMode())
@@ -669,61 +659,11 @@ func (a *Archiver) createXZArchive(ctx context.Context, sourceDir, outputPath st
 	if err != nil {
 		return err
 	}
-	outFile, err := createBackupOutputFile(outputPath)
-	if err != nil {
-		return fmt.Errorf("failed to create output file: %w", err)
-	}
-	defer closeIntoErr(&err, outFile, "close output archive")
-
-	pr, pw := io.Pipe()
-	cmd.Stdin = pr
-	writer, finalizeEncryption, err := a.wrapEncryptionWriter(outFile)
-	if err != nil {
-		return err
-	}
-	defer finalizeEncryptionInto(&err, finalizeEncryption)
-	cmd.Stdout = writer
-	if err := attachStderrLoggerFn(a, cmd, "xz"); err != nil {
-		return fmt.Errorf("capture xz output: %w", err)
-	}
-
-	errChan := make(chan error, 1)
-	go func() {
-		defer close(errChan)
-		err := a.writeTar(ctx, sourceDir, pw)
-		if err != nil {
-			_ = pw.CloseWithError(err)
-		} else {
-			err = pw.Close()
-		}
-		errChan <- err
-	}()
-
-	if err := cmd.Start(); err != nil {
-		startErr := fmt.Errorf("failed to start xz: %w", err)
-		drainTarWriterAfterCompressorStartFailure(pw, errChan, startErr)
-		return startErr
-	}
-
-	tarErr := <-errChan
-	if tarErr != nil {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = cmd.Wait()
-		return tarErr
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return &CompressionError{Algorithm: "xz", Err: err}
-	}
-
-	a.logger.Debug("XZ compression completed successfully")
-	return nil
+	return a.pipeTarThroughCommand(ctx, sourceDir, outputPath, cmd, "xz")
 }
 
 // createZstdArchive creates a zstd-compressed tar archive using external zstd command
-func (a *Archiver) createZstdArchive(ctx context.Context, sourceDir, outputPath string) (err error) {
+func (a *Archiver) createZstdArchive(ctx context.Context, sourceDir, outputPath string) error {
 	a.logger.Debug("Creating zstd archive with level %d (mode %s)", a.compressionLevel, a.CompressionMode())
 
 	args := buildZstdArgs(a.compressionLevel, a.compressionThreads)
@@ -731,57 +671,7 @@ func (a *Archiver) createZstdArchive(ctx context.Context, sourceDir, outputPath 
 	if err != nil {
 		return err
 	}
-	outFile, err := createBackupOutputFile(outputPath)
-	if err != nil {
-		return fmt.Errorf("failed to create output file: %w", err)
-	}
-	defer closeIntoErr(&err, outFile, "close output archive")
-
-	pr, pw := io.Pipe()
-	cmd.Stdin = pr
-	writer, finalizeEncryption, err := a.wrapEncryptionWriter(outFile)
-	if err != nil {
-		return err
-	}
-	defer finalizeEncryptionInto(&err, finalizeEncryption)
-	cmd.Stdout = writer
-	if err := attachStderrLoggerFn(a, cmd, "zstd"); err != nil {
-		return fmt.Errorf("capture zstd output: %w", err)
-	}
-
-	errChan := make(chan error, 1)
-	go func() {
-		defer close(errChan)
-		err := a.writeTar(ctx, sourceDir, pw)
-		if err != nil {
-			_ = pw.CloseWithError(err)
-		} else {
-			err = pw.Close()
-		}
-		errChan <- err
-	}()
-
-	if err := cmd.Start(); err != nil {
-		startErr := fmt.Errorf("failed to start zstd: %w", err)
-		drainTarWriterAfterCompressorStartFailure(pw, errChan, startErr)
-		return startErr
-	}
-
-	tarErr := <-errChan
-	if tarErr != nil {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = cmd.Wait()
-		return tarErr
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return &CompressionError{Algorithm: "zstd", Err: err}
-	}
-
-	a.logger.Debug("Zstd compression completed successfully")
-	return nil
+	return a.pipeTarThroughCommand(ctx, sourceDir, outputPath, cmd, "zstd")
 }
 
 func (a *Archiver) attachStderrLogger(cmd *exec.Cmd, algo string) error {
@@ -804,16 +694,26 @@ func (a *Archiver) attachStderrLogger(cmd *exec.Cmd, algo string) error {
 	return nil
 }
 
-func drainTarWriterAfterCompressorStartFailure(pw *io.PipeWriter, errChan <-chan error, startErr error) {
-	_ = pw.CloseWithError(startErr)
-	<-errChan
+// createArchiveOutputFile creates the archive file of a backup run with
+// ArtifactFilePerm (0o600): like every file of a backup set, the archive is
+// readable by root only. Group read is never decided here; it is granted later, and
+// only when SET_BACKUP_PERMISSIONS=true asks for it (see ArtifactFilePerm).
+func createArchiveOutputFile(outputPath string) (*os.File, error) {
+	// Contain the variable output path within its directory via os.Root so it
+	// cannot escape (gosec G304). The returned file is an independent descriptor
+	// and stays valid after the Root is closed.
+	root, err := os.OpenRoot(filepath.Dir(outputPath))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	return root.OpenFile(filepath.Base(outputPath), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, ArtifactFilePerm)
 }
 
-// createBackupOutputFile creates a backup output/content file with the project's
-// standard backup permission (defaultOptimizedFilePerm, 0o640). Backups are
-// intentionally group-readable so a backup-operator group can read them; the
-// containing directory restricts world access. Centralised here so the single
-// deliberate permission decision is documented in one place.
+// createBackupOutputFile creates a content file the collector writes into the
+// staging tree of a run (defaultOptimizedFilePerm, 0o640), which is also the mode
+// the file is recorded with inside the archive. It is never used for the archive
+// itself: that is createArchiveOutputFile's job.
 func createBackupOutputFile(outputPath string) (*os.File, error) {
 	// Contain the variable output path within its directory via os.Root so it
 	// cannot escape (gosec G304); the path is the admin-configured backup
@@ -824,51 +724,66 @@ func createBackupOutputFile(outputPath string) (*os.File, error) {
 		return nil, err
 	}
 	defer func() { _ = root.Close() }()
-	// #nosec G302 -- 0o640 group-read is the deliberate backup-file convention (defaultOptimizedFilePerm); operators read backups and the parent dir gates world access.
 	return root.OpenFile(filepath.Base(outputPath), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, defaultOptimizedFilePerm)
 }
 
+// pipeTarThroughCommand writes the tar stream of sourceDir into the compressor cmd,
+// whose output becomes the archive. The tar is written straight into the
+// compressor's stdin pipe: when the compressor stops reading (a full disk, a crash,
+// a cancel that killed it), the next write fails with EPIPE and the writer returns.
+// Through an io.Pipe set as cmd.Stdin it blocked forever instead: os/exec's copy
+// goroutine stops on EPIPE without closing the pipe it reads.
 func (a *Archiver) pipeTarThroughCommand(ctx context.Context, sourceDir, outputPath string, cmd *exec.Cmd, algo string) (err error) {
-	outFile, err := createBackupOutputFile(outputPath)
+	outFile, err := createArchiveOutputFile(outputPath)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	defer closeIntoErr(&err, outFile, "close output archive")
 
-	pr, pw := io.Pipe()
-	cmd.Stdin = pr
 	writer, finalizeEncryption, err := a.wrapEncryptionWriter(outFile)
 	if err != nil {
 		return err
 	}
 	defer finalizeEncryptionInto(&err, finalizeEncryption)
 	cmd.Stdout = writer
-	if err := a.attachStderrLogger(cmd, algo); err != nil {
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("connect %s input: %w", algo, err)
+	}
+	if err := attachStderrLoggerFn(a, cmd, algo); err != nil {
+		_ = stdin.Close()
 		return fmt.Errorf("capture %s output: %w", algo, err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start %s: %w", algo, err)
 	}
 
 	errChan := make(chan error, 1)
 	go func() {
-		defer close(errChan)
-		if err := a.writeTar(ctx, sourceDir, pw); err != nil {
-			_ = pw.CloseWithError(err)
-			errChan <- err
-			return
+		err := a.writeTar(ctx, sourceDir, stdin)
+		// Closing stdin is what tells the compressor the tar stream is complete.
+		if closeErr := stdin.Close(); err == nil {
+			err = closeErr
 		}
-		errChan <- pw.Close()
+		errChan <- err
 	}()
-
-	if err := cmd.Start(); err != nil {
-		startErr := fmt.Errorf("failed to start %s: %w", algo, err)
-		drainTarWriterAfterCompressorStartFailure(pw, errChan, startErr)
-		return startErr
-	}
 
 	if tarErr := <-errChan; tarErr != nil {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		_ = cmd.Wait()
+		waitErr := cmd.Wait()
+		if errors.Is(tarErr, syscall.EPIPE) {
+			// The compressor went first: a cancellation killed it, or its own exit is
+			// the reason the archive could not be written.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if waitErr != nil {
+				return &CompressionError{Algorithm: algo, Err: waitErr}
+			}
+		}
 		return tarErr
 	}
 
@@ -901,7 +816,7 @@ func (a *Archiver) addToTar(ctx context.Context, tarWriter *tar.Writer, sourceDi
 		}
 
 		if err != nil {
-			a.logger.Warning("Error accessing path %s: %v", path, err)
+			a.logger.Warning("Failed to access path %s: %v", path, err)
 			// A walk error on a directory means filepath.Walk does not descend into
 			// it, so a whole subtree may be missing from the archive: record it so
 			// the run fails instead of shipping a silently incomplete archive.
@@ -964,6 +879,8 @@ func (a *Archiver) addToTar(ctx context.Context, tarWriter *tar.Writer, sourceDi
 		if stat, ok := linkInfo.Sys().(*syscall.Stat_t); ok {
 			header.Uid = int(stat.Uid)
 			header.Gid = int(stat.Gid)
+			// ProxSave is built and released only for linux/amd64, where these
+			// Timespec fields are int64; 32-bit syscall widths are unsupported.
 			// Preserve access and modification times
 			header.AccessTime = time.Unix(stat.Atim.Sec, stat.Atim.Nsec)
 			header.ChangeTime = time.Unix(stat.Ctim.Sec, stat.Ctim.Nsec)

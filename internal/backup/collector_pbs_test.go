@@ -141,7 +141,7 @@ func TestGetDatastoreListDisambiguatesCLIAndOverrideOutputKeyCollisions(t *testi
 			return "/usr/bin/" + cmd, nil
 		},
 		RunCommand: func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			return []byte(fmt.Sprintf(`[{"name":%q,"path":"/data/runtime","comment":"main"}]`, collidingKey)), nil
+			return fmt.Appendf(nil, `[{"name":%q,"path":"/data/runtime","comment":"main"}]`, collidingKey), nil
 		},
 	})
 	collector.config.PBSDatastorePaths = []string{overridePath}
@@ -389,15 +389,22 @@ func TestHasTapeSupportHasDrives(t *testing.T) {
 	}
 }
 
+// collectDatastoreNamespaces collects namespace information for a datastore
+// using CLI first, then filesystem fallback.
+func (c *Collector) collectDatastoreNamespaces(ctx context.Context, ds pbsDatastore, datastoreDir string) error {
+	_, err := c.collectDatastoreNamespacesSnapshot(ctx, ds, datastoreDir)
+	return err
+}
+
 func TestCollectDatastoreNamespacesSuccess(t *testing.T) {
-	stubListNamespaces(t, func(_ context.Context, name, path string, _ time.Duration) ([]pbs.Namespace, bool, error) {
-		if name != "store1" || path != "/fake" {
-			t.Fatalf("unexpected datastore %s %s", name, path)
+	stubDiscoverNamespaces(t, func(_ context.Context, path string, _ time.Duration) ([]pbs.Namespace, error) {
+		if path != "/fake" {
+			t.Fatalf("unexpected datastore path %s", path)
 		}
 		return []pbs.Namespace{
 			{Ns: "", Path: "/fake"},
-			{Ns: "child", Path: "/fake/child"},
-		}, true, nil
+			{Ns: "child", Path: "/fake/ns/child"},
+		}, nil
 	})
 
 	collector := newTestCollectorWithDeps(t, CollectorDeps{})
@@ -426,8 +433,8 @@ func TestCollectDatastoreNamespacesSuccess(t *testing.T) {
 }
 
 func TestCollectDatastoreNamespacesError(t *testing.T) {
-	stubListNamespaces(t, func(context.Context, string, string, time.Duration) ([]pbs.Namespace, bool, error) {
-		return nil, false, fmt.Errorf("boom")
+	stubDiscoverNamespaces(t, func(context.Context, string, time.Duration) ([]pbs.Namespace, error) {
+		return nil, fmt.Errorf("boom")
 	})
 
 	collector := newTestCollectorWithDeps(t, CollectorDeps{})
@@ -443,13 +450,6 @@ func TestCollectDatastoreNamespacesError(t *testing.T) {
 }
 
 func TestCollectDatastoreNamespacesOverrideUsesFilesystemOnly(t *testing.T) {
-	origList := listNamespacesFunc
-	t.Cleanup(func() { listNamespacesFunc = origList })
-	listNamespacesFunc = func(context.Context, string, string, time.Duration) ([]pbs.Namespace, bool, error) {
-		t.Fatal("CLI namespace discovery should not be used for override paths")
-		return nil, false, nil
-	}
-
 	collector := newTestCollectorWithDeps(t, CollectorDeps{})
 	dsDir := filepath.Join(collector.tempDir, "datastores")
 	if err := os.MkdirAll(dsDir, 0o755); err != nil {
@@ -457,7 +457,7 @@ func TestCollectDatastoreNamespacesOverrideUsesFilesystemOnly(t *testing.T) {
 	}
 
 	dsPath := filepath.Join(collector.tempDir, "override")
-	if err := os.MkdirAll(filepath.Join(dsPath, "local", "vm"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dsPath, "ns", "local"), 0o755); err != nil {
 		t.Fatalf("failed to create override namespace fixture: %v", err)
 	}
 
@@ -487,8 +487,8 @@ func TestCollectDatastoreNamespacesOverrideUsesFilesystemOnly(t *testing.T) {
 }
 
 func TestCollectDatastoreConfigsDryRun(t *testing.T) {
-	stubListNamespaces(t, func(context.Context, string, string, time.Duration) ([]pbs.Namespace, bool, error) {
-		return []pbs.Namespace{{Ns: ""}}, false, nil
+	stubDiscoverNamespaces(t, func(context.Context, string, time.Duration) ([]pbs.Namespace, error) {
+		return []pbs.Namespace{{Ns: ""}}, nil
 	})
 
 	collector := newTestCollectorWithDeps(t, CollectorDeps{
@@ -518,11 +518,11 @@ func TestCollectDatastoreConfigs_UsesPathSafeKeyForUnsafeDatastoreName(t *testin
 	unsafeName := "../escape"
 	expectedKey := collectorPathKey(unsafeName)
 
-	stubListNamespaces(t, func(_ context.Context, name, path string, _ time.Duration) ([]pbs.Namespace, bool, error) {
-		if name != unsafeName || path != "/fake" {
-			t.Fatalf("unexpected datastore args name=%q path=%q", name, path)
+	stubDiscoverNamespaces(t, func(_ context.Context, path string, _ time.Duration) ([]pbs.Namespace, error) {
+		if path != "/fake" {
+			t.Fatalf("unexpected datastore path=%q", path)
 		}
-		return []pbs.Namespace{{Ns: ""}}, false, nil
+		return []pbs.Namespace{{Ns: ""}}, nil
 	})
 
 	var seenArgs []string
@@ -570,13 +570,6 @@ func TestCollectDatastoreConfigs_UsesPathSafeKeyForUnsafeDatastoreName(t *testin
 }
 
 func TestCollectDatastoreConfigsSkipsCLIConfigForOverridePaths(t *testing.T) {
-	origList := listNamespacesFunc
-	t.Cleanup(func() { listNamespacesFunc = origList })
-	listNamespacesFunc = func(context.Context, string, string, time.Duration) ([]pbs.Namespace, bool, error) {
-		t.Fatal("CLI namespace discovery should not be used for override paths")
-		return nil, false, nil
-	}
-
 	dsPath := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dsPath, "vm"), 0o755); err != nil {
 		t.Fatalf("mkdir vm: %v", err)
@@ -626,15 +619,12 @@ func TestCollectDatastoreConfigsDisambiguatesManualCLIAndOverrideKeyCollisions(t
 	}
 
 	collidingKey := buildPBSOverrideOutputKey(overridePath)
-	stubListNamespaces(t, func(_ context.Context, name, path string, _ time.Duration) ([]pbs.Namespace, bool, error) {
-		return []pbs.Namespace{{Ns: name, Path: path}}, false, nil
+	stubDiscoverNamespaces(t, func(_ context.Context, path string, _ time.Duration) ([]pbs.Namespace, error) {
+		if path == overridePath {
+			return []pbs.Namespace{{Ns: "override", Path: path}}, nil
+		}
+		return []pbs.Namespace{{Ns: "", Path: path}}, nil
 	})
-
-	origDiscover := discoverNamespacesFunc
-	t.Cleanup(func() { discoverNamespacesFunc = origDiscover })
-	discoverNamespacesFunc = func(_ context.Context, path string, _ time.Duration) ([]pbs.Namespace, error) {
-		return []pbs.Namespace{{Ns: "override", Path: path}}, nil
-	}
 
 	collector := newTestCollectorWithDeps(t, CollectorDeps{
 		LookPath: func(cmd string) (string, error) {
@@ -752,7 +742,7 @@ func TestCollectPBSCommands_UsesPathSafeKeyForUnsafeDatastoreName(t *testing.T) 
 			return "/bin/" + name, nil
 		},
 		RunCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			return []byte(fmt.Sprintf("%s %s", name, strings.Join(args, " "))), nil
+			return fmt.Appendf(nil, "%s %s", name, strings.Join(args, " ")), nil
 		},
 	})
 
@@ -797,7 +787,7 @@ func TestCollectPBSCommands_DisambiguatesStatusFilesForCollidingDatastoreKeys(t 
 			return "/bin/" + name, nil
 		},
 		RunCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			return []byte(fmt.Sprintf("%s %s", name, strings.Join(args, " "))), nil
+			return fmt.Appendf(nil, "%s %s", name, strings.Join(args, " ")), nil
 		},
 	})
 
@@ -870,22 +860,21 @@ func TestCollectUserConfigsWithTokens(t *testing.T) {
 			if name != "proxmox-backup-manager" {
 				return nil, fmt.Errorf("unexpected command %s", name)
 			}
+			if len(args) == 3 && args[0] == "user" && args[1] == "list" {
+				return []byte(`[{"userid":"user@pam"},{"userid":""}]`), nil
+			}
 			if len(args) != 4 || args[0] != "user" || args[1] != "list-tokens" {
 				return nil, fmt.Errorf("unexpected args %v", args)
 			}
 			return []byte(`[{"tokenid":"mytoken"}]`), nil
 		},
 	})
-	commandsDir := filepath.Join(collector.tempDir, "var", "lib", "proxsave-info", "commands", "pbs")
-	if err := os.MkdirAll(commandsDir, 0o755); err != nil {
-		t.Fatalf("failed to create commands dir: %v", err)
-	}
-	userList := `[{"userid":"user@pam"},{"userid":""}]`
-	if err := os.WriteFile(filepath.Join(commandsDir, "user_list.json"), []byte(userList), 0o644); err != nil {
-		t.Fatalf("failed to write user list: %v", err)
-	}
 
-	runRecipeForTest(t, context.Background(), collector, newPBSUserConfigRecipe(), nil)
+	runSelectedBricksForTest(t, context.Background(), collector, newPBSCommandsRecipe(), nil,
+		brickPBSRuntimeAccessUsers,
+		brickPBSRuntimeAccessUserTokens,
+		brickPBSRuntimeAccessTokensAggregate,
+	)
 
 	tokensPath := filepath.Join(collector.tempDir, "var", "lib", "proxsave-info", "pbs", "access-control", "tokens.json")
 	data, err := os.ReadFile(tokensPath)
@@ -905,22 +894,12 @@ func TestCollectUserConfigsWithTokens(t *testing.T) {
 	}
 }
 
-func TestCollectUserConfigsMissingUserList(t *testing.T) {
-	collector := newTestCollectorWithDeps(t, CollectorDeps{})
-	runRecipeForTest(t, context.Background(), collector, newPBSUserConfigRecipe(), nil)
-
-	tokensPath := filepath.Join(collector.tempDir, "var", "lib", "proxsave-info", "pbs", "access-control", "tokens.json")
-	if _, err := os.Stat(tokensPath); !os.IsNotExist(err) {
-		t.Fatalf("expected no tokens.json, got err=%v", err)
-	}
-}
-
-func stubListNamespaces(t *testing.T, fn func(context.Context, string, string, time.Duration) ([]pbs.Namespace, bool, error)) {
+func stubDiscoverNamespaces(t *testing.T, fn func(context.Context, string, time.Duration) ([]pbs.Namespace, error)) {
 	t.Helper()
-	orig := listNamespacesFunc
-	listNamespacesFunc = fn
+	orig := discoverNamespacesFunc
+	discoverNamespacesFunc = fn
 	t.Cleanup(func() {
-		listNamespacesFunc = orig
+		discoverNamespacesFunc = orig
 	})
 }
 
@@ -931,7 +910,7 @@ func (fakeFileInfo) Size() int64        { return 0 }
 func (fakeFileInfo) Mode() os.FileMode  { return 0 }
 func (fakeFileInfo) ModTime() time.Time { return time.Time{} }
 func (fakeFileInfo) IsDir() bool        { return false }
-func (fakeFileInfo) Sys() interface{}   { return nil }
+func (fakeFileInfo) Sys() any           { return nil }
 
 func TestCollectPBSConfigSnapshotExcludesUserConfigSecretsWhenDisabled(t *testing.T) {
 	pbsRoot := t.TempDir()
@@ -999,5 +978,131 @@ func TestCollectPBSConfigSnapshotKeepsUserConfigSecretsWhenEnabled(t *testing.T)
 		if _, err := os.Stat(filepath.Join(dest, kept)); err != nil {
 			t.Fatalf("expected %s collected when BACKUP_USER_CONFIGS=true, got %v", kept, err)
 		}
+	}
+}
+
+// PBS keeps the ACME accounts as a directory of per-account JSON documents. The three
+// tests below pin the three things #313 got wrong: the toggle has to prune the
+// directory, an enabled toggle has to keep it, and the manifest has to describe it as
+// collected instead of warning that a non-existent accounts.cfg is "not configured".
+func TestCollectPBSConfigSnapshotExcludesAcmeAccountsDirWhenDisabled(t *testing.T) {
+	pbsRoot := t.TempDir()
+	accounts := filepath.Join(pbsRoot, "acme", "accounts")
+	if err := os.MkdirAll(accounts, 0o700); err != nil {
+		t.Fatalf("mkdir accounts: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(accounts, "le"), []byte(`{"account":{}}`), 0o600); err != nil {
+		t.Fatalf("write account: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pbsRoot, "acme", "plugins.cfg"), []byte("standalone: standalone\n"), 0o600); err != nil {
+		t.Fatalf("write plugins.cfg: %v", err)
+	}
+
+	cfg := GetDefaultCollectorConfig()
+	cfg.PBSConfigPath = pbsRoot
+	cfg.BackupPBSAcmeAccounts = false
+	cfg.BackupPBSAcmePlugins = true
+
+	collector := NewCollectorWithDeps(newTestLogger(), cfg, t.TempDir(), types.ProxmoxBS, false, CollectorDeps{})
+	if err := collector.collectPBSConfigSnapshot(context.Background(), pbsRoot); err != nil {
+		t.Fatalf("collectPBSConfigSnapshot failed: %v", err)
+	}
+
+	dest := filepath.Join(collector.tempDir, "etc/proxmox-backup")
+	if _, err := os.Stat(filepath.Join(dest, "acme", "accounts")); err == nil {
+		t.Fatal("expected acme/accounts pruned when BACKUP_PBS_ACME_ACCOUNTS=false")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat acme/accounts: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "acme", "plugins.cfg")); err != nil {
+		t.Fatalf("expected acme/plugins.cfg retained (different toggle): %v", err)
+	}
+}
+
+func TestCollectPBSConfigSnapshotKeepsAcmeAccountsDirWhenEnabled(t *testing.T) {
+	pbsRoot := t.TempDir()
+	accounts := filepath.Join(pbsRoot, "acme", "accounts")
+	if err := os.MkdirAll(accounts, 0o700); err != nil {
+		t.Fatalf("mkdir accounts: %v", err)
+	}
+	for _, name := range []string{"le", "le-staging"} {
+		if err := os.WriteFile(filepath.Join(accounts, name), []byte(`{"account":{}}`), 0o600); err != nil {
+			t.Fatalf("write account %s: %v", name, err)
+		}
+	}
+
+	cfg := GetDefaultCollectorConfig()
+	cfg.PBSConfigPath = pbsRoot
+	cfg.BackupPBSAcmeAccounts = true
+
+	collector := NewCollectorWithDeps(newTestLogger(), cfg, t.TempDir(), types.ProxmoxBS, false, CollectorDeps{})
+	if err := collector.collectPBSConfigSnapshot(context.Background(), pbsRoot); err != nil {
+		t.Fatalf("collectPBSConfigSnapshot failed: %v", err)
+	}
+
+	dest := filepath.Join(collector.tempDir, "etc/proxmox-backup", "acme", "accounts")
+	for _, name := range []string{"le", "le-staging"} {
+		if _, err := os.Stat(filepath.Join(dest, name)); err != nil {
+			t.Fatalf("expected account %s collected when BACKUP_PBS_ACME_ACCOUNTS=true: %v", name, err)
+		}
+	}
+}
+
+func TestCollectPBSManifestACMEAccountsDescribesDirectory(t *testing.T) {
+	pbsRoot := t.TempDir()
+	accounts := filepath.Join(pbsRoot, "acme", "accounts")
+	if err := os.MkdirAll(accounts, 0o700); err != nil {
+		t.Fatalf("mkdir accounts: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(accounts, "le"), []byte(`{"account":{}}`), 0o600); err != nil {
+		t.Fatalf("write account: %v", err)
+	}
+
+	cfg := GetDefaultCollectorConfig()
+	cfg.PBSConfigPath = pbsRoot
+	cfg.BackupPBSAcmeAccounts = true
+
+	collector := NewCollectorWithDeps(newTestLogger(), cfg, t.TempDir(), types.ProxmoxBS, false, CollectorDeps{})
+	if err := collector.collectPBSConfigSnapshot(context.Background(), pbsRoot); err != nil {
+		t.Fatalf("collectPBSConfigSnapshot failed: %v", err)
+	}
+	collector.initPBSManifest()
+	if err := collector.collectPBSManifestACMEAccounts(context.Background(), pbsRoot); err != nil {
+		t.Fatalf("collectPBSManifestACMEAccounts failed: %v", err)
+	}
+
+	entry, ok := collector.pbsManifest["acme/accounts"]
+	if !ok {
+		t.Fatalf("expected manifest key acme/accounts, got %v", collector.pbsManifest)
+	}
+	if entry.Status != StatusCollected {
+		t.Fatalf("expected status %s, got %s", StatusCollected, entry.Status)
+	}
+	if _, stale := collector.pbsManifest["acme/accounts.cfg"]; stale {
+		t.Fatal("manifest still carries the acme/accounts.cfg key PBS never creates")
+	}
+	if collector.stats.FilesNotFound != 0 {
+		t.Fatalf("expected no not-found count for a present directory, got %d", collector.stats.FilesNotFound)
+	}
+}
+
+func TestCollectPBSManifestACMEAccountsCountsMissingDirectory(t *testing.T) {
+	pbsRoot := t.TempDir()
+
+	cfg := GetDefaultCollectorConfig()
+	cfg.PBSConfigPath = pbsRoot
+	cfg.BackupPBSAcmeAccounts = true
+
+	collector := NewCollectorWithDeps(newTestLogger(), cfg, t.TempDir(), types.ProxmoxBS, false, CollectorDeps{})
+	collector.initPBSManifest()
+	if err := collector.collectPBSManifestACMEAccounts(context.Background(), pbsRoot); err != nil {
+		t.Fatalf("collectPBSManifestACMEAccounts failed: %v", err)
+	}
+
+	if got := collector.pbsManifest["acme/accounts"].Status; got != StatusNotFound {
+		t.Fatalf("expected status %s for an absent directory, got %s", StatusNotFound, got)
+	}
+	if collector.stats.FilesNotFound != 1 {
+		t.Fatalf("expected 1 not-found, got %d", collector.stats.FilesNotFound)
 	}
 }

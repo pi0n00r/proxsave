@@ -27,6 +27,14 @@ Scheduler engine: daemon (resident, hang watchdog + healthchecks) or cron [daemo
 off         no monitoring
 centralized ProxSave HC Server (zero setup, reuses the Telegram identity)
 self        your own healthchecks/SaaS server (you paste the ping URLs next)
-Healthchecks monitoring: off, centralized, or self [centralized]: 
+Healthchecks monitoring: off, centralized, or self [centralized]: HC initial account email []: 
+--- Notify level ---
+always      every run
+warning     warnings and failures
+failure     failures only
+Notify level: always, warning, or failure [warning]: 
 --- Schedule ---
-Run at (daily, HH:MM) [02:00]: 
+daily       every day
+weekly      once a week, on the weekday asked next
+monthly     once a month, on the day of month asked next (1-28)
+Frequency: daily, weekly, or monthly [daily]: Run at (HH:MM) [02:00]: 

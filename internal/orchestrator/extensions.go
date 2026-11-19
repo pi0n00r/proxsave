@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -9,10 +10,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tis24dev/proxsave/internal/block"
+	"github.com/tis24dev/proxsave/internal/config"
 	"github.com/tis24dev/proxsave/internal/health"
+	"github.com/tis24dev/proxsave/internal/notify"
+	"github.com/tis24dev/proxsave/internal/notifyfilter"
 	"github.com/tis24dev/proxsave/internal/safefs"
 	"github.com/tis24dev/proxsave/internal/storage"
 	"github.com/tis24dev/proxsave/internal/types"
+	"github.com/tis24dev/proxsave/internal/ui/theme"
 )
 
 // fsIoTimeout converts the configured FS_IO_TIMEOUT into a per-operation safefs
@@ -62,12 +68,58 @@ func (o *Orchestrator) RegisterStorageTarget(target StorageTarget) {
 	o.storageTargets = append(o.storageTargets, target)
 }
 
+// RegisterBackupBlock adds a destination block (the PBS storage) to run as a step of
+// its own after the path block. A block is never critical: it cannot stop the run.
+func (o *Orchestrator) RegisterBackupBlock(b block.Backup) {
+	if b == nil {
+		return
+	}
+	o.backupBlocks = append(o.backupBlocks, b)
+}
+
 // RegisterNotificationChannel adds a notification channel to run after the backup.
 func (o *Orchestrator) RegisterNotificationChannel(channel NotificationChannel) {
 	if channel == nil {
 		return
 	}
 	o.notificationChannels = append(o.notificationChannels, channel)
+}
+
+// reportingOnlyChannel marks the dispatch-table entries that NOTIFY_ON must never filter,
+// because they are not notification channels: they implement NotificationChannel to get a
+// slot in the ordered dispatch, but they send nothing outward. Healthchecks is one (see
+// healthcheck_section.go) -- it renders the Phase-7 section and captures the portal
+// magic-link onto stats.HealthcheckLink, both of which are reporting, not delivery, and
+// both of which the R3 ordering contract depends on.
+//
+// A marker interface rather than a Name() allowlist: Name() is operator-visible display
+// text on a slice that does not enforce uniqueness, so a second channel answering
+// "Healthchecks" would inherit the exemption and send on the runs the operator silenced.
+// The method is unexported, so only this package can claim the exemption, and claiming it
+// is a deliberate act -- a future Tier-2 entry has to opt in rather than be forgotten.
+type reportingOnlyChannel interface {
+	reportingOnly()
+}
+
+func notifyOnExempt(ch NotificationChannel) bool {
+	_, ok := ch.(reportingOnlyChannel)
+	return ok
+}
+
+// notifyOutcome classifies a run for NOTIFY_ON filtering. Deliberately not a bare
+// StatusFromExitCode(stats.ExitCode): DispatchEarlyErrorNotification assembles its own
+// stats and ExitCode is an int nothing validates, so an early-init failure that ever
+// carried 0 would classify as a success and be suppressed -- the one outcome nobody
+// configures NOTIFY_ON to hide. Failed/ErrorCount are set on that path and are the
+// authoritative signal. A nil stats is unclassifiable and therefore delivers.
+func notifyOutcome(stats *BackupStats) notify.NotificationStatus {
+	if stats == nil {
+		return notify.StatusFailure
+	}
+	if stats.Failed || stats.ErrorCount > 0 {
+		return notify.StatusFailure
+	}
+	return notify.StatusFromExitCode(stats.ExitCode)
 }
 
 func (o *Orchestrator) dispatchNotifications(ctx context.Context, stats *BackupStats) {
@@ -89,6 +141,33 @@ func (o *Orchestrator) dispatchNotifications(ctx context.Context, stats *BackupS
 	}
 
 	cfg := o.cfg
+
+	// NOTIFY_ON: a global severity threshold layered on top of each channel's own
+	// *_ENABLED flag. It decides DELIVERY only; the exit code, the log counts and the
+	// Prometheus status gauge are all computed elsewhere and are untouched by it, so a
+	// suppressed run still reports exactly what it reported before. The threshold applied
+	// is the one decided for this run (notifyFilterDispatch), never the raw setting: below
+	// always it needs a confirmed Healthchecks monitor, and an early-error dispatch, which
+	// does not go through startNotificationGroup, notifies every outcome.
+	policy := o.notifyFilterDispatch
+	if !config.IsValidNotifyOn(policy) {
+		policy = config.NotifyOnAlways
+	}
+	outcome := notifyOutcome(stats)
+	if cfg != nil && cfg.NotifyOn != "" && !config.IsValidNotifyOn(cfg.NotifyOn) {
+		// Mirrors the EMAIL_DELIVERY_METHOD handling below: the parser passes an
+		// unrecognised value through and the point of use is where it gets named,
+		// because that is where there is a logger the operator will read.
+		o.logger.Warning("NOTIFY_ON=%q not recognized (allowed: always|warning|failure); delivering every outcome", cfg.NotifyOn)
+	}
+	if stats != nil {
+		o.logger.Debug("notifications dispatch: run outcome=%s warnings=%d errors=%d", outcome, stats.WarningCount, stats.ErrorCount)
+	}
+	if notify.NotifyOnAllows(policy, outcome) {
+		o.logger.Info("Notifications: sending...")
+	} else {
+		o.logger.Info("Notifications: skipped")
+	}
 
 	// If email notifications are disabled in configuration, reflect this explicitly
 	// in the aggregated backup stats so that downstream channels (e.g. Telegram)
@@ -135,9 +214,7 @@ func (o *Orchestrator) dispatchNotifications(ctx context.Context, stats *BackupS
 		if !ok || channel == nil {
 			if entry.name == "Email" && cfg != nil {
 				method := strings.TrimSpace(cfg.EmailDeliveryMethod)
-				if method == "" {
-					method = "relay"
-				}
+				method = cmp.Or(method, "relay")
 				o.logger.Warning("%s: enabled but not initialized (EMAIL_DELIVERY_METHOD=%q; allowed: relay|sendmail|pmf)", entry.name, method)
 
 				if stats != nil && strings.TrimSpace(stats.EmailStatus) == "" {
@@ -156,13 +233,43 @@ func (o *Orchestrator) dispatchNotifications(ctx context.Context, stats *BackupS
 			continue
 		}
 
+		// Claimed before the NOTIFY_ON gate below, so a suppressed channel is not picked
+		// up again by the remainder loop and skipped a second time.
 		usedChannels[channel] = true
+
+		// NOTIFY_ON is applied here, BELOW the initialization check above and not before
+		// it. A channel that is enabled but failed to initialize is a broken configuration,
+		// not a quiet run: it has to keep warning and keep recording "error" whatever the
+		// threshold says. Gating earlier would hide a misconfigured notifier behind the
+		// very setting the operator uses to stop reading successful runs, and would drop
+		// the WARNING that promotes that run's exit code -- which NOTIFY_ON must not touch.
+		if !notifyOnExempt(channel) && !notify.NotifyOnAllows(policy, outcome) {
+			o.logger.Skip("%s: filtered", entry.name)
+			// Record the suppression so stats.NotifyResults stays non-empty. An empty
+			// map makes persistNotifyResults write {} and the daemon then bails on
+			// len(nr.Results)==0, which would leave every per-channel sensor to go DOWN
+			// on grace expiry after each quiet run. "filtered" is skipped without a ping,
+			// like "disabled", but the daemon keeps the channel's row, so its last real
+			// delivery stays visible (a daemon that predates it prunes it like "disabled").
+			setNotifyResult(stats, entry.name, notifyResultFiltered)
+			continue
+		}
+
 		_ = channel.Notify(ctx, stats) // Ignore errors - notifications are non-critical
 	}
 
 	// Dispatch any remaining channels (custom or future ones) that weren't part of the fixed list above.
+	// NOTIFY_ON applies here too, under the same exemption: a channel is filtered because it
+	// SENDS, and the operator asking for quiet successes means all of them, not just the four
+	// the table happens to name today.
 	for _, ch := range o.notificationChannels {
 		if ch == nil || usedChannels[ch] {
+			continue
+		}
+		name := strings.TrimSpace(ch.Name())
+		if !notifyOnExempt(ch) && !notify.NotifyOnAllows(policy, outcome) {
+			o.logger.Skip("%s: filtered", name)
+			setNotifyResult(stats, name, notifyResultFiltered)
 			continue
 		}
 		_ = ch.Notify(ctx, stats)
@@ -197,6 +304,21 @@ func (o *Orchestrator) startNotificationGroup(ctx context.Context, stats *Backup
 	if o == nil {
 		return
 	}
+	// The threshold is decided (and, when the relay's answer expired, re-read) BEFORE the issue
+	// snapshot: its DEBUG lines must not fall between the snapshot and the dispatch. Phase [7]
+	// states only the outcome, after the refresh's DEBUG evidence (the relay read or the reuse);
+	// the details are in the initialization block. It is an INFO even when not applied: a
+	// WARNING here would raise the run's exit code.
+	d := notifyfilter.Decision{Requested: notifyfilter.Negotiated(o.cfg), Effective: config.NotifyOnAlways}
+	if o.notifyFilterRefresh != nil {
+		d = o.notifyFilterRefresh(ctx)
+	} else if o.logger != nil {
+		o.logger.Debug("notifications dispatch: no init decision requested=%s fallback=%s", d.Requested, d.Effective)
+	}
+	o.notifyFilterDispatch = d.Effective
+	if o.logger != nil {
+		o.logger.Info("%s", d.Outcome())
+	}
 	o.snapshotPreNotificationIssues(stats)
 	applyIssueExitCode(stats)
 	o.dispatchNotifications(ctx, stats)
@@ -211,11 +333,19 @@ func (o *Orchestrator) refreshLogIssuesFromFile(stats *BackupStats, includeCateg
 		return
 	}
 
-	categoryLimit := 0
-	if includeCategories {
-		categoryLimit = 10
+	// No cap: the notifications list every problem; the chat webhooks keep their own
+	// short list (webhook_payloads.go).
+	categories, errorCount, warningCount, notifyCount := ParseLogCounts(stats.LogFilePath, 0)
+	// A file that lost lines (write errors, timeouts, a disabled sink) undercounts: the
+	// exit code and the healthchecks ping then read a clean run. Take the higher of the
+	// file's counts and the logger's own.
+	if o.logger != nil && o.logger.FileIncomplete() {
+		o.logger.Debug("Run log incomplete: counts file errors=%d warnings=%d notify=%d, logger errors=%d warnings=%d notify=%d",
+			errorCount, warningCount, notifyCount, o.logger.ErrorCount(), o.logger.WarningCount(), o.logger.NotifyCount())
+		errorCount = max(errorCount, int(o.logger.ErrorCount()))
+		warningCount = max(warningCount, int(o.logger.WarningCount()))
+		notifyCount = max(notifyCount, int(o.logger.NotifyCount()))
 	}
-	categories, errorCount, warningCount, notifyCount := ParseLogCounts(stats.LogFilePath, categoryLimit)
 	stats.ErrorCount = errorCount
 	stats.WarningCount = warningCount
 	stats.NotifyCount = notifyCount
@@ -341,25 +471,17 @@ func (o *Orchestrator) dispatchNotificationsAndLogs(ctx context.Context, stats *
 		return
 	}
 
-	// Log explicit SKIP lines for disabled storage tiers so that
-	// Local / Secondary / Cloud all appear grouped with storage operations.
-	if o.logger != nil && stats != nil {
-		if !stats.SecondaryEnabled {
-			o.logger.Skip("Secondary Storage: disabled")
-		}
-		if !stats.CloudEnabled {
-			o.logger.Skip("Cloud Storage: disabled")
-		}
-	}
+	// The SKIP lines of the disabled storage tiers close step [6]
+	// (logDisabledStorageTargets), grouped with the storage operations.
 
 	// Phase 2: Notifications (non-critical - failures don't abort backup)
 	// Notification errors are logged but never propagated
 	fmt.Println()
-	o.logStep(7, "Notifications - dispatching channels")
+	o.logStep(8, "Notifications - dispatching channels")
 	o.startNotificationGroup(ctx, stats)
 }
 
-func (o *Orchestrator) dispatchPostBackup(ctx context.Context, stats *BackupStats) error {
+func (o *Orchestrator) syncStorageTargets(ctx context.Context, stats *BackupStats) error {
 	if o == nil {
 		return nil
 	}
@@ -373,9 +495,6 @@ func (o *Orchestrator) dispatchPostBackup(ctx context.Context, stats *BackupStat
 			}
 		}
 	}
-
-	// Phase 2 + 3: Notifications and log management (non-critical)
-	o.FinalizeAfterRun(ctx, stats)
 	return nil
 }
 
@@ -407,7 +526,7 @@ func (o *Orchestrator) FinalizeAndCloseLog(ctx context.Context) {
 	}
 
 	fmt.Println()
-	o.logStep(8, "Log file management")
+	o.logStep(9, "Log file management")
 	o.logger.Info("Closing log file: %s", logFilePath)
 	if err := o.logger.CloseLogFile(); err != nil {
 		o.logger.Warning("Failed to close log file: %v", err)
@@ -444,23 +563,41 @@ func (o *Orchestrator) dispatchLogFile(ctx context.Context, logFilePath string) 
 	if o.cfg.SecondaryEnabled && o.cfg.SecondaryLogPath != "" {
 		secondaryLogPath := filepath.Join(o.cfg.SecondaryLogPath, logFileName)
 		o.logger.Debug("Copying log to secondary: %s", secondaryLogPath)
+		o.logger.Info("Secondary: %s", secondaryLogPath)
 
-		_, mkErr := safefs.Run(context.Background(), "logmkdir", o.cfg.SecondaryLogPath, timeout, func() (struct{}, error) {
-			return struct{}{}, fs.MkdirAll(o.cfg.SecondaryLogPath, 0755)
-		})
+		// Each failure is one fact line and the outcome; the full error and the path
+		// it names stay in DEBUG. A dry run writes nothing: the Secondary copy has no
+		// check that only reads, so it goes straight to the SKIP (no directory created).
+		var mkErr error
+		if !o.dryRun {
+			_, mkErr = safefs.Run(context.Background(), "logmkdir", o.cfg.SecondaryLogPath, timeout, func() (struct{}, error) {
+				return struct{}{}, fs.MkdirAll(o.cfg.SecondaryLogPath, 0755)
+			})
+		}
 		switch {
+		case o.dryRun:
+			o.logger.Debug("Log copy: dry run, %s not copied to %s (no directory created)", logFilePath, secondaryLogPath)
+			o.logger.Skip("Log copy: dry run mode")
 		case mkErr != nil && errors.Is(mkErr, safefs.ErrTimeout):
-			o.logger.Warning("Skipping secondary log copy: creating %s timed out after %s (dead/stale mount?)", o.cfg.SecondaryLogPath, timeout)
+			o.logger.Debug("Secondary log copy: creating %s timed out after %s (dead/stale mount?): %v", o.cfg.SecondaryLogPath, timeout, mkErr)
+			o.logger.Info("  Directory not created: timed out after %s", safefs.WholeSeconds(timeout))
+			o.logger.Warning("%s Log not copied to secondary", theme.SymbolWarning)
 		case mkErr != nil:
-			o.logger.Warning("Failed to create secondary log directory: %v", mkErr)
+			o.logger.Debug("Secondary log copy: failed to create %s: %v", o.cfg.SecondaryLogPath, mkErr)
+			o.logger.Info("  Directory not created: %s", safefs.SystemErrorText(mkErr))
+			o.logger.Warning("%s Log not copied to secondary", theme.SymbolWarning)
 		default:
 			switch err := boundedCopyFile(context.Background(), fs, logFilePath, secondaryLogPath, timeout); {
 			case err == nil:
-				o.logger.Info("✓ Log copied to secondary: %s", secondaryLogPath)
+				o.logger.Info("%s Log copied to secondary", theme.SymbolSuccess)
 			case errors.Is(err, safefs.ErrTimeout):
-				o.logger.Warning("Skipping secondary log copy: copy to %s timed out after %s (dead/stale mount?)", secondaryLogPath, timeout)
+				o.logger.Debug("Secondary log copy: copy to %s timed out after %s (dead/stale mount?): %v", secondaryLogPath, timeout, err)
+				o.logger.Info("  Copy failed: timed out after %s", safefs.WholeSeconds(timeout))
+				o.logger.Warning("%s Log not copied to secondary", theme.SymbolWarning)
 			default:
-				o.logger.Warning("Failed to copy log to secondary: %v", err)
+				o.logger.Debug("Secondary log copy: failed to copy to %s: %v", secondaryLogPath, err)
+				o.logger.Info("  Copy failed: %s", safefs.SystemErrorText(err))
+				o.logger.Warning("%s Log not copied to secondary", theme.SymbolWarning)
 			}
 		}
 	}
@@ -472,16 +609,38 @@ func (o *Orchestrator) dispatchLogFile(ctx context.Context, logFilePath string) 
 	if o.cfg.CloudEnabled {
 		if cloudBase := strings.TrimSpace(o.cfg.CloudLogPath); cloudBase != "" {
 			destination := buildCloudLogDestination(cloudBase, logFileName, o.cfg.CloudRemote)
+			o.logger.Info("Cloud: %s", destination)
 
+			// With CLOUD_REMOTE a local directory, a CLOUD_LOG_PATH that resolves
+			// outside it is refused: nothing is copied there.
+			// The source probe still runs: its result stays in DEBUG beside the refusal.
+			cloudRoot, outside := storage.LocalCloudLogOutside(cloudBase, o.cfg.CloudRemote)
 			_, probeErr := safefs.Run(context.Background(), "logstat", logFilePath, timeout, func() (struct{}, error) {
 				_, e := fs.Stat(logFilePath)
 				return struct{}{}, e
 			})
 			switch {
+			case outside:
+				o.logger.Debug("Cloud log copy: CLOUD_LOG_PATH %s resolves to %s, outside the CLOUD_REMOTE directory %s", cloudBase, destination, cloudRoot)
+				if probeErr != nil {
+					o.logger.Debug("Cloud log copy: source log %s not accessible either: %v", logFilePath, probeErr)
+				} else {
+					o.logger.Debug("Cloud log copy: source log %s is readable", logFilePath)
+				}
+				o.logger.Info("  CLOUD_LOG_PATH: outside %s", cloudRoot)
+				o.logger.Warning("%s Log not copied to cloud", theme.SymbolWarning)
 			case probeErr != nil && errors.Is(probeErr, safefs.ErrTimeout):
-				o.logger.Warning("Skipping cloud log copy: source log %s unreachable after %s (dead/stale mount?)", logFilePath, timeout)
+				o.logger.Debug("Cloud log copy: source log %s unreachable after %s (dead/stale mount?): %v", logFilePath, timeout, probeErr)
+				o.logger.Info("  Source log not accessible: timed out after %s", safefs.WholeSeconds(timeout))
+				o.logger.Warning("%s Log not copied to cloud", theme.SymbolWarning)
 			case probeErr != nil:
-				o.logger.Warning("Skipping cloud log copy: cannot stat source log %s: %v", logFilePath, probeErr)
+				o.logger.Debug("Cloud log copy: cannot stat source log %s: %v", logFilePath, probeErr)
+				o.logger.Info("  Source log not accessible: %s", safefs.SystemErrorText(probeErr))
+				o.logger.Warning("%s Log not copied to cloud", theme.SymbolWarning)
+			case o.dryRun:
+				// Every check above only reads; the copy is what a dry run leaves out.
+				o.logger.Debug("Log copy: dry run, %s not copied to %s", logFilePath, destination)
+				o.logger.Skip("Log copy: dry run mode")
 			default:
 				o.logger.Debug("Copying log to cloud: %s", destination)
 				// Detach the upload from the (possibly cancelled) run ctx: like the
@@ -492,24 +651,94 @@ func (o *Orchestrator) dispatchLogFile(ctx context.Context, logFilePath string) 
 				if o.copyLogToCloudFn != nil {
 					upload = o.copyLogToCloudFn
 				}
-				if err := upload(context.Background(), logFilePath, destination); err != nil {
-					o.logger.Warning("Failed to copy log to cloud: %v", err)
-				} else {
-					o.logger.Info("✓ Log copied to cloud: %s", destination)
+				var permErr *logPermissionsError
+				switch err := upload(context.Background(), logFilePath, destination); {
+				case errors.As(err, &permErr):
+					o.logger.Debug("Cloud log copy: %s uploaded, mode not set: %v", destination, permErr.err)
+					o.logger.Info("  Permissions failed: %s: %s", filepath.Base(destination), safefs.SystemErrorText(permErr.err))
+					if permErr.checksumNotVerified {
+						o.logger.Warning("%s Log copied to cloud, checksum not verified, permissions not set", theme.SymbolWarning)
+					} else {
+						o.logger.Warning("%s Log copied to cloud, permissions not set", theme.SymbolWarning)
+					}
+				case errors.Is(err, errLogChecksumNotVerified):
+					o.logger.Debug("Cloud log copy: %s uploaded, verified by size only", destination)
+					o.logger.Warning("%s Log copied to cloud, checksum not verified", theme.SymbolWarning)
+				case err != nil:
+					o.logger.Debug("Cloud log copy: failed to upload to %s: %v", destination, err)
+					switch {
+					case storage.AttemptsReported(err):
+						// With several attempts, each one is already a fact with its
+						// cause ("  Attempt <i>/<n> failed: ..."): the outcome follows.
+					case storage.VerificationFailed(err):
+						// The copy went through; what failed is the check of it.
+						o.logger.Info("  Verification failed: %s", storage.ErrorCause(err))
+					default:
+						o.logger.Info("  Copy failed: %s", storage.ErrorCause(err))
+					}
+					o.logger.Warning("%s Log not copied to cloud", theme.SymbolWarning)
+				default:
+					o.logger.Info("%s Log copied to cloud", theme.SymbolSuccess)
 				}
 			}
 		}
 	}
 
+	o.dispatchLogToBlocks(logFilePath)
 	return nil
 }
 
+// blockLogUploader is a destination block that attaches the run log to what it saved
+// in this run (the PBS storage: snapshot upload-log).
+type blockLogUploader interface {
+	Snapshot() string
+	UploadLog(ctx context.Context, logPath string) *block.ServerCause
+}
+
+// dispatchLogToBlocks copies the log to the snapshot each destination block saved in
+// this run. Like the other copies it runs on a background context: the log must still
+// ship after a Ctrl+C; the client bounds its own calls (10 s to connect, 120 s for an
+// answer).
+func (o *Orchestrator) dispatchLogToBlocks(logFilePath string) {
+	for _, b := range o.backupBlocks {
+		uploader, ok := b.(blockLogUploader)
+		if !ok {
+			continue
+		}
+		snapshot := uploader.Snapshot()
+		if snapshot == "" {
+			o.logger.Debug("PBS log copy: no snapshot saved in this run (dry_run=%v)", o.dryRun)
+			o.logger.Info("PBS: no snapshot in this run")
+			if o.dryRun {
+				o.logger.Skip("Log copy: dry run mode")
+			} else {
+				o.logger.Info("%s Log not copied to PBS", theme.SymbolWarning)
+			}
+			continue
+		}
+		o.logger.Info("PBS: %s", snapshot)
+		if cause := uploader.UploadLog(context.Background(), logFilePath); cause != nil {
+			o.logger.Debug("PBS log copy: upload of %s to %s failed: %s", logFilePath, snapshot, cause.Text)
+			for _, line := range cause.Facts() {
+				o.logger.Info("%s", line)
+			}
+			o.logger.Warning("%s Log not copied to PBS", theme.SymbolWarning)
+			continue
+		}
+		o.logger.Info("%s Log copied to PBS", theme.SymbolSuccess)
+	}
+}
+
 // resolveCloudPath normalizes a cloud path by prepending the remote name if not present.
-// Supports both new style (/path) and legacy style (remote:/path).
+// Supports both new style (/path) and legacy style (remote:/path). When CLOUD_REMOTE is
+// a local directory, a path without ":" lives inside it (storage.LocalCloudLogDir).
 func resolveCloudPath(path, cloudRemote string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return ""
+	}
+	if dir, ok := storage.LocalCloudLogDir(path, cloudRemote); ok {
+		return dir
 	}
 	// If it already contains ":", it's a legacy full path - use as-is
 	if strings.Contains(path, ":") {
@@ -530,20 +759,76 @@ func resolveCloudPath(path, cloudRemote string) string {
 
 // copyLogToCloud copies a log file to cloud storage using rclone
 func (o *Orchestrator) copyLogToCloud(ctx context.Context, sourcePath, destPath string) error {
-	// Normalize path using CLOUD_REMOTE if needed
-	destPath = resolveCloudPath(destPath, o.cfg.CloudRemote)
-
-	if !strings.Contains(destPath, ":") {
-		return fmt.Errorf("CLOUD_LOG_PATH requires CLOUD_REMOTE to be set: %s", destPath)
+	// Normalize path using CLOUD_REMOTE if needed. With CLOUD_REMOTE a local directory
+	// the destination dispatchLogFile hands over is already the full path inside it
+	// (buildCloudLogDestination): resolving it again would join the directory twice.
+	if _, local := storage.LocalCloudRemote(o.cfg.CloudRemote); !local {
+		destPath = resolveCloudPath(destPath, o.cfg.CloudRemote)
+		if !strings.Contains(destPath, ":") {
+			return fmt.Errorf("CLOUD_LOG_PATH requires CLOUD_REMOTE to be set: %s", destPath)
+		}
 	}
 
-	client, err := storage.NewCloudStorage(o.cfg, o.logger)
+	// No write-side hostname: this client only uploads a log file to an explicit
+	// remote path and never runs retention, so it has no archives of its own to
+	// recognise. It does pick up this host's server identity from cfg, because the
+	// constructor reads it there, and that is inert for the same reason: the identity
+	// is only ever consulted by ApplyRetention, which this client never calls.
+	client, err := storage.NewCloudStorage(o.cfg, o.logger, "")
 	if err != nil {
 		return fmt.Errorf("failed to initialize cloud storage: %w", err)
 	}
 
-	return client.UploadToRemotePath(ctx, sourcePath, destPath, true)
+	if err := client.UploadToRemotePath(ctx, sourcePath, destPath, true); err != nil {
+		return err
+	}
+	checksumNotVerified := false
+	for _, issue := range client.LastStoreIssues() {
+		if issue == storage.StoreIssueChecksumNotVerified {
+			checksumNotVerified = true
+		}
+	}
+	// rclone writes the log 0644. In a local CLOUD_REMOTE directory it gets the mode the
+	// Secondary log copy creates (copyFile, 0640), owner unchanged; the log is there
+	// either way.
+	if _, err := client.SetLocalLogMode(ctx, destPath, o.cloudFilesystemInfo()); err != nil {
+		return &logPermissionsError{err: err, checksumNotVerified: checksumNotVerified}
+	}
+	if checksumNotVerified {
+		return errLogChecksumNotVerified
+	}
+	return nil
 }
+
+// cloudFilesystemInfo is what the storage initialization detected for the cloud
+// destination (the registered cloud target's filesystem), nil without one.
+func (o *Orchestrator) cloudFilesystemInfo() *storage.FilesystemInfo {
+	for _, target := range o.storageTargets {
+		if adapter, ok := target.(*StorageAdapter); ok && adapter.backend != nil && adapter.backend.Location() == storage.LocationCloud {
+			return adapter.fsInfo
+		}
+	}
+	return nil
+}
+
+// logPermissionsError is a log that reached a local CLOUD_REMOTE directory whose mode
+// could not be set: dispatchLogFile prints "  Permissions failed: <log>: <cause>" and
+// closes the copy with "Log copied to cloud, permissions not set".
+type logPermissionsError struct {
+	err                 error
+	checksumNotVerified bool
+}
+
+func (e *logPermissionsError) Error() string {
+	return "log copied, permissions not set: " + e.err.Error()
+}
+
+func (e *logPermissionsError) Unwrap() error { return e.err }
+
+// errLogChecksumNotVerified is a log that reached the cloud verified by size only: the
+// verify path printed the "  Checksum failed" fact, and dispatchLogFile closes the copy
+// with "Log copied to cloud, checksum not verified" instead of a failure.
+var errLogChecksumNotVerified = errors.New("log copied, checksum not verified")
 
 func buildCloudLogDestination(basePath, fileName, cloudRemote string) string {
 	// Normalize path using cloudRemote if basePath doesn't contain ":"
@@ -576,5 +861,13 @@ func describeEarlyErrorPhase(phase string) string {
 			return "Initialization failed"
 		}
 		return fmt.Sprintf("%s failed", phase)
+	}
+}
+
+// SetNotifyFilter hands the orchestrator the threshold decided at initialization and the refresh
+// that decides it again before dispatch (cmd/proxsave notify_filter.go).
+func (o *Orchestrator) SetNotifyFilter(refresh func(context.Context) notifyfilter.Decision) {
+	if o != nil {
+		o.notifyFilterRefresh = refresh
 	}
 }

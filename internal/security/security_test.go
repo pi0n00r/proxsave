@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/tis24dev/proxsave/internal/config"
@@ -91,36 +92,15 @@ func TestResultAdd(t *testing.T) {
 	}
 }
 
-func TestResultHasErrors(t *testing.T) {
-	tests := []struct {
-		name     string
-		issues   []Issue
-		expected bool
-	}{
-		{"empty", nil, false},
-		{"warnings only", []Issue{{Severity: severityWarning}}, false},
-		{"has error", []Issue{{Severity: severityError}}, true},
-		{"mixed", []Issue{{Severity: severityWarning}, {Severity: severityError}}, true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := (&Result{Issues: tc.issues}).HasErrors(); got != tc.expected {
-				t.Fatalf("HasErrors() = %v, want %v", got, tc.expected)
-			}
-		})
-	}
-}
-
 func TestResultCounts(t *testing.T) {
 	r := &Result{Issues: []Issue{
 		{Severity: severityWarning},
 		{Severity: severityWarning},
 		{Severity: severityError},
 	}}
-	if r.ErrorCount() != 1 || r.WarningCount() != 2 || r.TotalIssues() != 3 {
+	if r.ErrorCount() != 1 || r.WarningCount() != 2 || len(r.Issues) != 3 {
 		t.Fatalf("unexpected counts: errors=%d warnings=%d total=%d",
-			r.ErrorCount(), r.WarningCount(), r.TotalIssues())
+			r.ErrorCount(), r.WarningCount(), len(r.Issues))
 	}
 }
 
@@ -257,7 +237,7 @@ func TestVerifySensitiveFilesOptionalSkip(t *testing.T) {
 	cfg := &config.Config{BaseDir: t.TempDir()}
 	checker := newChecker(t, cfg)
 	checker.verifySensitiveFiles(context.Background())
-	if checker.result.TotalIssues() != 0 {
+	if len(checker.result.Issues) != 0 {
 		t.Fatalf("expected no issues for optional sensitive files, got %+v", checker.result.Issues)
 	}
 }
@@ -1077,7 +1057,7 @@ func TestRunWithSecurityErrors(t *testing.T) {
 	}
 
 	// With ContinueOnSecurityIssues=false and wrong permissions, should get error
-	if err == nil && result.HasErrors() {
+	if err == nil && result.ErrorCount() > 0 {
 		t.Error("Run() should return error when ContinueOnSecurityIssues=false and errors exist")
 	}
 }
@@ -1207,6 +1187,7 @@ func TestShouldSkipOwnershipChecks(t *testing.T) {
 					SetBackupPermissions: tc.setBackupPerms,
 					BackupPath:           tc.backupPath,
 					LogPath:              tc.logPath,
+					SecondaryEnabled:     true,
 					SecondaryPath:        tc.secondaryPath,
 					SecondaryLogPath:     tc.secondaryLogPath,
 				},
@@ -1780,7 +1761,7 @@ func TestDetectPrivateAgeKeysSkipsExtensions(t *testing.T) {
 	checker.detectPrivateAgeKeys(context.Background())
 
 	// Should not detect keys in files with .md, .txt, .example extensions
-	if checker.result.TotalIssues() != 0 {
+	if len(checker.result.Issues) != 0 {
 		t.Errorf("expected no issues for files with skipped extensions, got %+v", checker.result.Issues)
 	}
 }
@@ -1810,7 +1791,7 @@ func TestDetectPrivateAgeKeysEmptyBaseDir(t *testing.T) {
 	checker.detectPrivateAgeKeys(context.Background())
 
 	// Empty BaseDir must skip the scan: no crash, and no walk of ./identity.
-	if checker.result.TotalIssues() != 0 {
+	if len(checker.result.Issues) != 0 {
 		t.Fatalf("empty BaseDir must skip the scan, got %+v", checker.result.Issues)
 	}
 }
@@ -1825,7 +1806,7 @@ func TestDetectPrivateAgeKeysNonExistentDir(t *testing.T) {
 	checker.detectPrivateAgeKeys(context.Background())
 
 	// Should not crash and should not add issues
-	if checker.result.TotalIssues() != 0 {
+	if len(checker.result.Issues) != 0 {
 		t.Errorf("expected no issues for non-existent dir, got %+v", checker.result.Issues)
 	}
 }
@@ -1844,7 +1825,7 @@ func TestVerifySecureAccountFilesEmptyPath(t *testing.T) {
 	checker.verifySecureAccountFiles(context.Background())
 
 	// Should return early with no issues
-	if checker.result.TotalIssues() != 0 {
+	if len(checker.result.Issues) != 0 {
 		t.Errorf("expected no issues for empty secure account path, got %+v", checker.result.Issues)
 	}
 }
@@ -1861,7 +1842,7 @@ func TestVerifySecureAccountFilesNoJsonFiles(t *testing.T) {
 	checker.verifySecureAccountFiles(context.Background())
 
 	// Should not add issues when no JSON files exist
-	if checker.result.TotalIssues() != 0 {
+	if len(checker.result.Issues) != 0 {
 		t.Errorf("expected no issues when no JSON files exist, got %+v", checker.result.Issues)
 	}
 }
@@ -2090,6 +2071,7 @@ func TestVerifyDirectoriesWithAllPaths(t *testing.T) {
 			BaseDir:          tmpDir,
 			BackupPath:       filepath.Join(tmpDir, "backup"),
 			LogPath:          filepath.Join(tmpDir, "log"),
+			SecondaryEnabled: true,
 			SecondaryPath:    filepath.Join(tmpDir, "secondary"),
 			SecondaryLogPath: filepath.Join(tmpDir, "secondary_log"),
 			LockPath:         filepath.Join(tmpDir, "lock"),
@@ -2851,5 +2833,70 @@ func TestExtractPortIPv6WithBrackets(t *testing.T) {
 	}
 	if addr != "::1" {
 		t.Errorf("expected addr ::1, got %s", addr)
+	}
+}
+
+// openUnnamedDescriptor opens path and returns a duplicate descriptor wrapped in an
+// *os.File with an empty name, the shape f.Name() returns "" for.
+func openUnnamedDescriptor(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	fd, err := syscall.Dup(int(f.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unnamed := os.NewFile(uintptr(fd), "")
+	t.Cleanup(func() { _ = unnamed.Close() })
+	return unnamed
+}
+
+// A descriptor without a name is reported as "<opened file>".
+func TestEnsureOwnershipAndPermFromFDNamesAnUnnamedDescriptor(t *testing.T) {
+	testFile := filepath.Join(t.TempDir(), "testfile")
+	if err := os.WriteFile(testFile, []byte("test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(testFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	logger := logging.New(types.LogLevelDebug, false)
+	logger.SetOutput(&log)
+	checker := &Checker{logger: logger, cfg: &config.Config{}, result: &Result{}}
+
+	checker.ensureOwnershipAndPermFromFD(openUnnamedDescriptor(t, testFile), nil, 0o600, "test file")
+
+	if want := "incorrect permissions on <opened file>"; !strings.Contains(log.String(), want) {
+		t.Fatalf("log missing %q:\n%s", want, log.String())
+	}
+}
+
+// A writable executable descriptor without a name is reported as "<opened file>".
+func TestEnsureExecutableOwnerWriteOnlyNamesAnUnnamedDescriptor(t *testing.T) {
+	testFile := filepath.Join(t.TempDir(), "proxsave")
+	if err := os.WriteFile(testFile, []byte("binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(testFile, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	f := openUnnamedDescriptor(t, testFile)
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	logger := logging.New(types.LogLevelDebug, false)
+	logger.SetOutput(&log)
+	checker := &Checker{logger: logger, cfg: &config.Config{}, result: &Result{}}
+
+	checker.ensureExecutableOwnerWriteOnly(f, info, "executable")
+
+	if want := "group/other-writable executable <opened file>"; !strings.Contains(log.String(), want) {
+		t.Fatalf("log missing %q:\n%s", want, log.String())
 	}
 }

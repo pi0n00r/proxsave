@@ -2,6 +2,7 @@
 package orchestrator
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,7 +10,10 @@ import (
 	"github.com/tis24dev/proxsave/internal/logging"
 )
 
-var pbsDatastoreSubdirs = []string{".chunks", ".index"}
+// pbsDatastoreSubdirs are the directories PBS creates in a datastore
+// (ChunkStore::create): only the chunk store. Index files live in the snapshot
+// directories, there is no .index directory.
+var pbsDatastoreSubdirs = []string{".chunks"}
 
 type pbsDatastorePreflight struct {
 	basePath        string
@@ -122,6 +126,10 @@ func shouldSkipUnsafePBSDatastore(preflight pbsDatastorePreflight, logger *loggi
 	if shouldSkipExistingDatastoreData(preflight, logger) {
 		return true
 	}
+	if preflight.hasData {
+		// A chunk store left incomplete, which initializePBSDatastore completes.
+		return false
+	}
 	return shouldSkipUnexpectedDatastoreEntries(preflight.basePath, logger)
 }
 
@@ -131,9 +139,9 @@ func shouldSkipRootFilesystemDatastore(preflight pbsDatastorePreflight, logger *
 	}
 
 	logger.Warning("PBS datastore preflight: %s resolves to the root filesystem (mount missing?), skipping datastore directory initialization to avoid writing to the wrong disk", preflight.basePath)
-	logger.Info("Mount/import the datastore disk/pool first, then restart PBS services.")
+	logger.Info("PBS datastore - left uninitialized until its disk or pool is mounted at %s", preflight.basePath)
 	if _, err := os.Stat(zpoolCachePath); err == nil {
-		logger.Info("ZFS detected: if this datastore was on ZFS, you may need to import the pool first (e.g. `zpool import` then `zpool import <pool-name>`).")
+		logger.Info("ZFS detected: a datastore on a ZFS pool is available only once that pool is imported")
 	}
 	return true
 }
@@ -150,10 +158,21 @@ func shouldSkipExistingDatastoreData(preflight pbsDatastorePreflight, logger *lo
 	if !preflight.hasData {
 		return false
 	}
+	// PBS writes .lock when it creates a chunk store, and ProxSave last, after the
+	// hash directories: entries in .chunks without .lock are a creation that
+	// stopped half-way (disk or inodes exhausted, the run killed). The missing
+	// directories and .lock are created; nothing there is removed.
+	if _, err := os.Lstat(filepath.Join(preflight.basePath, ".lock")); os.IsNotExist(err) {
+		logger.Debug("PBS datastore preflight: datastore=%s .chunks has entries, .lock missing action=complete", preflight.datastoreName)
+		logger.Info("Datastore %s initialization is incomplete, its missing directories are created", preflight.datastoreName)
+		return false
+	}
 	if warn := validatePBSDatastoreReadOnly(preflight.basePath); warn != "" {
 		logger.Warning("PBS datastore preflight: %s", warn)
 	}
-	logger.Info("PBS datastore preflight: datastore %s appears to contain data; skipping directory/permission changes to avoid risking datastore contents", preflight.datastoreName)
+	// has_data only means .chunks has entries, which every datastore PBS created
+	// has (its 65536 hash directories), with or without backups.
+	logger.Info("Datastore %s is already initialized, its directory is left as it is", preflight.datastoreName)
 	return true
 }
 
@@ -186,13 +205,124 @@ func initializePBSDatastore(basePath, datastoreName string, logger *logging.Logg
 		return false, fmt.Errorf("create datastore subdirectories: %w", err)
 	}
 	applyPBSDatastoreOwnership(basePath, datastoreName, dirsToFix, logger)
+	chunkDirsChanged, err := ensurePBSChunkStoreDirs(basePath, logger)
+	if err != nil {
+		return false, fmt.Errorf("create chunk store directories: %w", err)
+	}
 
 	lockChanged, lockErr := ensurePBSDatastoreLockFile(basePath, logger)
 	if lockErr != nil {
 		logger.Warning("PBS datastore lock file: %v", lockErr)
 	}
+	modesChanged := setPBSChunkStoreModes(basePath, logger)
 
-	return changed || subdirChanged || lockChanged, nil
+	return changed || subdirChanged || chunkDirsChanged || lockChanged || modesChanged, nil
+}
+
+// pbsChunkStoreModes are the modes PBS creates a chunk store with, and the only
+// ones it reopens an existing one with: "datastore create --reuse-datastore"
+// refuses any other, "permissions or owner not correct" (measured on PBS 4.2.8).
+// The hash directories are created 0750 by ensurePBSChunkStoreDirs.
+var pbsChunkStoreModes = []struct {
+	rel  string
+	mode os.FileMode
+}{
+	{".", 0o755},
+	{".chunks", 0o750},
+	{".lock", 0o644},
+}
+
+// setPBSChunkStoreModes gives the datastore directory, .chunks and .lock the modes
+// of pbsChunkStoreModes. They are changed through an os.Root of the datastore
+// directory, so a symlink put in place of .chunks or .lock (the datastore belongs
+// to the backup user) cannot lead the chmod outside it. A chmod that fails is
+// reported like the other datastore permission changes and does not stop the
+// recreation.
+func setPBSChunkStoreModes(basePath string, logger *logging.Logger) bool {
+	root, err := os.OpenRoot(basePath)
+	if err != nil {
+		logger.Debug("PBS datastore permissions: cannot open %s: %v", basePath, err)
+		return false
+	}
+	defer func() { _ = root.Close() }()
+	changed := false
+	for _, m := range pbsChunkStoreModes {
+		path := filepath.Join(basePath, m.rel)
+		info, err := root.Lstat(m.rel)
+		if err != nil {
+			// A missing entry has no mode to set; any other failure is traced.
+			if !errors.Is(err, os.ErrNotExist) {
+				logger.Debug("PBS datastore permissions: cannot stat %s: %v", path, err)
+			}
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		current := info.Mode().Perm()
+		if current == m.mode {
+			continue
+		}
+		logger.Debug("PBS datastore permissions: chmod %s from %o to %o", path, current, m.mode)
+		if err := root.Chmod(m.rel, m.mode); err != nil {
+			if err := handleDatastoreModeError(path, current, m.mode, err, logger); err != nil {
+				logger.Warning("Could not set datastore ownership for %s: %v", path, err)
+			}
+			continue
+		}
+		changed = true
+	}
+	return changed
+}
+
+// pbsChunkStoreDirTotal is the number of hash directories PBS creates in .chunks,
+// 0000 to ffff (ChunkStore::create): a chunk is written into the directory named
+// after the first 4 hex digits of its digest, and fails when that directory is
+// missing. pbsChunkStoreDirCount is how many ensurePBSChunkStoreDirs creates; only
+// tests lower it.
+const pbsChunkStoreDirTotal = 64 * 1024
+
+var pbsChunkStoreDirCount = pbsChunkStoreDirTotal
+
+func pbsChunkStoreDirName(i int) string {
+	return fmt.Sprintf("%04x", i)
+}
+
+// ensurePBSChunkStoreDirs creates the missing hash directories of .chunks, 0750
+// and owned by backup:backup like the ones PBS creates. Without them the
+// datastore is listed but every backup and garbage collection fails.
+func ensurePBSChunkStoreDirs(basePath string, logger *logging.Logger) (bool, error) {
+	chunkDir := filepath.Join(basePath, ".chunks")
+	uid, gid, chown := -1, -1, false
+	if os.Geteuid() == 0 {
+		var err error
+		if uid, gid, chown, err = lookupBackupOwnership(chunkDir, logger); err != nil {
+			return false, err
+		}
+	}
+	created := 0
+	for i := range pbsChunkStoreDirCount {
+		dir := filepath.Join(chunkDir, pbsChunkStoreDirName(i))
+		if err := os.Mkdir(dir, 0o750); err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return created > 0, fmt.Errorf("create %s: %w", dir, err)
+		}
+		created++
+		if !chown {
+			continue
+		}
+		if err := os.Chown(dir, uid, gid); err != nil {
+			// One report for the whole chunk store, not one per directory.
+			chown = false
+			if err := handleDatastoreOwnershipError("ownership", dir, uid, gid, err, logger); err != nil {
+				return true, err
+			}
+		}
+	}
+	logger.Debug("PBS datastore chunk store: created %d of %d hash directories in %s (chown=%v)", created, pbsChunkStoreDirCount, chunkDir, chown)
+	return created > 0, nil
 }
 
 func ensurePBSDatastoreSubdirs(basePath string, dirsToFix []string) (bool, []string, error) {

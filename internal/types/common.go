@@ -123,6 +123,19 @@ type BackupMetadata struct {
 	// Empty when no manifest could be read.
 	Hostname string
 
+	// ServerID is the server identity of the machine that produced the backup,
+	// taken from the same manifest payload that supplied Hostname ("server_id").
+	// It is empty for every archive written before the field existed, and for every
+	// archive whose manifest could not be read. It is never inferred from the
+	// filename, which carries no such token.
+	//
+	// Absence means "no stronger signal is available", never "no owner" and never
+	// "matches": comparing two empty values must never make two archives, or two
+	// machines, the same. It is a CONFIRMING signal only. It can turn an ambiguous
+	// hostname claim into a certain one, and it can never create a claim the
+	// hostname did not already make, nor remove one the hostname does make.
+	ServerID string
+
 	// ProxmoxType is the type of Proxmox environment (PVE/PBS)
 	ProxmoxType ProxmoxType
 
@@ -136,25 +149,6 @@ type BackupMetadata struct {
 	// or .sha256) exists for this backup. An unverified entry (a partial or a
 	// mystery file) is inert for retention: never kept as a slot, never deleted.
 	Verified bool
-}
-
-// StorageLocation represents a storage destination.
-type StorageLocation string
-
-const (
-	// StorageLocal - Local storage
-	StorageLocal StorageLocation = "local"
-
-	// StorageSecondary - Secondary storage
-	StorageSecondary StorageLocation = "secondary"
-
-	// StorageCloud - Cloud storage (rclone)
-	StorageCloud StorageLocation = "cloud"
-)
-
-// String returns the string representation of the location.
-func (s StorageLocation) String() string {
-	return string(s)
 }
 
 // LogLevel represents the logging level.

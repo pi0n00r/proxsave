@@ -7,7 +7,6 @@ import (
 	"io"
 	"strings"
 
-	"github.com/tis24dev/proxsave/internal/backup"
 	"github.com/tis24dev/proxsave/internal/config"
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/ui/shell"
@@ -77,14 +76,15 @@ func RunDecryptWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logg
 	return nil
 }
 
-func buildTargetInfo(manifest *backup.Manifest) string {
-	return fmt.Sprintf("Targets: %s", formatBackupCandidateTarget(manifest))
-}
-
 func normalizeProxmoxVersion(value string) string {
 	version := strings.TrimSpace(value)
 	if version == "" {
 		return ""
+	}
+	// "unknown" is what detection records when no marker carried a version. It is not
+	// a version number, so it takes no "v": the backup list read "PVE vunknown".
+	if strings.EqualFold(version, "unknown") {
+		return "unknown"
 	}
 	if !strings.HasPrefix(strings.ToLower(version), "v") {
 		version = "v" + version

@@ -176,7 +176,7 @@ func maybeApplyPVEHAWithUI(
 	}
 	logging.DebugStep(logger, "pve ha restore (ui)", "User choice: applyNow=%v", applyNow)
 	if !applyNow {
-		logger.Info("Skipping PVE HA apply (you can apply manually later).")
+		logger.Info("PVE HA - not applied: this host keeps its current HA configuration")
 		return nil
 	}
 
@@ -365,11 +365,15 @@ func armHARollback(ctx context.Context, logger *logging.Logger, backupPath strin
 	}
 
 	timestamp := nowRestore().Format("20060102_150405")
+	logPath, err := rollbackLogPath(fmt.Sprintf("ha_rollback_%s.log", timestamp))
+	if err != nil {
+		return nil, err
+	}
 	handle = &haRollbackHandle{
 		workDir:    baseDir,
 		markerPath: filepath.Join(baseDir, fmt.Sprintf("ha_rollback_pending_%s", timestamp)),
 		scriptPath: filepath.Join(baseDir, fmt.Sprintf("ha_rollback_%s.sh", timestamp)),
-		logPath:    filepath.Join(baseDir, fmt.Sprintf("ha_rollback_%s.log", timestamp)),
+		logPath:    logPath,
 		armedAt:    nowRestore(),
 		timeout:    timeout,
 	}
@@ -383,10 +387,7 @@ func armHARollback(ctx context.Context, logger *logging.Logger, backupPath strin
 		return nil, fmt.Errorf("write rollback script: %w", err)
 	}
 
-	timeoutSeconds := int(timeout.Seconds())
-	if timeoutSeconds < 1 {
-		timeoutSeconds = 1
-	}
+	timeoutSeconds := max(int(timeout.Seconds()), 1)
 
 	if commandAvailable("systemd-run") {
 		handle.unitName = fmt.Sprintf("proxsave-ha-rollback-%s", timestamp)
@@ -439,6 +440,7 @@ func buildHARollbackScript(markerPath, backupPath, logPath string) string {
 		"#!/bin/sh",
 		"set -eu",
 		fmt.Sprintf("LOG=%s", shellQuote(logPath)),
+		rollbackLogProbe,
 		fmt.Sprintf("MARKER=%s", shellQuote(markerPath)),
 		fmt.Sprintf("BACKUP=%s", shellQuote(backupPath)),
 		`echo "[INFO] ========================================" >> "$LOG"`,

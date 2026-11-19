@@ -1,14 +1,17 @@
 package health
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/serverbot"
 )
 
@@ -40,6 +43,12 @@ type CentralizedConfig struct {
 	BackupURL   string `json:"backup_ping_url"`
 	ProjectCode string `json:"project_code"`
 	LoginURL    string `json:"login_url"`
+	// NotifyPolicy is the relay's ack of a contract-1 poll (FetchCentralizedConfigPoll);
+	// nil on a legacy poll or an older relay.
+	NotifyPolicy *NotifyPolicyAck `json:"notify_policy,omitempty"`
+	// Schedule is the relay's ack of the backup schedule frequency a poll sent
+	// (FetchCentralizedConfigPoll); nil when the poll sent none or the relay never stored one.
+	Schedule *ScheduleAck `json:"schedule,omitempty"`
 	// PortalURL and PortalLogin are the state-INDEPENDENT portal facts: the plain
 	// sign-in page and the identity that signs in there. The server derives both from
 	// its own constants (no provisioning round-trip), so they ride every answer for a
@@ -54,6 +63,14 @@ type CentralizedConfig struct {
 	// infer it from an empty LoginURL: a failed mint looks identical and would tell a
 	// password-less operator to sign in with a password they never chose.
 	PasswordSet *bool `json:"password_set"`
+	// LoginKind is LoginKindPortal when LoginURL is the portal's plain sign-in page rather than a
+	// single-use magic-link: the relay sends it for a project the operator owns (an initial
+	// email applied, or a project moved to an account of theirs). "" for a magic-link or an
+	// older relay.
+	LoginKind string `json:"login_kind,omitempty"`
+	// AccountInitialEmail is the relay's answer to HEALTHCHECK_ACCOUNT_INITIAL_EMAIL on a poll
+	// that sent it; nil otherwise or from an older relay.
+	AccountInitialEmail *AccountInitialEmailAck `json:"account_initial_email,omitempty"`
 	// Checks carries additive, OPTIONAL per-sensor ping URLs beyond the two frozen
 	// alive/backup keys (Fase 1: {"updates":"<ping-url>"}). An old server omits it; the
 	// completeness check below still requires only alive+backup, so a new client against
@@ -102,21 +119,30 @@ type serverError struct {
 // used by the install-time setup screen; the daemon's poll passes false so it
 // never triggers the server-side mint.
 func FetchCentralizedConfig(ctx context.Context, client *http.Client, serverAPIHost, serverID, secret string, includeLogin bool) (CentralizedConfig, error) {
-	return fetchConfig(ctx, client, serverAPIHost, serverID, secret, includeLogin, nil)
+	return fetchConfig(ctx, client, serverAPIHost, serverID, secret, includeLogin)
 }
 
-// FetchCentralizedConfigWithChannels is the daemon-only variant that ALSO sends the
-// authoritative enabled-notification set as ?channels so the server provisions one check per
-// enabled channel. channels is the lowercased set (e.g. ["email","telegram"]); an EMPTY
-// (non-nil) slice sends the "none" sentinel (pause all). It is a separate function from
-// FetchCentralizedConfig so the install-wizard/Phase-7 callers structurally CANNOT send
-// ?channels (only the daemon owns the authoritative set).
-func FetchCentralizedConfigWithChannels(ctx context.Context, client *http.Client, serverAPIHost, serverID, secret string, includeLogin bool, channels []string) (CentralizedConfig, error) {
-	return fetchConfig(ctx, client, serverAPIHost, serverID, secret, includeLogin, channels)
+func fetchConfig(ctx context.Context, client *http.Client, serverAPIHost, serverID, secret string, includeLogin bool) (CentralizedConfig, error) {
+	cfg, _, err := fetchConfigPoll(ctx, client, serverAPIHost, serverID, secret, includeLogin, nil, nil, "", PollLog{})
+	return cfg, err
 }
 
-func fetchConfig(ctx context.Context, client *http.Client, serverAPIHost, serverID, secret string, includeLogin bool, channels []string) (CentralizedConfig, error) {
+// PollLog names how a config poll's transport stages are logged in DEBUG
+// (serverbot.Request.LogOperation, LogPrefix, LogURLDetail). A nil Logger logs nothing.
+type PollLog struct {
+	Logger    *logging.Logger
+	Operation string
+	Prefix    string
+	URLDetail string
+}
+
+// fetchConfigPoll fetches the config (with extra query parameters, the notify policy contract)
+// and also returns the HTTP status of the answer: 0 when
+// there was none (the error is then the transport's), the relay's status otherwise, whatever the
+// error. With plog.Logger an answer other than 200 adds an excerpt of its body, secret masked.
+func fetchConfigPoll(ctx context.Context, client *http.Client, serverAPIHost, serverID, secret string, includeLogin bool, channels []string, extra url.Values, initialEmail string, plog PollLog) (CentralizedConfig, int, error) {
 	q := url.Values{"server_id": {serverID}}
+	maps.Copy(q, extra)
 	if includeLogin {
 		q.Set("login", "1")
 	}
@@ -125,21 +151,24 @@ func fetchConfig(ctx context.Context, client *http.Client, serverAPIHost, server
 	// value, which a proxy could drop and silently turn into "leave alone").
 	if channels != nil {
 		v := strings.Join(channels, ",")
-		if v == "" {
-			v = "none"
-		}
+		v = cmp.Or(v, "none")
 		q.Set("channels", v)
 	}
 	// Transport + auth (host normalize, X-Server-Auth, X-Proxsave-Version, timeout,
 	// bounded read, error redaction) is the shared serverbot brick; the endpoint
 	// vocabulary below (status map + typed errors + completeness check) stays here.
-	resp, err := serverbot.New(serverAPIHost, client, nil).Do(ctx, serverbot.Request{
+	resp, err := serverbot.New(serverAPIHost, client, plog.Logger).Do(ctx, serverbot.Request{
 		Method:   http.MethodGet,
 		Path:     "/api/healthcheck/config",
 		Query:    q,
 		Secret:   secret,
 		Timeout:  fetchTimeout,
 		MaxBytes: 8192,
+		// The address travels in a header and never in LogURLDetail: never logged.
+		AccountInitialEmail: initialEmail,
+		LogOperation:        plog.Operation,
+		LogPrefix:           plog.Prefix,
+		LogURLDetail:        plog.URLDetail,
 	})
 	if err != nil {
 		// Transport failure (build/dial/read), already URL-stripped + secret-masked by
@@ -149,38 +178,63 @@ func fetchConfig(ctx context.Context, client *http.Client, serverAPIHost, server
 		// definitive. Benign: the affected 4xx/503 bodies are tiny, so the window (status
 		// received but body transfer broken) is vanishingly small, and retry is the safer
 		// degradation.
-		return CentralizedConfig{}, err
+		return CentralizedConfig{}, 0, err
+	}
+	if resp.Status != http.StatusOK && plog.Logger != nil {
+		msg := fmt.Sprintf("response body=%q", logging.RedactSecrets(resp.Snippet(200), secret))
+		if plog.Prefix != "" {
+			msg = plog.Prefix + " " + msg
+		}
+		logging.DebugStep(plog.Logger, plog.Operation, "%s", msg)
 	}
 
-	switch resp.Status {
-	case http.StatusOK:
+	switch {
+	case resp.Status == http.StatusOK:
 		var cfg CentralizedConfig
 		if err := resp.JSON(&cfg); err != nil {
-			return CentralizedConfig{}, fmt.Errorf("healthcheck config: bad JSON: %w", err)
+			return CentralizedConfig{}, resp.Status, fmt.Errorf("healthcheck config: bad JSON: %w", err)
 		}
 		if cfg.AliveURL == "" || cfg.BackupURL == "" {
-			return CentralizedConfig{}, fmt.Errorf("healthcheck config: incomplete response")
+			return CentralizedConfig{}, resp.Status, fmt.Errorf("healthcheck config: incomplete response")
 		}
-		return cfg, nil
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return CentralizedConfig{}, ErrHCAuth
-	case http.StatusNotFound:
-		return CentralizedConfig{}, ErrHCUnknown
-	case http.StatusGone:
+		return cfg, resp.Status, nil
+	case serverbot.AuthRejected(resp.Status):
+		return CentralizedConfig{}, resp.Status, ErrHCAuth
+	case resp.Status == http.StatusNotFound:
+		return CentralizedConfig{}, resp.Status, ErrHCUnknown
+	case resp.Status == http.StatusGone:
 		// 410 SERVER_PARKED: the row was purged but this host still holds the old
 		// token. Treat like a definitive auth rejection so the daemon clears the
 		// stale secret and re-provisions (which re-admits the returning host).
-		return CentralizedConfig{}, ErrHCParked
-	case http.StatusServiceUnavailable:
+		return CentralizedConfig{}, resp.Status, ErrHCParked
+	case resp.Status == http.StatusServiceUnavailable:
 		// The server returns HC_DISABLED (feature off) or HC_NOT_READY (provisioning
 		// not done yet). Distinguish so the daemon logs the right thing.
 		var e serverError
 		_ = resp.JSON(&e)
 		if e.Error == "HC_DISABLED" {
-			return CentralizedConfig{}, ErrHCDisabled
+			return CentralizedConfig{}, resp.Status, ErrHCDisabled
 		}
-		return CentralizedConfig{}, ErrHCNotReady
+		return CentralizedConfig{}, resp.Status, ErrHCNotReady
 	default:
-		return CentralizedConfig{}, fmt.Errorf("healthcheck config: HTTP %d", resp.Status)
+		return CentralizedConfig{}, resp.Status, fmt.Errorf("healthcheck config: HTTP %d", resp.Status)
 	}
+}
+
+// LoginKindPortal is CentralizedConfig.LoginKind for a login URL that is the portal's sign-in page.
+const LoginKindPortal = "portal"
+
+// AccountInitialEmailAck is the relay's answer about HEALTHCHECK_ACCOUNT_INITIAL_EMAIL (issue 347):
+// State is "pending" (a confirmation mail is out, or none could go yet), "applied" (the address
+// now signs in to the portal; the variable is not needed any more) or "rejected", with Reason
+// "invalid", "reserved" or "unconfirmed". A pending answer may carry Reason "limit".
+type AccountInitialEmailAck struct {
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// Final reports whether the relay will answer the same for this address from now on: the daemon
+// then stops sending it.
+func (a *AccountInitialEmailAck) Final() bool {
+	return a != nil && (a.State == "applied" || a.State == "rejected")
 }

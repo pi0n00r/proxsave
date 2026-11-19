@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -34,38 +35,19 @@ func readPVEPoolsFromExportUserCfg(exportRoot string) ([]pvePoolSpec, error) {
 		return nil, nil
 	}
 
-	sections, err := parseProxmoxNotificationSections(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parse user.cfg: %w", err)
-	}
-
+	// user.cfg is colon lines, not a section config (restore_access_control_pve.go):
+	// pool:<poolid>:<comment>:<vmids,...>:<storages,...>: (measured on PVE 9.1.9).
 	var pools []pvePoolSpec
-	for _, s := range sections {
-		if !strings.EqualFold(strings.TrimSpace(s.Type), "pool") {
+	for _, l := range parsePVEUserCfg(raw) {
+		if l.typ != "pool" || l.field(0) == "" {
 			continue
 		}
-		id := strings.TrimSpace(s.Name)
-		if id == "" {
-			continue
-		}
-
-		spec := pvePoolSpec{ID: id}
-		for _, kv := range s.Entries {
-			key := strings.ToLower(strings.TrimSpace(kv.Key))
-			val := strings.TrimSpace(kv.Value)
-			switch key {
-			case "comment":
-				spec.Comment = val
-			case "vms":
-				spec.VMIDs = splitProxmoxCSV(val)
-			case "storage":
-				spec.Storages = splitProxmoxCSV(val)
-			}
-		}
-
-		spec.VMIDs = uniqueSortedStrings(spec.VMIDs)
-		spec.Storages = uniqueSortedStrings(spec.Storages)
-		pools = append(pools, spec)
+		pools = append(pools, pvePoolSpec{
+			ID:       l.field(0),
+			Comment:  l.field(1),
+			VMIDs:    uniqueSortedStrings(splitProxmoxCSV(l.field(2))),
+			Storages: uniqueSortedStrings(splitProxmoxCSV(l.field(3))),
+		})
 	}
 
 	sort.Slice(pools, func(i, j int) bool { return pools[i].ID < pools[j].ID })
@@ -101,8 +83,31 @@ func anyPoolHasVMs(pools []pvePoolSpec) bool {
 	return false
 }
 
+// listPVEPoolIDs reads the pool IDs already on the node.
+//
+// It captures STDOUT ONLY. The loop below takes fields[0] of every non-empty
+// line as a pool ID, so anything the tool writes to stderr is ingested as data.
+//
+// Measured on a live PVE 9.1.9 node (2026-09-05): with LC_ALL set to a locale the
+// host does not have, `pveum pool list` exits 0 and writes 556 bytes of
+// "perl: warning: Setting locale failed." to stderr. Running this very loop over
+// the merged bytes yielded 17 phantom IDs, one per variable the warning
+// enumerates: perl:, LANGUAGE, LC_ALL, LC_CTYPE, LC_NUMERIC, LC_COLLATE, LC_TIME,
+// LC_MESSAGES, LC_MONETARY, LC_ADDRESS, LC_IDENTIFICATION, LC_MEASUREMENT,
+// LC_PAPER, LC_TELEPHONE, LC_NAME, LANG, are.
+//
+// The real IDs survive alongside them, so nothing is lost; what breaks is
+// pvePoolAlreadyExists, which would report a backup pool named like one of those
+// tokens as already present and skip it. LANG, LC_TIME and are are all valid PVE
+// pool IDs. The stock sshd_config on that node carries `AcceptEnv LANG LC_*`, so
+// an operator sshing in with a locale it lacks is the whole reproduction.
+//
+// Parsing on a non-nil error stays deliberate: a partial list beats none. It only
+// gets better here, because stdout alone is empty when pveum failed outright, so
+// the raw == "" branch surfaces the error instead of parsing a warning, and
+// runCommandStdout folds stderr into that error.
 func listPVEPoolIDs(ctx context.Context) (map[string]struct{}, error) {
-	output, err := restoreCmd.Run(ctx, "pveum", "pool", "list")
+	output, err := runCommandStdout(ctx, "pveum", "pool", "list")
 	raw := strings.TrimSpace(string(output))
 	if raw == "" {
 		if err != nil {
@@ -112,7 +117,7 @@ func listPVEPoolIDs(ctx context.Context) (map[string]struct{}, error) {
 	}
 
 	out := make(map[string]struct{})
-	for _, line := range strings.Split(raw, "\n") {
+	for line := range strings.SplitSeq(raw, "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
 		if len(fields) == 0 {
 			continue
@@ -296,6 +301,6 @@ func uniqueSortedStrings(items []string) []string {
 		seen[s] = struct{}{}
 		out = append(out, s)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }

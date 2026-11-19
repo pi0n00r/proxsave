@@ -198,7 +198,7 @@ func TestCheckHealthcheckConnection(t *testing.T) {
 		// Fresh, OK heartbeat on disk -> the daemon is alive and transmitting (CheckDaemonState
 		// reads the real status file now, so seed one instead of stubbing the load).
 		base := t.TempDir()
-		if err := health.RecordPing(base, "self", health.KindHeartbeat, now.Unix(), true, nil); err != nil {
+		if err := health.RecordOutcomePing(base, "self", health.KindHeartbeat, now.Unix(), true, false, nil); err != nil {
 			t.Fatalf("seed heartbeat: %v", err)
 		}
 		res := CheckHealthcheckConnection(context.Background(), "https://h", "id", base, time.Minute)
@@ -210,6 +210,18 @@ func TestCheckHealthcheckConnection(t *testing.T) {
 		}
 		if !res.DaemonRead || res.Daemon.State != health.TxTransmitting {
 			t.Fatalf("daemon must be diagnosed as transmitting: read=%v state=%q", res.DaemonRead, res.Daemon.State)
+		}
+	})
+
+	t.Run("the portal sign-in page keeps its login_kind", func(t *testing.T) {
+		healthcheckSetupFetch = func(ctx context.Context, client *http.Client, host, id, secret string, includeLogin bool) (health.CentralizedConfig, error) {
+			return health.CentralizedConfig{AliveURL: "https://a", BackupURL: "https://b",
+				LoginURL: "https://hc.proxsave.dev/accounts/login/", LoginKind: health.LoginKindPortal}, nil
+		}
+		healthcheckSetupPing = func(ctx context.Context, aliveURL string) error { return nil }
+		res := CheckHealthcheckConnection(context.Background(), "https://h", "id", t.TempDir(), time.Minute)
+		if res.LoginKind != health.LoginKindPortal {
+			t.Fatalf("login_kind lost: %+v", res)
 		}
 	})
 
@@ -279,7 +291,7 @@ func TestClassifyHealthcheckDaemonState(t *testing.T) {
 // is driven by the injected DaemonProcStale seam, not the record.
 func seedDaemonInfoFor(t *testing.T, base string, now time.Time) {
 	t.Helper()
-	if err := health.RecordPing(base, "self", health.KindHeartbeat, now.Unix(), true, nil); err != nil {
+	if err := health.RecordOutcomePing(base, "self", health.KindHeartbeat, now.Unix(), true, false, nil); err != nil {
 		t.Fatalf("seed heartbeat: %v", err)
 	}
 	if err := health.WriteDaemonInfo(base, health.DaemonInfo{
@@ -436,7 +448,7 @@ func TestCheckHealthcheckConnectionProcStaleFallback(t *testing.T) {
 	DaemonProcStale = func(pid int) (bool, bool) { return true, true }
 
 	base := t.TempDir()
-	if err := health.RecordPing(base, "self", health.KindHeartbeat, now.Unix(), true, nil); err != nil {
+	if err := health.RecordOutcomePing(base, "self", health.KindHeartbeat, now.Unix(), true, false, nil); err != nil {
 		t.Fatalf("seed heartbeat: %v", err)
 	}
 	// A LIVE pid (this process) so the leaf pidAlive probe reads ProcessAlive=true and the /proc probe
@@ -458,5 +470,55 @@ func TestCheckHealthcheckConnectionProcStaleFallback(t *testing.T) {
 	}
 	if res.DaemonStale == "" {
 		t.Fatalf("DaemonStale must carry the /proc fallback phrasing")
+	}
+}
+
+// A daemon config with a blank mode and host is read as centralized against the
+// default server.
+func TestBuildHealthcheckSetupBootstrapDefaultsABlankModeAndHost(t *testing.T) {
+	stubHealthcheckBootstrap(t, &config.Config{HealthcheckEnabled: true}, nil, "123456789012", "sekret")
+
+	state, err := BuildHealthcheckSetupBootstrap(context.Background(), "/cfg", "/base")
+	if err != nil {
+		t.Fatalf("bootstrap returned error (must be non-blocking): %v", err)
+	}
+	if state.HealthcheckMode != "centralized" || state.ServerAPIHost != defaultServerAPIHost {
+		t.Fatalf("mode=%q host=%q; want centralized and %q", state.HealthcheckMode, state.ServerAPIHost, defaultServerAPIHost)
+	}
+}
+
+// A behind daemon with no specific stale reason gets the generic one.
+func TestClassifyHealthcheckBehindDefaultsABlankReason(t *testing.T) {
+	behind := HealthcheckCheckResult{
+		Reachable: true, DaemonRead: true,
+		Daemon:             health.Diagnosis{State: health.TxRunningNoReport, DaemonUp: true},
+		DaemonAlignChecked: true,
+	}
+	msg := ClassifyHealthcheckSetupResult(behind).Message
+	if want := "is behind: it is running an older binary than the one now on disk;"; !strings.Contains(msg, want) {
+		t.Fatalf("BEHIND message = %q, want it to contain %q", msg, want)
+	}
+}
+
+// The portal's sign-in page (issue 347): marked only with login_kind portal and a trusted URL.
+func TestClassifyHealthcheckSetupResultPortalPage(t *testing.T) {
+	yes, no := true, false
+	page := "https://hc.proxsave.dev/accounts/login/"
+	for _, c := range []struct {
+		name              string
+		res               HealthcheckCheckResult
+		page, passwordSet bool
+	}{
+		{"portal page without password", HealthcheckCheckResult{Reachable: true, LoginURL: page, LoginKind: health.LoginKindPortal, PasswordSet: &no}, true, false},
+		{"portal page with password", HealthcheckCheckResult{Reachable: true, LoginURL: page, LoginKind: health.LoginKindPortal, PasswordSet: &yes}, true, true},
+		{"portal page, password unknown", HealthcheckCheckResult{Reachable: true, LoginURL: page, LoginKind: health.LoginKindPortal}, true, false},
+		{"magic link", HealthcheckCheckResult{Reachable: true, LoginURL: "https://hc.proxsave.dev/l/abc", PasswordSet: &no}, false, false},
+		{"unknown kind", HealthcheckCheckResult{Reachable: true, LoginURL: page, LoginKind: "other"}, false, false},
+		{"foreign host dropped", HealthcheckCheckResult{Reachable: true, LoginURL: "https://evil.example/accounts/login/", LoginKind: health.LoginKindPortal}, false, false},
+	} {
+		st := ClassifyHealthcheckSetupResult(c.res)
+		if st.LoginIsPortalPage != c.page || st.LoginPasswordSet != c.passwordSet {
+			t.Errorf("%s: page=%t password=%t", c.name, st.LoginIsPortalPage, st.LoginPasswordSet)
+		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/tis24dev/proxsave/internal/cli"
 	"github.com/tis24dev/proxsave/internal/types"
 	"github.com/tis24dev/proxsave/internal/ui/shell"
+	"github.com/tis24dev/proxsave/internal/whatsnew"
 )
 
 // isErrNilCheck reports whether e is `<name> == nil`.
@@ -123,11 +124,10 @@ func TestUpgradeShowsWhatsnewAfterFooter(t *testing.T) {
 	}
 }
 
-// TestShouldRunWhatsnewAfterUpgrade pins the post-upgrade gate: Screen 0 opens only on an
-// interactive terminal AND when the operator did not request auto-yes. Auto-yes (`--upgrade
-// y`) means non-interactive intent even under a pty (ssh -tt, Ansible, script -c), so it must
-// skip the screen; otherwise a successful automated upgrade would stall until the Screen 0
-// timeout waiting for a keypress nobody sends.
+// TestShouldRunWhatsnewAfterUpgrade pins the post-upgrade gate: Screen 0 follows the actual
+// terminal. Auto-yes only suppresses the initial confirmation; a manual `--upgrade y` in a
+// TTY still shows Screen 0, while the dashboard explicitly defers presentation to its
+// replacement process.
 func TestShouldRunWhatsnewAfterUpgrade(t *testing.T) {
 	orig := whatsnewAfterUpgradeInteractive
 	t.Cleanup(func() { whatsnewAfterUpgradeInteractive = orig })
@@ -135,19 +135,24 @@ func TestShouldRunWhatsnewAfterUpgrade(t *testing.T) {
 	cases := []struct {
 		name        string
 		args        *cli.Args
+		opts        upgradeRunOptions
 		interactive bool
 		want        bool
 	}{
-		{"interactive human upgrade shows", &cli.Args{}, true, true},
-		{"auto-yes under a pty skips (no stall)", &cli.Args{UpgradeAutoYes: true}, true, false},
-		{"non-interactive skips", &cli.Args{}, false, false},
-		{"auto-yes and non-interactive skips", &cli.Args{UpgradeAutoYes: true}, false, false},
-		{"nil args skips", nil, true, false},
+		{"interactive prompted upgrade shows", &cli.Args{}, upgradeRunOptions{}, true, true},
+		// A pty is routinely allocated where no human is watching (ssh -tt, Ansible
+		// with a pty, script -c), so the terminal check alone cannot decide this.
+		// Auto-yes is the operator saying nobody will answer prompts.
+		{"auto-yes upgrade skips even with a tty", &cli.Args{UpgradeAutoYes: true}, upgradeRunOptions{}, true, false},
+		{"non-interactive prompted upgrade skips", &cli.Args{}, upgradeRunOptions{}, false, false},
+		{"non-interactive auto-yes upgrade skips", &cli.Args{UpgradeAutoYes: true}, upgradeRunOptions{}, false, false},
+		{"dashboard defers presentation", &cli.Args{UpgradeAutoYes: true}, upgradeRunOptions{deferWhatsnew: true}, true, false},
+		{"nil args skips", nil, upgradeRunOptions{}, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			whatsnewAfterUpgradeInteractive = func() bool { return tc.interactive }
-			if got := shouldRunWhatsnewAfterUpgrade(tc.args); got != tc.want {
+			if got := shouldRunWhatsnewAfterUpgrade(tc.args, tc.opts); got != tc.want {
 				t.Fatalf("shouldRunWhatsnewAfterUpgrade = %v, want %v", got, tc.want)
 			}
 		})
@@ -162,7 +167,10 @@ func TestShowWhatsnewScreenSkipsWhenNonInteractive(t *testing.T) {
 	origDecide := whatsnewDecide
 	dashboardIsInteractive = func() bool { return false }
 	called := false
-	whatsnewDecide = func(baseDir, current string) (bool, string, error) { called = true; return false, "", nil }
+	whatsnewDecide = func(loc whatsnew.Location, current string) (bool, string, error) {
+		called = true
+		return false, "", nil
+	}
 	t.Cleanup(func() {
 		dashboardIsInteractive = origInter
 		whatsnewDecide = origDecide
@@ -183,7 +191,10 @@ func TestShowWhatsnewScreenSkipsUnderDryRun(t *testing.T) {
 	origDecide := whatsnewDecide
 	dashboardIsInteractive = func() bool { return true }
 	called := false
-	whatsnewDecide = func(baseDir, current string) (bool, string, error) { called = true; return false, "", nil }
+	whatsnewDecide = func(loc whatsnew.Location, current string) (bool, string, error) {
+		called = true
+		return false, "", nil
+	}
 	t.Cleanup(func() {
 		dashboardIsInteractive = origInter
 		whatsnewDecide = origDecide
@@ -209,7 +220,7 @@ func TestShowWhatsnewScreenDelegatesWhenInteractive(t *testing.T) {
 	}
 	var gotVersion string
 	called := false
-	whatsnewDecide = func(baseDir, current string) (bool, string, error) {
+	whatsnewDecide = func(loc whatsnew.Location, current string) (bool, string, error) {
 		called = true
 		gotVersion = current
 		return false, "", nil // no-show: maybeShowWhatsnew returns before touching the session
@@ -245,7 +256,7 @@ func TestShowWhatsnewScreenSkipsSessionWhenNothingUnseen(t *testing.T) {
 		sessionBuilt = true
 		return shell.StartForTest(ctx, shell.Config{AppName: "ProxSave", Subtitle: "Dashboard"})
 	}
-	whatsnewDecide = func(baseDir, current string) (bool, string, error) { return false, "", nil }
+	whatsnewDecide = func(loc whatsnew.Location, current string) (bool, string, error) { return false, "", nil }
 	t.Cleanup(func() {
 		dashboardIsInteractive = origInter
 		testDashboardSession = origSess
@@ -274,7 +285,7 @@ func TestShowWhatsnewScreenBuildsSessionWhenUnseen(t *testing.T) {
 		sessionBuilt = true
 		return shell.StartForTest(ctx, shell.Config{AppName: "ProxSave", Subtitle: "Dashboard"})
 	}
-	whatsnewDecide = func(baseDir, current string) (bool, string, error) { return true, "NOTES-BODY", nil }
+	whatsnewDecide = func(loc whatsnew.Location, current string) (bool, string, error) { return true, "NOTES-BODY", nil }
 	gotBody := ""
 	whatsnewRun = func(ctx context.Context, session *shell.Session, body string) error {
 		if session == nil {
@@ -284,7 +295,7 @@ func TestShowWhatsnewScreenBuildsSessionWhenUnseen(t *testing.T) {
 		return nil
 	}
 	saved := false
-	whatsnewSaveSeen = func(baseDir, version string) error { saved = true; return nil }
+	whatsnewSaveSeen = func(loc whatsnew.Location, version string) error { saved = true; return nil }
 	t.Cleanup(func() {
 		dashboardIsInteractive = origInter
 		testDashboardSession = origSess
@@ -318,7 +329,10 @@ func TestRunShowWhatsnewMode(t *testing.T) {
 		return shell.StartForTest(ctx, shell.Config{AppName: "ProxSave", Subtitle: "Dashboard"})
 	}
 	decideCalls := 0
-	whatsnewDecide = func(baseDir, current string) (bool, string, error) { decideCalls++; return false, "", nil }
+	whatsnewDecide = func(loc whatsnew.Location, current string) (bool, string, error) {
+		decideCalls++
+		return false, "", nil
+	}
 	t.Cleanup(func() {
 		dashboardIsInteractive = origInter
 		testDashboardSession = origSess

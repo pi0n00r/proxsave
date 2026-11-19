@@ -161,7 +161,7 @@ func (t *TelegramNotifier) Send(ctx context.Context, data *NotificationData) (*N
 	startTime := time.Now()
 	result := &NotificationResult{
 		Method:   "telegram",
-		Metadata: make(map[string]interface{}),
+		Metadata: make(map[string]any),
 	}
 	// One idempotent id per notification, reused across the relay POST and the
 	// delivery-status poll (and any relay retry after a stale-secret reprovision) so
@@ -338,7 +338,7 @@ func (t *TelegramNotifier) fetchCentralizedCredentials(ctx context.Context) (str
 		if provisioned := strings.TrimSpace(response.NotifySecret); provisioned != "" && t.config.BaseDir != "" {
 			t.logger.RegisterSecret(provisioned) // mask before any I/O can echo it
 			if err := identity.PersistNotifySecret(ctx, t.config.BaseDir, provisioned, t.logger); err != nil {
-				t.logger.Warning("WARNING: failed to persist provisioned relay secret: %v", err)
+				t.logger.Warning("failed to persist provisioned relay secret: %v", err)
 			} else {
 				t.config.NotifySecret = provisioned // adopt in-memory for this run
 				t.logger.Debug("Telegram: adopted+persisted per-server relay secret (overwrite)")
@@ -371,7 +371,8 @@ func (t *TelegramNotifier) fetchCentralizedCredentials(ctx context.Context) (str
 	case 422:
 		return "", "", fmt.Errorf("invalid SERVER_ID (HTTP 422)")
 	default:
-		return "", "", fmt.Errorf("unexpected status %d: %s", resp.Status, string(body))
+		t.logger.Debug("Telegram: get-chat-id answer (HTTP %d): %s", resp.Status, resp.Snippet(200))
+		return "", "", fmt.Errorf("unexpected status %d", resp.Status)
 	}
 }
 
@@ -415,8 +416,8 @@ func (t *TelegramNotifier) sendViaRelay(ctx context.Context, message, notifyID s
 		return 0, "", fmt.Errorf("relay request failed: %s", logging.RedactSecrets(err.Error(), t.config.NotifySecret))
 	}
 
-	switch resp.Status {
-	case 200, 202:
+	switch {
+	case resp.Status == 200 || resp.Status == 202:
 		// 200 = legacy synchronous relay (outbox kill-switch off) = already
 		// delivered. 202 = accepted onto the durable outbox; the real delivery
 		// outcome is learned via the status poll.
@@ -426,16 +427,16 @@ func (t *TelegramNotifier) sendViaRelay(ctx context.Context, message, notifyID s
 		// it RAW onto stats.HealthcheckLink; the backup epilogue is the sole display
 		// boundary (sanitized) - this path does not log it.
 		return resp.Status, t.showPortalLink(resp.Body), nil
-	case 401, 403:
+	case serverbot.AuthRejected(resp.Status):
 		return resp.Status, "", fmt.Errorf("%w (HTTP %d)", errRelayAuthRejected, resp.Status)
-	case 410:
+	case resp.Status == 410:
 		// SERVER_PARKED: the row was purged; the secret is dead until re-admission.
 		return resp.Status, "", fmt.Errorf("%w (HTTP 410)", errRelayParked)
-	case 404:
+	case resp.Status == 404:
 		return resp.Status, "", fmt.Errorf("server unknown (HTTP 404)")
-	case 409:
+	case resp.Status == 409:
 		return resp.Status, "", fmt.Errorf("registration missing (HTTP 409)")
-	case 413:
+	case resp.Status == 413:
 		return resp.Status, "", fmt.Errorf("message too long (HTTP 413)")
 	default:
 		return resp.Status, "", fmt.Errorf("relay returned status %d: %s",
@@ -547,6 +548,13 @@ func (t *TelegramNotifier) buildMessage(data *NotificationData) string {
 		msg.WriteString("➖ Cloud      (disabled)\n")
 	}
 
+	if data.PBSEnabled {
+		pbsEmoji := GetStorageEmoji(data.PBSStatus)
+		fmt.Fprintf(&msg, "%s PBS        (%s backups)\n", pbsEmoji, data.PBSStatusSummary)
+	} else {
+		msg.WriteString("➖ PBS        (disabled)\n")
+	}
+
 	// Email status
 	emailEmoji := GetStorageEmoji(data.EmailStatus)
 	fmt.Fprintf(&msg, "%s Email\n\n", emailEmoji)
@@ -563,6 +571,9 @@ func (t *TelegramNotifier) buildMessage(data *NotificationData) string {
 	fmt.Fprintf(&msg, "🔹 Local: %s\n", data.LocalFree)
 	if data.SecondaryEnabled && data.SecondaryFree != "" {
 		fmt.Fprintf(&msg, "🔹 Secondary: %s\n", data.SecondaryFree)
+	}
+	if data.PBSEnabled && data.PBSFree != "" {
+		fmt.Fprintf(&msg, "🔹 PBS: %s\n", data.PBSFree)
 	}
 	msg.WriteString("\n")
 
@@ -583,7 +594,6 @@ func (t *TelegramNotifier) buildMessage(data *NotificationData) string {
 		} else {
 			fmt.Fprintf(&msg, "New version: %s\n", data.LatestVersion)
 		}
-		msg.WriteString("Run 'proxsave --upgrade'\n")
 	}
 
 	return msg.String()
@@ -618,8 +628,12 @@ func (t *TelegramNotifier) sendToTelegram(ctx context.Context, botToken, chatID,
 
 	// Check response
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("telegram api returned status %d: %s", resp.StatusCode, string(body))
+		// The answer goes to a DEBUG line only, read up to 8 KiB, token masked before
+		// the cut: a proxy page can be megabytes of multi-line HTML, and can echo the URL.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		masked := logging.RedactSecrets(string(body), botToken)
+		t.logger.Debug("Telegram: api answer (HTTP %d): %s", resp.StatusCode, (&serverbot.Response{Body: []byte(masked)}).Snippet(200))
+		return fmt.Errorf("telegram api returned status %d", resp.StatusCode)
 	}
 
 	return nil

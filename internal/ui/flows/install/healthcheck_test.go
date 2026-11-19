@@ -36,7 +36,7 @@ func TestRunHealthcheckSetupDashboardBack(t *testing.T) {
 
 	resCh := make(chan struct{}, 1)
 	go func() {
-		_, _ = RunHealthcheckSetup(context.Background(), d.session, t.TempDir(), "/tmp/backup.env", true)
+		_, _ = RunHealthcheckSetup(t.Context(), d.session, t.TempDir(), "/tmp/backup.env", true)
 		resCh <- struct{}{}
 	}()
 	d.waitScreen("Backup monitoring (healthchecks)")
@@ -68,7 +68,7 @@ func TestRunHealthcheckSetupCtrlCInterrupts(t *testing.T) {
 
 	resCh := make(chan error, 1)
 	go func() {
-		_, err := RunHealthcheckSetup(context.Background(), d.session, t.TempDir(), "/tmp/backup.env", true)
+		_, err := RunHealthcheckSetup(t.Context(), d.session, t.TempDir(), "/tmp/backup.env", true)
 		resCh <- err
 	}()
 	d.waitScreen("Backup monitoring (healthchecks)")
@@ -82,7 +82,7 @@ func TestBuildHealthcheckPrompt(t *testing.T) {
 	link := "https://hc.proxsave.dev/l/Nr4vAebz5b"
 
 	// Ok level: green "✓ WORKING", the explanation on its own line, the link boxed.
-	v := buildHealthcheckPrompt(false, link, "", "", "WORKING", "It is reporting.", orchestrator.HealthcheckSetupLevelOk, nil)
+	v := buildHealthcheckPrompt(false, link, "", "", "WORKING", "It is reporting.", orchestrator.HealthcheckSetupLevelOk, nil, nil, portalLinkCopy{})
 	if !strings.Contains(ansi.Strip(v), "✓ WORKING") {
 		t.Fatalf("working keyword missing: %q", ansi.Strip(v))
 	}
@@ -97,7 +97,7 @@ func TestBuildHealthcheckPrompt(t *testing.T) {
 	}
 
 	// Error level: red "✗ REJECTED".
-	f := buildHealthcheckPrompt(false, link, "", "", "REJECTED", "bad creds", orchestrator.HealthcheckSetupLevelError, nil)
+	f := buildHealthcheckPrompt(false, link, "", "", "REJECTED", "bad creds", orchestrator.HealthcheckSetupLevelError, nil, nil, portalLinkCopy{})
 	if !strings.Contains(ansi.Strip(f), "✗ REJECTED") {
 		t.Fatalf("error keyword missing: %q", ansi.Strip(f))
 	}
@@ -106,7 +106,7 @@ func TestBuildHealthcheckPrompt(t *testing.T) {
 	}
 
 	// Warn level (a real post-check warning): yellow "⚠ NOT RUNNING" (with the triangle).
-	w := buildHealthcheckPrompt(false, link, "", "", "NOT RUNNING", "daemon down", orchestrator.HealthcheckSetupLevelWarn, nil)
+	w := buildHealthcheckPrompt(false, link, "", "", "NOT RUNNING", "daemon down", orchestrator.HealthcheckSetupLevelWarn, nil, nil, portalLinkCopy{})
 	if !strings.Contains(ansi.Strip(w), "⚠ NOT RUNNING") {
 		t.Fatalf("warn keyword missing: %q", ansi.Strip(w))
 	}
@@ -115,7 +115,7 @@ func TestBuildHealthcheckPrompt(t *testing.T) {
 	}
 
 	// Neutral level (pre-check): yellow "NOT CHECKED" with NO triangle - like upgrade/telegram.
-	nn := buildHealthcheckPrompt(false, link, "", "", "NOT CHECKED", "Choose Check.", orchestrator.HealthcheckSetupLevelNeutral, nil)
+	nn := buildHealthcheckPrompt(false, link, "", "", "NOT CHECKED", "Choose Check.", orchestrator.HealthcheckSetupLevelNeutral, nil, nil, portalLinkCopy{})
 	if !strings.Contains(ansi.Strip(nn), "NOT CHECKED") {
 		t.Fatalf("neutral keyword missing: %q", ansi.Strip(nn))
 	}
@@ -127,7 +127,7 @@ func TestBuildHealthcheckPrompt(t *testing.T) {
 	}
 
 	// No link -> no box; the explanation still renders verbatim.
-	n := ansi.Strip(buildHealthcheckPrompt(false, "", "", "", "NOT CHECKED", "Choose Check.", orchestrator.HealthcheckSetupLevelNeutral, nil))
+	n := ansi.Strip(buildHealthcheckPrompt(false, "", "", "", "NOT CHECKED", "Choose Check.", orchestrator.HealthcheckSetupLevelNeutral, nil, nil, portalLinkCopy{}))
 	if strings.Contains(n, "╭") {
 		t.Fatalf("no link must render no box: %q", n)
 	}
@@ -171,7 +171,7 @@ func TestRunHealthcheckSetupPortalFallbackReplacesTheSpentMagicLink(t *testing.T
 
 	resCh := make(chan struct{}, 1)
 	go func() {
-		_, _ = RunHealthcheckSetup(context.Background(), d.session, t.TempDir(), "/tmp/backup.env", false)
+		_, _ = RunHealthcheckSetup(t.Context(), d.session, t.TempDir(), "/tmp/backup.env", false)
 		resCh <- struct{}{}
 	}()
 
@@ -212,7 +212,7 @@ func TestRunHealthcheckSetup(t *testing.T) {
 	resCh := make(chan result, 1)
 	ask := func() {
 		go func() {
-			res, err := RunHealthcheckSetup(context.Background(), d.session, t.TempDir(), "/tmp/backup.env", false)
+			res, err := RunHealthcheckSetup(t.Context(), d.session, t.TempDir(), "/tmp/backup.env", false)
 			resCh <- result{res, err}
 		}()
 	}

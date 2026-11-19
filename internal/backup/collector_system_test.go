@@ -1458,6 +1458,35 @@ func TestCollectScriptRepositoryCopiesAndSkipsRuntimeDirs(t *testing.T) {
 	assertAbsent(filepath.Join("nested", "log", "skip"))
 }
 
+// The script repository is BASE_DIR, and BASE_DIR/restore holds the safety backups
+// of past restores (/etc/shadow and /etc/pve/priv material in the clear) while
+// BASE_DIR/guards holds the mount guards. Neither may reach a backup archive. Only
+// the top level is host state: the operator's own restore/ or guards/ directory
+// deeper in the tree is kept.
+func TestCollectScriptRepositorySkipsTopLevelRestoreAndGuards(t *testing.T) {
+	collector := newTestCollector(t)
+	repo := t.TempDir()
+	collector.config.ScriptRepositoryPath = repo
+
+	writeFileAt(t, filepath.Join(repo, "restore", "20260929_101500", "restore_backup_20260929_101512.tar.gz"), "secret\n")
+	writeFileAt(t, filepath.Join(repo, "guards", "chattr-targets"), "/mnt/datastore\n")
+	writeFileAt(t, filepath.Join(repo, "scripts", "restore", "run.sh"), "#!/bin/sh\n")
+	writeFileAt(t, filepath.Join(repo, "scripts", "guards", "check.sh"), "#!/bin/sh\n")
+
+	if err := collector.collectScriptRepository(context.Background()); err != nil {
+		t.Fatalf("collectScriptRepository: %v", err)
+	}
+
+	target := collector.proxsaveInfoDir("script-repository", filepath.Base(repo))
+	for _, rel := range []string{"restore", "guards"} {
+		if _, err := os.Stat(filepath.Join(target, rel)); !os.IsNotExist(err) {
+			t.Fatalf("expected top-level %s to be skipped, stat err=%v", rel, err)
+		}
+	}
+	assertFileExists(t, filepath.Join(target, "scripts", "restore", "run.sh"))
+	assertFileExists(t, filepath.Join(target, "scripts", "guards", "check.sh"))
+}
+
 func TestCollectScriptRepositorySkipAndCancelBranches(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -2908,9 +2937,6 @@ func newTestCollectorWithDeps(t *testing.T, override CollectorDeps) *Collector {
 	if override.RunCommand != nil {
 		deps.RunCommand = override.RunCommand
 	}
-	if override.RunCommandWithEnv != nil {
-		deps.RunCommandWithEnv = override.RunCommandWithEnv
-	}
 	if override.Stat != nil {
 		deps.Stat = override.Stat
 	}
@@ -3039,5 +3065,39 @@ func TestSafeCopyDirSkipsStagingWorkspace(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, "proxsave-staging")); !os.IsNotExist(err) {
 		t.Fatalf("staging workspace must not be copied into itself (#56), stat err=%v", err)
+	}
+}
+
+// An unavailable probe that gives no reason is logged with the default reason.
+func TestCollectBestEffortProbeDefaultsABlankSkipReason(t *testing.T) {
+	var log bytes.Buffer
+	logger := logging.New(types.LogLevelDebug, false)
+	logger.SetOutput(&log)
+	collector := NewCollectorWithDeps(logger, GetDefaultCollectorConfig(), t.TempDir(), types.ProxmoxUnknown, false, CollectorDeps{
+		LookPath:                    func(string) (string, error) { return "/bin/tool", nil },
+		DetectUnprivilegedContainer: func() (bool, string) { return false, "" },
+	})
+
+	err := collector.collectBestEffortProbe(context.Background(), commandSpec("tool"), filepath.Join(t.TempDir(), "out.txt"), "tool", func() (bool, string) {
+		return false, ""
+	})
+	if err != nil {
+		t.Fatalf("collectBestEffortProbe unavailable = %v", err)
+	}
+	if want := "Skipping tool: required capability not detected"; !strings.Contains(log.String(), want) {
+		t.Fatalf("log missing %q:\n%s", want, log.String())
+	}
+}
+
+// An empty PATH starts from the standard system PATH, so the bin directories
+// survive next to the sbin ones ensureSystemPath always adds.
+func TestEnsureSystemPathDefaultsAnEmptyPATH(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	ensureSystemPath()
+
+	want := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	if got := os.Getenv("PATH"); got != want {
+		t.Fatalf("PATH = %q, want %q", got, want)
 	}
 }

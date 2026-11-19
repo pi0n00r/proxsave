@@ -94,8 +94,7 @@ func askResult[T any](t *testing.T, ch <-chan askOutcome[T]) (T, error) {
 }
 
 func TestAskResolvesOnUserAnswer(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	s := StartForTest(ctx, Config{AppName: "ProxSave", UseColor: true})
 	defer func() { _ = s.Close() }()
 
@@ -114,8 +113,7 @@ func TestAskResolvesOnUserAnswer(t *testing.T) {
 }
 
 func TestAskFirstResolveWins(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	s := StartForTest(ctx, Config{AppName: "ProxSave", UseColor: true})
 	defer func() { _ = s.Close() }()
 
@@ -135,8 +133,7 @@ func TestAskFirstResolveWins(t *testing.T) {
 }
 
 func TestAskReturnsOnContextCancel(t *testing.T) {
-	progCtx, progCancel := context.WithCancel(context.Background())
-	defer progCancel()
+	progCtx := t.Context()
 	s := StartForTest(progCtx, Config{AppName: "ProxSave", UseColor: true})
 	defer func() { _ = s.Close() }()
 
@@ -163,8 +160,7 @@ func TestAskReturnsOnContextCancel(t *testing.T) {
 }
 
 func TestAskReturnsErrClosedOnCtrlC(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	s := StartForTest(ctx, Config{AppName: "ProxSave", UseColor: true})
 	defer func() { _ = s.Close() }()
 
@@ -180,6 +176,21 @@ func TestAskReturnsErrClosedOnCtrlC(t *testing.T) {
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("expected ErrClosed on ctrl+c interrupt, got %v", err)
 	}
+	// errors.Is(ErrClosed) alone does not say WHICH termination happened: a UI
+	// death satisfies it too (TestAskReturnsErrClosedWhenProgramDies). The whole
+	// value is what tells them apart, and it is the value callers outside this
+	// package have to stand in for, so pin it here against the real thing rather
+	// than leaving each caller to guess at the wording.
+	if got, want := err.Error(), ClosedByInterrupt().Error(); got != want {
+		t.Fatalf("a real ctrl+c produced %q, but ClosedByInterrupt hands callers %q: every fixture built on it is now a shape production never emits", got, want)
+	}
+	// Text is not enough for a CALLER: whatsnewRender has to save the seen-flag for a
+	// person who pressed ctrl+c and withhold it for a UI that died, and matching on
+	// wording would put that decision at the mercy of bubbletea's phrasing. The cause
+	// has to survive in the CHAIN.
+	if !errors.Is(err, tea.ErrInterrupted) {
+		t.Fatalf("ctrl+c does not carry tea.ErrInterrupted in its chain, so a caller cannot tell it from a UI death: %v", err)
+	}
 }
 
 func TestAskReturnsErrClosedWhenProgramDies(t *testing.T) {
@@ -194,6 +205,17 @@ func TestAskReturnsErrClosedWhenProgramDies(t *testing.T) {
 	_, err := askResult(t, ch)
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("expected ErrClosed, got %v", err)
+	}
+	// The other half of the pair: a program that died is NOT a person pressing
+	// Ctrl+C, and the two must stay distinguishable. They differ by text only,
+	// because closedErr flattens its cause with %v, so a caller that wants to
+	// treat them differently has to change closedErr to %w first. This is what
+	// pins that they have not quietly collapsed into one value.
+	if err.Error() == ClosedByInterrupt().Error() {
+		t.Fatalf("a killed program is indistinguishable from ctrl+c: both are %q", err)
+	}
+	if errors.Is(err, tea.ErrInterrupted) {
+		t.Fatalf("a program killed out from under the Ask claims to be a user interrupt: %v", err)
 	}
 	_ = s.Close()
 }
@@ -227,16 +249,13 @@ func TestCloseIsIdempotentAndCleanAfterQuit(t *testing.T) {
 // TestAskStress exercises the bridge under -race: sequential Asks answered,
 // aborted, and cancelled while unrelated messages keep flowing.
 func TestAskStress(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	s := StartForTest(ctx, Config{AppName: "ProxSave", UseColor: true})
 	defer func() { _ = s.Close() }()
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -246,10 +265,10 @@ func TestAskStress(t *testing.T) {
 				time.Sleep(time.Millisecond)
 			}
 		}
-	}()
+	})
 
-	for i := 0; i < 60; i++ {
-		askCtx, askCancel := context.WithCancel(context.Background())
+	for i := range 60 {
+		askCtx, askCancel := context.WithCancel(t.Context())
 		scr := newStubScreen(i)
 		ch := startAsk[int](askCtx, s, scr)
 		scr.waitPushed(t)

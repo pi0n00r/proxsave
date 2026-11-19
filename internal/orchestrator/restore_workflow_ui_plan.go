@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tis24dev/proxsave/internal/logging"
+	"github.com/tis24dev/proxsave/internal/types"
 )
 
 func (w *restoreUIWorkflowRun) prepareBundleAndPlan() (fallbackToFullRestore bool, err error) {
@@ -166,7 +169,7 @@ func (w *restoreUIWorkflowRun) selectClusterRestoreMode() error {
 	if !w.plan.NeedsClusterRestore || !w.plan.ClusterBackup {
 		return nil
 	}
-	w.logger.Info("Cluster payload detected in backup; enabling guarded restore options for pve_cluster")
+	w.logger.Info("PVE configuration database - in the backup: SAFE exports it, RECOVERY writes it to this host")
 	choice, err := w.ui.SelectClusterRestoreMode(w.ctx)
 	if err != nil {
 		return err
@@ -184,10 +187,88 @@ func (w *restoreUIWorkflowRun) applyClusterRestoreChoice(choice ClusterRestoreMo
 	case ClusterRestoreRecovery:
 		w.plan.ApplyClusterSafeMode(false)
 		w.logger.Warning("Selected RECOVERY cluster restore: full cluster database will be restored; ensure other nodes are isolated")
+		return w.refuseRecoveryOnQuorateCluster()
 	default:
 		return fmt.Errorf("invalid cluster restore mode selected")
 	}
 	return nil
+}
+
+// clusterRecoveryQuorumTimeout bounds the pvecm status probe; it is the timeout the
+// post-apply cluster health check gives the same command.
+const clusterRecoveryQuorumTimeout = 3 * time.Second
+
+// clusterRecoveryRefusedError stops a RECOVERY on a member of a quorate cluster.
+type clusterRecoveryRefusedError struct {
+	nodes string
+}
+
+func (e *clusterRecoveryRefusedError) Error() string {
+	return fmt.Sprintf("Cluster RECOVERY refused - quorate cluster, %s nodes online: its copy would replace the restored config.db", e.nodes)
+}
+
+// clusterRecoveryQuorumUnknownError stops a RECOVERY whose quorum cannot be read while
+// corosync is not shown to be stopped.
+type clusterRecoveryQuorumUnknownError struct {
+	reason   string
+	corosync string
+}
+
+func (e *clusterRecoveryQuorumUnknownError) Error() string {
+	return fmt.Sprintf("Cluster RECOVERY refused - quorum unknown (%s), corosync %s: in a quorate cluster, its copy would replace the restored config.db", e.reason, e.corosync)
+}
+
+// refuseRecoveryOnQuorateCluster probes the quorum before any restore step runs. On a
+// member of a quorate cluster with other nodes online, the config.db RECOVERY writes
+// is thrown away: when pve-cluster starts again, pmxcfs syncs from the cluster leader
+// and the restored database is replaced by the leader's copy, while the restore would
+// still report success. A standalone node (no corosync.conf), a node alone in its
+// cluster, and a node without quorum proceed as before. A node whose quorum cannot be
+// read, pvecm missing included, goes to refuseUnknownQuorumUnlessCorosyncStopped.
+func (w *restoreUIWorkflowRun) refuseRecoveryOnQuorateCluster() error {
+	if _, clustered := detectCorosyncConfig(); !clustered {
+		return nil
+	}
+	info, available, message := pvecmQuorumStatus(w.ctx, clusterRecoveryQuorumTimeout)
+	if !available {
+		return w.refuseUnknownQuorumUnlessCorosyncStopped("pvecm not available")
+	}
+	if message != "" {
+		return w.refuseUnknownQuorumUnlessCorosyncStopped(message)
+	}
+	if !info.Quorate {
+		return nil
+	}
+	nodes, err := strconv.Atoi(strings.TrimSpace(info.Nodes))
+	if err != nil {
+		return w.refuseUnknownQuorumUnlessCorosyncStopped("node count unreadable")
+	}
+	if nodes > 1 {
+		return &clusterRecoveryRefusedError{nodes: info.Nodes}
+	}
+	return nil
+}
+
+// refuseUnknownQuorumUnlessCorosyncStopped decides a RECOVERY whose quorum could not be
+// read. pvecm also fails when pmxcfs is down (no /etc/pve/corosync.conf) while corosync
+// is up and quorate with its peers: pve-cluster would then start again, sync from the
+// leader and drop the restored config.db. So the restore proceeds only on proof that
+// corosync is stopped, "inactive" or "failed" from systemctl, which is also the state of
+// the documented isolation (systemctl stop corosync). Any other state, or a state that
+// cannot be read, refuses.
+func (w *restoreUIWorkflowRun) refuseUnknownQuorumUnlessCorosyncStopped(reason string) error {
+	state, message, available := systemctlServiceState(w.ctx, "corosync", clusterRecoveryQuorumTimeout)
+	switch {
+	case !available:
+		return &clusterRecoveryQuorumUnknownError{reason: reason, corosync: "state unknown (systemctl not available)"}
+	case state == "inactive" || state == "failed":
+		w.logger.Warning("Cluster RECOVERY - quorum unknown (%s), corosync %s, proceeding", reason, state)
+		return nil
+	case state == "":
+		return &clusterRecoveryQuorumUnknownError{reason: reason, corosync: "state unknown (" + message + ")"}
+	default:
+		return &clusterRecoveryQuorumUnknownError{reason: reason, corosync: state}
+	}
 }
 
 func (w *restoreUIWorkflowRun) warnAccessControlHostnameMismatch() {
@@ -199,9 +280,58 @@ func (w *restoreUIWorkflowRun) warnAccessControlHostnameMismatch() {
 	if err != nil || backupHost == "" || strings.TrimSpace(currentHost) == "" {
 		return
 	}
-	if !strings.EqualFold(strings.TrimSpace(currentHost), backupHost) {
+	if !accessControlHostIsOurs(backupHost, currentHost, w.runHostname) {
 		w.logger.Warning("Access control/TFA: backup hostname=%s current hostname=%s; WebAuthn users may require re-enrollment if the UI origin (FQDN/port) changes", backupHost, currentHost)
 	}
+}
+
+// unresolvedRunHostname is what resolveHostname in package main stamps when the
+// machine cannot name itself at all. It names no host, so it never counts as this
+// machine's identity: two machines that both failed to resolve must not look like
+// one. internal/storage refuses the same sentinel, for the same reason; the two
+// constants are kept separate so this package does not depend on a storage detail.
+const unresolvedRunHostname = "unknown"
+
+// accessControlHostIsOurs reports whether the restored bundle was written by THIS
+// machine. It applies the rule retention uses (hostOwnsName in internal/storage):
+// the backup's host is ours when it equals, once spelling is normalised, one of the
+// names this machine answers to. Those names are what os.Hostname() reports (the
+// kernel short name, usually "pve") and what this run resolved as its own write-side
+// identity (resolveHostname in package main, which prefers "hostname -f", usually
+// "pve.home.arpa"). The second one is the very function that stamped the hostname
+// into the archive, so both sides of the comparison are spelled by the same
+// resolver.
+//
+// There is deliberately no fold to the first label. "pve" and "pve.siteB.example"
+// are two machines unless this machine answers to both, and folding them would
+// silence this warning on exactly the cross-host restore it exists for: that is when
+// the UI origin, and so the WebAuthn credential binding, has really changed and an
+// admin can be locked out of the web UI.
+//
+// An empty runHost leaves the set at os.Hostname() alone, which is the strict rule
+// this check had before it learned about the run identity: a missing plumb warns
+// more, never less.
+//
+// It stays hostname-only, and deliberately does NOT learn the server identity that
+// retention's ownership rule gained. The two rules are not the same question. This one
+// asks whether the WebAuthn credential binding survived the restore, so a clone or a
+// restored container that inherited the source machine's identity is exactly the case
+// that MUST still warn. Retention's rule may widen on an identity because its failure
+// mode is a directory that grows; this one's failure mode is an admin locked out of
+// the web UI with no warning that it was coming.
+func accessControlHostIsOurs(backupHost, currentHost, runHost string) bool {
+	backup := types.NormalizeHostname(backupHost)
+	if backup == "" {
+		return false
+	}
+	if own := types.NormalizeHostname(currentHost); own != "" && own == backup {
+		return true
+	}
+	// The sentinel is refused only for the resolved run identity. A machine the
+	// kernel really does call "unknown" still recognises its own archives, just as
+	// it did before, which is the same position internal/storage takes.
+	own := types.NormalizeHostname(runHost)
+	return own != "" && own != unresolvedRunHostname && own == backup
 }
 
 func (w *restoreUIWorkflowRun) collapseStagingWhenUnavailable() {
@@ -227,7 +357,15 @@ func (w *restoreUIWorkflowRun) confirmRestorePlan() error {
 	}
 	restoreConfig.SelectedCategories = append(restoreConfig.SelectedCategories, w.plan.NormalCategories...)
 	restoreConfig.SelectedCategories = append(restoreConfig.SelectedCategories, w.plan.StagedCategories...)
-	restoreConfig.SelectedCategories = append(restoreConfig.SelectedCategories, w.plan.ExportCategories...)
+	// Every export category goes to the export directory, including those moved there
+	// for this run (pve_cluster in SAFE mode, another product's categories) whose
+	// ExportOnly is false: flagged on copies, so the plan does not list their paths as
+	// restored over the live system. The plan's own categories keep the flag as it is,
+	// since applyClusterSafety moves pve_cluster back when SAFE is turned off.
+	for _, cat := range w.plan.ExportCategories {
+		cat.ExportOnly = true
+		restoreConfig.SelectedCategories = append(restoreConfig.SelectedCategories, cat)
+	}
 
 	if err := w.ui.ShowRestorePlan(w.ctx, restoreConfig); err != nil {
 		return err

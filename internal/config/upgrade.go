@@ -1,9 +1,10 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -29,6 +30,19 @@ type keyRange struct {
 	end   int
 }
 
+// Levels of an UpgradeNote. A finding that is a warning is not a note: it goes to
+// UpgradeResult.Warnings, the list every caller already renders as warnings.
+const (
+	UpgradeNoteInfo  = "info"
+	UpgradeNoteDebug = "debug"
+)
+
+// UpgradeNote is one line of UpgradeResult.Notes: its level and its text.
+type UpgradeNote struct {
+	Level string
+	Text  string
+}
+
 // UpgradeResult describes the outcome of a configuration upgrade.
 type UpgradeResult struct {
 	// BackupPath is the path of the backup created from the previous config.
@@ -42,8 +56,18 @@ type UpgradeResult struct {
 	// CaseConflictKeys are keys that differ only by case from template keys.
 	// They are preserved in-place with their original casing.
 	CaseConflictKeys []string
+	// Legacy are the variables written under a name of the Bash version, which the
+	// loader no longer reads: each was renamed to its current name or, when it had no
+	// effect, dropped. A binary built before the field existed decodes a result carrying
+	// it and ignores it; the lines the operator sees travel in Notes.
+	Legacy []LegacyChange
 	// Warnings includes non-fatal parsing or merge issues detected while upgrading.
 	Warnings []string
+	// Notes are lines the caller logs, in order and at their level, BEFORE Warnings:
+	// the INFO block of an outcome that needs no action and the DEBUG evidence behind
+	// either list. Filled by the caller of the merge, never by the merge itself. A
+	// binary built before the field existed decodes a result carrying it and ignores it.
+	Notes []UpgradeNote
 	// PreservedValues is the number of existing key=value pairs from the user's
 	// configuration that were kept during the merge for keys present in the
 	// template.
@@ -52,7 +76,8 @@ type UpgradeResult struct {
 	Changed bool
 }
 
-// UpgradeConfigFile merges the user's configuration with the embedded template.
+// UpgradeConfigFileWithBaseDir merges the user's configuration with the
+// embedded template and validates the result against the detected base dir.
 //
 // Goals:
 //   - Ensure all keys present in the template exist in the user's config.
@@ -73,12 +98,6 @@ type UpgradeResult struct {
 //  3. Keys present in the user config but not in the template are appended
 //     to a "Custom keys" section at the bottom of the file.
 //  4. The original file is backed up before writing the new version.
-func UpgradeConfigFile(configPath string) (*UpgradeResult, error) {
-	return UpgradeConfigFileWithBaseDir(configPath, defaultBaseDir())
-}
-
-// UpgradeConfigFileWithBaseDir merges the user's configuration with the
-// embedded template and validates the result against the detected base dir.
 func UpgradeConfigFileWithBaseDir(configPath, baseDir string) (*UpgradeResult, error) {
 	result, newContent, originalContent, err := computeConfigUpgrade(configPath)
 	if err != nil {
@@ -173,6 +192,11 @@ func computeConfigUpgrade(configPath string) (*UpgradeResult, string, []byte, er
 	normalizedOriginal := strings.ReplaceAll(string(originalContent), "\r\n", "\n")
 	originalLines := strings.Split(normalizedOriginal, "\n")
 
+	// 0. Carry the variables of the Bash version over to their current names before
+	// anything else reads the file, so the merge below sees the current name in place
+	// and does not add it again from the template.
+	originalLines, result.Legacy = migrateLegacyLines(originalLines)
+
 	// 1. Collect user values: for each KEY we store all VALUE entries in order.
 	userValues, userKeyOrder, caseMap, caseConflicts, warnings, userRanges, err := parseEnvValues(originalLines)
 	if err != nil {
@@ -200,6 +224,12 @@ func computeConfigUpgrade(configPath string) (*UpgradeResult, string, []byte, er
 		"CHUNK_SIZE_MB":         {},
 		"CHUNK_THRESHOLD_MB":    {},
 		"BACKUP_USER_HOMES":     {},
+		// Retired with the SCHEDULER_MODE presence rule: --daemon-remove wrote it purely to
+		// contradict the SCHEDULER_MODE=cron it had just written, because the --upgrade
+		// retrofit read cron as "migrate me". The retrofit now decides on whether
+		// SCHEDULER_MODE was already in the file, so the mode alone carries the choice and
+		// nothing reads this key.
+		"DAEMON_OPT_OUT": {},
 	}
 	skipOriginalLines := make([]bool, len(originalLines))
 	prunedLineCount := 0
@@ -228,7 +258,7 @@ func computeConfigUpgrade(configPath string) (*UpgradeResult, string, []byte, er
 		for k := range prunedKeys {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		warnings = append(warnings, fmt.Sprintf("Removed deprecated keys from backup.env: %s (obsolete or auto-managed settings no longer used by ProxSave)", strings.Join(keys, ", ")))
 	}
 
@@ -237,11 +267,20 @@ func computeConfigUpgrade(configPath string) (*UpgradeResult, string, []byte, er
 	normalizedTemplate := strings.ReplaceAll(template, "\r\n", "\n")
 	templateLines := strings.Split(normalizedTemplate, "\n")
 
+	refreshedComments := refreshRetiredTemplateComments(originalLines, skipOriginalLines, templateLines)
+
 	type templateEntry struct {
 		key   string
 		upper string
 		lines []string
 		index int
+		// start and end are the entry's own line span inside templateLines. They are
+		// what lets a missing key be inserted INSIDE its section: the lines between the
+		// previous entry's end and this entry's start are the section header and the
+		// comments that document the key, and the merge walks past the ones the user's
+		// file already carries instead of writing the key above them.
+		start int
+		end   int
 	}
 
 	templateEntries := make([]templateEntry, 0)
@@ -278,6 +317,8 @@ func computeConfigUpgrade(configPath string) (*UpgradeResult, string, []byte, er
 				upper: upperKey,
 				lines: templateLines[i : blockEnd+1],
 				index: len(templateEntries),
+				start: i,
+				end:   blockEnd,
 			})
 			i = blockEnd
 			continue
@@ -287,6 +328,8 @@ func computeConfigUpgrade(configPath string) (*UpgradeResult, string, []byte, er
 			upper: upperKey,
 			lines: []string{line},
 			index: len(templateEntries),
+			start: i,
+			end:   i,
 		})
 	}
 
@@ -340,8 +383,8 @@ func computeConfigUpgrade(configPath string) (*UpgradeResult, string, []byte, er
 		}
 	}
 
-	// If nothing is missing and nothing is pruned, do not rewrite the file.
-	if len(missingKeys) == 0 && prunedLineCount == 0 {
+	// If nothing is missing, pruned, refreshed or renamed, do not rewrite the file.
+	if len(missingKeys) == 0 && prunedLineCount == 0 && refreshedComments == 0 && len(result.Legacy) == 0 {
 		result.Changed = false
 		result.Warnings = warnings
 		result.MissingKeys = missingKeys
@@ -387,28 +430,106 @@ func computeConfigUpgrade(configPath string) (*UpgradeResult, string, []byte, er
 		return "", false
 	}
 
-	findPrevAnchor := func(entryIndex int) (int, bool) {
+	findPrevAnchor := func(entryIndex int) (int, int, bool) {
 		for i := entryIndex - 1; i >= 0; i-- {
 			if userKey, ok := resolveUserKey(templateEntries[i]); ok {
 				ranges := userRanges[userKey]
 				if len(ranges) == 0 {
 					continue
 				}
-				return ranges[len(ranges)-1].end + 1, true
+				return ranges[len(ranges)-1].end + 1, i, true
 			}
 		}
-		return 0, false
+		return 0, 0, false
+	}
+
+	// skipSharedContext walks the insertion point forward over the lines the template
+	// puts between the anchor key and the missing key - the section header and the
+	// comments that document the key - for as long as the user's file repeats them
+	// verbatim. Without it a missing key is written immediately after the previous
+	// key, which lands it ABOVE its own section header: the operator then sees the
+	// variable appear detached from the block that explains it, and above a header
+	// that now documents nothing (#313 follow-up, reported for CUSTOM_BACKUP_PATHS).
+	//
+	// The comparison is on trimmed text and stops at the first line that differs, so a
+	// file that moved or edited those comments keeps today's placement rather than
+	// having the merge guess. Pruned lines stop it too: inserting after a line that is
+	// about to be removed would leave the key stranded again.
+	//
+	// matchTemplateRun is that walk over one run of template lines. It reports whether the
+	// whole run matched, because a run that stopped early has to stop the walk for good:
+	// resuming past a line the user's file does not have would consume unrelated lines.
+	matchTemplateRun := func(userIdx, from, to int) (int, bool) {
+		for ti := from; ti < to; ti++ {
+			if userIdx >= len(originalLines) {
+				return userIdx, false
+			}
+			if userIdx < len(skipOriginalLines) && skipOriginalLines[userIdx] {
+				return userIdx, false
+			}
+			if strings.TrimSpace(templateLines[ti]) != strings.TrimSpace(originalLines[userIdx]) {
+				return userIdx, false
+			}
+			userIdx++
+		}
+		return userIdx, true
+	}
+
+	// skipDisabledEntry consumes the user's commented-out copy of a missing entry, which is
+	// how a variable gets switched off without being deleted. It is all or nothing: a span
+	// that does not match from its first line to its last consumes NOTHING, so a file that
+	// simply deleted the variable walks on exactly as before. A block value is matched line
+	// by line, so a half-commented block is not mistaken for a disabled one.
+	skipDisabledEntry := func(userIdx int, mid templateEntry) int {
+		probe := userIdx
+		for ti := mid.start; ti <= mid.end; ti++ {
+			if probe >= len(originalLines) {
+				return userIdx
+			}
+			if probe < len(skipOriginalLines) && skipOriginalLines[probe] {
+				return userIdx
+			}
+			if !isDisabledCopyOf(originalLines[probe], templateLines[ti]) {
+				return userIdx
+			}
+			probe++
+		}
+		return probe
+	}
+
+	// Between the anchor and the missing key there can be OTHER missing keys: findPrevAnchor
+	// walks back to the first key the user's file actually has, so every entry it stepped
+	// over is missing too. Their own template lines are therefore lines the user's file
+	// cannot carry as they stand, and comparing them would fail on the first one - stranding
+	// the key at the anchor, above its own comments and, when the anchor is the last key of
+	// the previous section, under the wrong section header. Step over each such span, taking
+	// the commented-out copy with it when the file has one, then keep matching the comments
+	// the two files do share.
+	skipSharedContext := func(userIdx, prevEntryIdx int, entry templateEntry) int {
+		ti := templateEntries[prevEntryIdx].end + 1
+		for k := prevEntryIdx + 1; k < entry.index; k++ {
+			mid := templateEntries[k]
+			next, whole := matchTemplateRun(userIdx, ti, mid.start)
+			userIdx = next
+			if !whole {
+				return userIdx
+			}
+			userIdx = skipDisabledEntry(userIdx, mid)
+			ti = mid.end + 1
+		}
+		userIdx, _ = matchTemplateRun(userIdx, ti, entry.start)
+		return userIdx
 	}
 
 	ops := make([]insertOp, 0, len(missingEntries))
 	unanchored := make([]templateEntry, 0)
 	for _, entry := range missingEntries {
-		prev, ok := findPrevAnchor(entry.index)
+		prev, prevEntryIdx, ok := findPrevAnchor(entry.index)
 		if !ok {
 			unanchored = append(unanchored, entry)
 			continue
 		}
-		insertIndex := normalizeInsertIndex(prev)
+		insertIndex := normalizeInsertIndex(skipSharedContext(prev, prevEntryIdx, entry))
 		ops = append(ops, insertOp{
 			index: insertIndex,
 			lines: entry.lines,
@@ -431,11 +552,11 @@ func computeConfigUpgrade(configPath string) (*UpgradeResult, string, []byte, er
 		})
 	}
 
-	sort.SliceStable(ops, func(i, j int) bool {
-		if ops[i].index != ops[j].index {
-			return ops[i].index < ops[j].index
-		}
-		return ops[i].order < ops[j].order
+	slices.SortStableFunc(ops, func(a, b insertOp) int {
+		return cmp.Or(
+			cmp.Compare(a.index, b.index),
+			cmp.Compare(a.order, b.order),
+		)
 	})
 
 	newLines := make([]string, 0, len(originalLines)+len(ops))
@@ -473,6 +594,64 @@ func computeConfigUpgrade(configPath string) (*UpgradeResult, string, []byte, er
 	result.Warnings = warnings
 	result.Changed = true
 	return result, newContent, originalContent, nil
+}
+
+// retiredTemplateComments lists, per key, the inline comments earlier templates wrote. A line
+// that still carries one was written by ProxSave, not by the operator, so the merge replaces
+// that comment with the current template's. The value, and any comment the operator wrote,
+// are never touched.
+var retiredTemplateComments = map[string][]string{
+	// Said "daily" and "used by daemon mode" before SCHEDULER_FREQUENCY existed.
+	"SCHEDULER_TIME": {`# daily HH:MM ("Run at") used by daemon mode; cron mode uses the crontab`},
+	// Called the centralized value a cache the server fills; nothing writes it, and the daemon
+	// reads it only when ProxSave HC Server cannot be reached.
+	"HEALTHCHECK_ALIVE_URL":  {`# centralized: cache auto-filled from the server (do not edit by hand). self: the FULL service-alive ping URL you paste (e.g. https://hc-ping.com/<uuid>)`},
+	"HEALTHCHECK_BACKUP_URL": {`# centralized: cache auto-filled from the server (do not edit by hand). self: the FULL backup-outcome ping URL you paste`},
+}
+
+// refreshRetiredTemplateComments rewrites, in place, the inline comment of every user line whose
+// comment is a retired template comment for its key, keeping everything before the comment
+// (key, value and spacing) byte for byte. It returns how many lines it rewrote.
+func refreshRetiredTemplateComments(lines []string, skip []bool, templateLines []string) int {
+	current := make(map[string]string)
+	for _, tl := range templateLines {
+		if utils.IsComment(strings.TrimSpace(tl)) {
+			continue
+		}
+		if key, _, comment, ok := splitKeyValueRaw(tl); ok && comment != "" {
+			current[strings.ToUpper(key)] = comment
+		}
+	}
+	refreshed := 0
+	for i, line := range lines {
+		if i < len(skip) && skip[i] {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || utils.IsComment(trimmed) {
+			continue
+		}
+		key, _, comment, ok := splitKeyValueRaw(line)
+		if !ok || comment == "" {
+			continue
+		}
+		upper := strings.ToUpper(key)
+		replacement, has := current[upper]
+		if !has {
+			continue
+		}
+		for _, retired := range retiredTemplateComments[upper] {
+			if comment != retired {
+				continue
+			}
+			if idx := utils.FindInlineCommentIndex(line); idx >= 0 {
+				lines[i] = line[:idx] + replacement
+				refreshed++
+			}
+			break
+		}
+	}
+	return refreshed
 }
 
 func parseEnvValues(lines []string) (map[string][]envValue, []string, map[string]string, map[string]bool, []string, map[string][]keyRange, error) {
@@ -532,6 +711,23 @@ func parseEnvValues(lines []string) (map[string][]envValue, []string, map[string
 	}
 
 	return userValues, userKeyOrder, caseMap, caseConflicts, warnings, userRanges, nil
+}
+
+// isDisabledCopyOf reports whether userLine is templateLine switched off with a leading #.
+// Switching a variable off that way is as common as deleting it, and it leaves a line the
+// template has no match for, which is why the placement walk has to recognise it rather
+// than stop there. The comparison is on the whole line after the marker, inline comment
+// included, so a disabled line whose value was also edited is NOT a copy and is left alone.
+func isDisabledCopyOf(userLine, templateLine string) bool {
+	trimmed := strings.TrimSpace(userLine)
+	if !strings.HasPrefix(trimmed, "#") {
+		return false
+	}
+	uncommented := strings.TrimSpace(strings.TrimPrefix(trimmed, "#"))
+	if uncommented == "" {
+		return false
+	}
+	return uncommented == strings.TrimSpace(templateLine)
 }
 
 func splitKeyValueRaw(line string) (string, string, string, bool) {

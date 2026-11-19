@@ -9,10 +9,16 @@ import (
 )
 
 type restoreUIWorkflowRun struct {
-	ctx                         context.Context
-	cfg                         *config.Config
-	logger                      *logging.Logger
-	version                     string
+	ctx     context.Context
+	cfg     *config.Config
+	logger  *logging.Logger
+	version string
+	// runHostname is the name this run resolves as its own, plumbed in from package
+	// main (resolveHostname, which prefers "hostname -f"): the same function that
+	// stamps the hostname into an archive when this machine writes one. It is the
+	// second name the access control host check answers to, next to os.Hostname().
+	// Empty when no caller supplied one, which leaves that check strict.
+	runHostname                 string
 	ui                          RestoreWorkflowUI
 	candidate                   *backupCandidate
 	prepared                    *preparedBundle
@@ -36,19 +42,44 @@ type restoreUIWorkflowRun struct {
 	exportRoot                  string
 	needsClusterRestore         bool
 	clusterServicesStopped      bool
-	pbsServicesStopped          bool
-	needsPBSServices            bool
-	needsFilesystemRestore      bool
+	// stageIncomplete is set when the staged extraction did not complete. The stage
+	// is removed at once (discardIncompleteStage) and no step applies anything staged.
+	stageIncomplete bool
+	// clusterServicesRestarted is set once the PVE services stopped for a cluster
+	// RECOVERY have been started again, so the deferred cleanup does not repeat it.
+	clusterServicesRestarted bool
+	// clusterServicesNotRunning records what that restart left down, for the closing
+	// advice; nil when every unit started.
+	clusterServicesNotRunning *pveClusterStartError
+	pbsServicesStopped        bool
+	// pbsServicesRestarted is set once restartStoppedPBSServices ran;
+	// pbsServicesNotRunning records what it left down, for the closing advice.
+	pbsServicesRestarted   bool
+	pbsServicesNotRunning  *pbsServicesStartError
+	needsPBSServices       bool
+	needsFilesystemRestore bool
+	// needsBootConfiguration is set when the boot category is selected: it is taken
+	// out of the system-path extraction and applied by applyBootConfiguration.
+	needsBootConfiguration bool
+	// bootRebuildInputsWritten holds the bootRebuildInputs the system-path
+	// extraction wrote to, in the order first seen.
+	bootRebuildInputsWritten []string
+	// skipHostid, skipZFSCaches and skipZFSConf keep the backup's /etc/hostid, pool
+	// cache files and zfs.conf off this host (decideZFSHostFiles).
+	skipHostid    bool
+	skipZFSCaches bool
+	skipZFSConf   bool
 }
 
-func newRestoreUIWorkflowRun(ctx context.Context, cfg *config.Config, logger *logging.Logger, version string, ui RestoreWorkflowUI) *restoreUIWorkflowRun {
+func newRestoreUIWorkflowRun(ctx context.Context, cfg *config.Config, logger *logging.Logger, version string, ui RestoreWorkflowUI, runHostname string) *restoreUIWorkflowRun {
 	return &restoreUIWorkflowRun{
-		ctx:      ctx,
-		cfg:      cfg,
-		logger:   logger,
-		version:  version,
-		ui:       ui,
-		destRoot: "/",
+		ctx:         ctx,
+		cfg:         cfg,
+		logger:      logger,
+		version:     version,
+		runHostname: runHostname,
+		ui:          ui,
+		destRoot:    "/",
 	}
 }
 
@@ -67,6 +98,9 @@ func (w *restoreUIWorkflowRun) run() error {
 }
 
 func (w *restoreUIWorkflowRun) runSelectiveRestore() error {
+	// Deferred first so it runs last: the deferred services cleanup below still reads
+	// the stage (PBS notifications repair), on success and on failure alike.
+	defer w.removeStage()
 	if err := w.confirmRestorePlan(); err != nil {
 		return err
 	}
@@ -84,6 +118,12 @@ func (w *restoreUIWorkflowRun) runSelectiveRestore() error {
 	if err := w.runPostRestoreApplyWorkflows(); err != nil {
 		return err
 	}
+	if err := w.applyBootConfiguration(); err != nil {
+		return err
+	}
+	// The PBS services come back, and the notifications are verified, before the
+	// verdict and the advice that report on them.
+	w.restartStoppedPBSServices()
 	w.logRestoreCompletion()
 	w.logServiceRestartAdvice()
 	w.checkZFSPoolsAfterRestore()
@@ -93,9 +133,12 @@ func (w *restoreUIWorkflowRun) runSelectiveRestore() error {
 
 func (w *restoreUIWorkflowRun) prepareAndRestoreSelectedPayloads() error {
 	w.interceptFilesystemCategory()
+	w.interceptBootCategory()
 	if err := w.extractNormalCategories(); err != nil {
 		return err
 	}
+	// The cluster database is on disk: nothing after this needs pmxcfs down.
+	w.restartStoppedPVEClusterServices()
 	if err := w.smartMergeFilesystemCategory(); err != nil {
 		return err
 	}

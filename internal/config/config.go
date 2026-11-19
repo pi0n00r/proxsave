@@ -2,9 +2,7 @@ package config
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"crypto/x509"
-	"encoding/pem"
+	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,22 +10,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tis24dev/proxsave/internal/cron"
 	"github.com/tis24dev/proxsave/internal/safeexec"
 	"github.com/tis24dev/proxsave/internal/types"
 	"github.com/tis24dev/proxsave/pkg/utils"
 )
 
 const (
-	telegramEnabledKey        = "TELEGRAM_ENABLED"
-	telegramEnableLegacyKey   = "TELEGRAM_ENABLE"
-	emailEnabledKey           = "EMAIL_ENABLED"
-	emailEnableLegacyKey      = "EMAIL_ENABLE"
-	emailFallbackSendmailKey  = "EMAIL_FALLBACK_SENDMAIL"
-	emailFallbackPMFLegacyKey = "EMAIL_FALLBACK_PMF"
-	gotifyEnabledKey          = "GOTIFY_ENABLED"
-	gotifyEnableLegacyKey     = "GOTIFY_ENABLE"
-	webhookEnabledKey         = "WEBHOOK_ENABLED"
-	webhookEnableLegacyKey    = "WEBHOOK_ENABLE"
+	telegramEnabledKey       = "TELEGRAM_ENABLED"
+	emailEnabledKey          = "EMAIL_ENABLED"
+	emailFallbackSendmailKey = "EMAIL_FALLBACK_SENDMAIL"
+	gotifyEnabledKey         = "GOTIFY_ENABLED"
+	webhookEnabledKey        = "WEBHOOK_ENABLED"
 )
 
 var (
@@ -42,19 +36,6 @@ var (
 		"CUSTOM_BACKUP_PATHS": true,
 		"BACKUP_BLACKLIST":    true,
 	}
-
-	legacyNotificationEnableAliases = map[string]string{
-		telegramEnableLegacyKey: telegramEnabledKey,
-		emailEnableLegacyKey:    emailEnabledKey,
-		gotifyEnableLegacyKey:   gotifyEnabledKey,
-		webhookEnableLegacyKey:  webhookEnabledKey,
-	}
-
-	pbsFingerprintCertPaths = []string{
-		"/etc/proxmox-backup/proxy.pem",
-	}
-
-	configHostnameFunc = os.Hostname
 )
 
 // NormalizeEmailDeliveryMethod maps user-facing aliases to the internal delivery
@@ -111,7 +92,15 @@ type Config struct {
 	MinDiskPrimaryGB   float64
 	MinDiskSecondaryGB float64
 	MinDiskCloudGB     float64
-	SafetyFactor       float64
+	// MinDiskPBSGB is the free space the PBS storage needs; like the siblings, 0 or less
+	// is read as 10 GB (sanitizeMinDisk).
+	MinDiskPBSGB float64
+	SafetyFactor float64
+	// SkipPermissionCheck feeds checks.CheckerConfig.SkipPermissionCheck, which drops the
+	// ownership/mode verification of the backup and log directories from the pre-backup
+	// checks. Test-only, as the template says: a host that skips it can write archives
+	// nobody but root can read back.
+	SkipPermissionCheck bool
 
 	// Optimization settings
 	EnableDeduplication    bool
@@ -121,6 +110,7 @@ type Config struct {
 	// Paths
 	BackupPath       string
 	LogPath          string
+	DaemonLogPath    string
 	SecondaryLogPath string
 	CloudLogPath     string
 	LockPath         string
@@ -147,6 +137,19 @@ type Config struct {
 	// at the cost of full egress. Default false.
 	CloudVerifyDownload bool
 
+	// SecondaryStartupFailed and CloudStartupFailed are set by the run, never read from
+	// or written to backup.env: the destination is on in backup.env and could not be
+	// initialized at startup. The run switches it off (SecondaryEnabled / CloudEnabled
+	// false: no copy at [6], no log copy, no disk-space check), and its outcome is an
+	// error, not a destination switched off. Its metrics line stays, at 0.
+	SecondaryStartupFailed bool
+	CloudStartupFailed     bool
+
+	// PBS storage: every backup is also uploaded to the PBS storage PBSTargetStorage
+	// defined in <PVE_CONFIG_PATH>/storage.cfg.
+	PBSTargetEnabled bool
+	PBSTargetStorage string
+
 	// Rclone settings with comprehensible timeout names
 	// RcloneTimeoutConnection: timeout for checking if remote is accessible (default: 30s)
 	// RcloneTimeoutOperation: timeout for full upload/download operations (default: 300s)
@@ -165,6 +168,9 @@ type Config struct {
 	MaxLocalBackups        int
 	MaxSecondaryBackups    int
 	MaxCloudBackups        int
+	// MaxPBSTargetBackups is the simple retention of the PBS storage: 0 = no prune;
+	// a negative value is a configuration error (validatePBSTargetSettings).
+	MaxPBSTargetBackups int
 
 	// Retention policy selector ("simple" or "gfs")
 	RetentionPolicy string
@@ -185,6 +191,13 @@ type Config struct {
 	EncryptArchive        bool
 	AgeRecipients         []string
 	AgeRecipientFile      string
+
+	// Notification delivery filter. Global: applies to every notification channel
+	// (Email/Telegram/Gotify/Webhook) on top of each channel's own *_ENABLED flag.
+	// A severity THRESHOLD, not an exact match: "warning" means warning and worse.
+	NotifyOn string // "warning" (default) | "always" | "failure"
+	// NotifyOnSource is where NotifyOn came from: "backup.env", "environment" or "default".
+	NotifyOnSource string
 
 	// Telegram Notifications
 	TelegramEnabled      bool
@@ -216,13 +229,12 @@ type Config struct {
 	GotifyPriorityWarning int
 	GotifyPriorityFailure int
 
-	// Cloud Relay Configuration (hardcoded for compatibility)
-	CloudflareWorkerURL   string
-	CloudflareWorkerToken string
-	CloudflareHMACSecret  string
-	WorkerTimeout         int // seconds
-	WorkerMaxRetries      int
-	WorkerRetryDelay      int // seconds
+	// Cloud Relay Configuration (hardcoded for compatibility). The relay's shared
+	// token and HMAC are not here: they have one definition, notify.DefaultCloudRelayConfig.
+	CloudflareWorkerURL string
+	WorkerTimeout       int // seconds
+	WorkerMaxRetries    int
+	WorkerRetryDelay    int // seconds
 
 	// Webhook Notifications
 	WebhookEnabled       bool
@@ -238,22 +250,33 @@ type Config struct {
 
 	// Scheduler engine (cron vs resident daemon). Defaults keep existing installs
 	// on cron; the install wizard and the --upgrade auto-migration are what set daemon.
-	SchedulerMode  string        // "cron" | "daemon"
-	SchedulerTime  string        // daily HH:MM ("Run at") used by daemon mode
-	MaxRunDuration time.Duration // daemon watchdog: hard timeout for one supervised backup
-	DaemonOptOut   bool          // true after --daemon-remove; --upgrade won't re-install the daemon
+	SchedulerMode      string        // "cron" | "daemon"
+	SchedulerFrequency string        // daily | weekly | monthly (raw; SchedulerCadence validates)
+	SchedulerWeekday   string        // mon ... sun, weekly only (raw)
+	SchedulerMonthDay  string        // 1-28, monthly only (raw)
+	SchedulerTime      string        // HH:MM ("Run at")
+	MaxRunDuration     time.Duration // daemon watchdog: hard timeout for one supervised backup
+
+	// Personal scripts (daemon only): optional operator-owned scripts started around a
+	// supervised run. Empty means disabled, which is the shipped state.
+	PersonalScriptPreRun  string
+	PersonalScriptPostRun string
 
 	// Healthchecks connector (dead-man switch + backup outcome), used by the daemon.
-	HealthcheckEnabled           bool
-	HealthcheckMode              string // "centralized" (fetch ping-urls from the server) | "self"
-	HealthcheckHeartbeatInterval time.Duration
-	HealthcheckSendLog           bool
-	HealthcheckAliveURL          string // centralized cache (auto-filled from the server)
-	HealthcheckBackupURL         string // centralized cache (auto-filled from the server)
-	HealthcheckPingEndpoint      string // self mode: ping base
-	HealthcheckPingKey           string // self mode: optional ping key for slug URLs
-	HealthcheckAliveID           string // self mode: UUID or slug of the service-alive check
-	HealthcheckBackupID          string // self mode: UUID or slug of the backup-outcome check
+	HealthcheckEnabled bool
+	HealthcheckMode    string // "centralized" (fetch ping-urls from the server) | "self"
+	// HealthcheckAccountInitialEmail is the operator's address for the monitoring portal
+	// (centralized only, issue 347): sent to the relay until it is applied or refused, then
+	// changed from the portal. Empty sends nothing.
+	HealthcheckAccountInitialEmail string
+	HealthcheckHeartbeatInterval   time.Duration
+	HealthcheckSendLog             bool
+	HealthcheckAliveURL            string // centralized cache (auto-filled from the server)
+	HealthcheckBackupURL           string // centralized cache (auto-filled from the server)
+	HealthcheckPingEndpoint        string // self mode: ping base
+	HealthcheckPingKey             string // self mode: optional ping key for slug URLs
+	HealthcheckAliveID             string // self mode: UUID or slug of the service-alive check
+	HealthcheckBackupID            string // self mode: UUID or slug of the backup-outcome check
 	// Fase 1 updates sensor (daemon): whether a newer release is available.
 	HealthcheckUpdatesURL     string        // self mode: full updates check ping URL (optional)
 	HealthcheckUpdatesID      string        // self mode: UUID or slug of the updates check
@@ -348,21 +371,11 @@ type Config struct {
 	CustomBackupPaths []string
 	BackupBlacklist   []string
 
-	// PBS Authentication (auto-detected, no manual input required)
-	PBSRepository  string // Auto-detected from environment or generated
-	PBSPassword    string // Auto-detected API token secret
-	PBSFingerprint string // Auto-detected from PBS certificate
-
 	// raw configuration map
 	raw                  map[string]string
 	ignoredBaseDirConfig string
 	ignoredBaseDirEnv    string
 	detectedBaseDir      string
-}
-
-// LoadConfig reads the backup.env configuration file.
-func LoadConfig(configPath string) (*Config, error) {
-	return LoadConfigWithBaseDir(configPath, defaultBaseDir())
 }
 
 // LoadConfigWithBaseDir reads the backup.env configuration file and expands
@@ -424,19 +437,21 @@ var envOverrideKeys = []string{
 	"CLOUD_ENABLED", "CLOUD_REMOTE", "CLOUD_REMOTE_PATH", "CLOUD_LOG_PATH",
 	"CLOUD_UPLOAD_MODE", "CLOUD_PARALLEL_MAX_JOBS", "CLOUD_PARALLEL_VERIFICATION",
 	"CLOUD_WRITE_HEALTHCHECK",
+	"PBS_TARGET_ENABLED", "PBS_TARGET_STORAGE",
 	"RCLONE_TIMEOUT_CONNECTION", "RCLONE_TIMEOUT_OPERATION",
 	"RCLONE_BANDWIDTH_LIMIT", "RCLONE_TRANSFERS", "RCLONE_RETRIES", "RCLONE_VERIFY_METHOD",
 	"RCLONE_FLAGS",
 	"CLOUD_BATCH_SIZE", "CLOUD_BATCH_PAUSE",
-	"MAX_LOCAL_BACKUPS", "MAX_SECONDARY_BACKUPS", "MAX_CLOUD_BACKUPS",
+	"MAX_LOCAL_BACKUPS", "MAX_SECONDARY_BACKUPS", "MAX_CLOUD_BACKUPS", "MAX_PBS_TARGET_BACKUPS",
 	"RETENTION_DAILY", "RETENTION_WEEKLY", "RETENTION_MONTHLY", "RETENTION_YEARLY",
 	"BUNDLE_ASSOCIATED_FILES", "ENCRYPT_ARCHIVE", "AGE_RECIPIENT", "AGE_RECIPIENT_FILE",
-	"TELEGRAM_ENABLE", "TELEGRAM_ENABLED", "BOT_TELEGRAM_TYPE", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
-	"EMAIL_ENABLE", "EMAIL_ENABLED", "EMAIL_DELIVERY_METHOD", "EMAIL_FALLBACK_PMF", "EMAIL_FALLBACK_SENDMAIL",
+	"NOTIFY_ON",
+	"TELEGRAM_ENABLED", "BOT_TELEGRAM_TYPE", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
+	"EMAIL_ENABLED", "EMAIL_DELIVERY_METHOD", "EMAIL_FALLBACK_SENDMAIL",
 	"EMAIL_RECIPIENT", "EMAIL_FROM",
-	"GOTIFY_ENABLE", "GOTIFY_ENABLED", "GOTIFY_SERVER_URL", "GOTIFY_TOKEN",
+	"GOTIFY_ENABLED", "GOTIFY_SERVER_URL", "GOTIFY_TOKEN",
 	"GOTIFY_PRIORITY_SUCCESS", "GOTIFY_PRIORITY_WARNING", "GOTIFY_PRIORITY_FAILURE",
-	"WEBHOOK_ENABLE", "WEBHOOK_ENABLED", "WEBHOOK_ENDPOINTS", "WEBHOOK_FORMAT", "WEBHOOK_TIMEOUT",
+	"WEBHOOK_ENABLED", "WEBHOOK_ENDPOINTS", "WEBHOOK_FORMAT", "WEBHOOK_TIMEOUT",
 	"WEBHOOK_MAX_RETRIES", "WEBHOOK_RETRY_DELAY",
 	"METRICS_ENABLED", "METRICS_PATH",
 	"SECURITY_CHECK_ENABLED", "AUTO_UPDATE_HASHES", "AUTO_FIX_PERMISSIONS",
@@ -444,6 +459,7 @@ var envOverrideKeys = []string{
 	"CHECK_OPEN_PORTS", "SUSPICIOUS_PORTS", "PORT_WHITELIST",
 	"SUSPICIOUS_PROCESSES", "SAFE_BRACKET_PROCESSES", "SAFE_KERNEL_PROCESSES", "SAFE_PROCESSES",
 	"MIN_DISK_SPACE_PRIMARY_GB", "MIN_DISK_SPACE_SECONDARY_GB", "MIN_DISK_SPACE_CLOUD_GB",
+	"MIN_DISK_SPACE_PBS_GB",
 	"DISABLE_NETWORK_PREFLIGHT", "BACKUP_EXCLUDE_PATTERNS",
 	"SKIP_PERMISSION_CHECK", "BACKUP_CONFIG_FILE",
 	"BACKUP_USER", "BACKUP_GROUP", "SET_BACKUP_PERMISSIONS",
@@ -454,18 +470,12 @@ var envOverrideKeys = []string{
 func (c *Config) loadEnvOverrides() {
 	for _, key := range envOverrideKeys {
 		if envValue := os.Getenv(key); envValue != "" {
-			upperKey := strings.ToUpper(key)
-			if canonicalKey, ok := legacyNotificationEnableAliases[upperKey]; ok {
-				c.raw[canonicalKey] = envValue
-				continue
-			}
-			c.raw[upperKey] = envValue
+			c.raw[strings.ToUpper(key)] = envValue
 		}
 	}
 }
 
 // parse interprets raw configuration values.
-// It supports both legacy and new backup.env formats.
 func (c *Config) parse() error {
 	c.parseGeneralSettings()
 	c.parseCompressionSettings()
@@ -476,6 +486,7 @@ func (c *Config) parse() error {
 	c.parseRetentionSettings()
 	c.parseNotificationSettings()
 	c.parseSchedulerSettings()
+	c.parsePersonalScriptSettings()
 	c.parseHealthcheckSettings()
 	if err := c.parseCollectionSettings(); err != nil {
 		return err
@@ -486,7 +497,22 @@ func (c *Config) parse() error {
 	if err := c.validateCloudSettings(); err != nil {
 		return err
 	}
-	c.autoDetectPBSAuth()
+	if err := c.validatePBSTargetSettings(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validatePBSTargetSettings rejects what no run could use: an enabled PBS storage without
+// a storage ID, and a negative retention. Whether the storage exists in storage.cfg, and
+// its type, are checked at startup, not here.
+func (c *Config) validatePBSTargetSettings() error {
+	if c.PBSTargetEnabled && c.PBSTargetStorage == "" {
+		return fmt.Errorf("PBS_TARGET_STORAGE is required when PBS_TARGET_ENABLED=true")
+	}
+	if c.MaxPBSTargetBackups < 0 {
+		return fmt.Errorf("MAX_PBS_TARGET_BACKUPS must not be negative (got %d)", c.MaxPBSTargetBackups)
+	}
 	return nil
 }
 
@@ -552,11 +578,10 @@ func (c *Config) parseGeneralSettings() {
 	c.ProfilingEnabled = c.getBool("PROFILING_ENABLED", true)
 	c.DebugLevel = c.getLogLevel("DEBUG_LEVEL", types.LogLevelInfo)
 
-	if disableColors, ok := c.raw["DISABLE_COLORS"]; ok {
-		c.UseColor = !utils.ParseBool(disableColors)
-	} else {
-		c.UseColor = c.getBool("USE_COLOR", true)
-	}
+	// DISABLE_COLORS, the Bash-era name, is no longer read: 935fcc51 dropped the legacy
+	// names from the loader and missed this one, so the integrity check called it unknown
+	// and ignored while it still overrode USE_COLOR, from the file and the environment.
+	c.UseColor = c.getBool("USE_COLOR", true)
 	c.ColorizeStepLogs = c.getBool("COLORIZE_STEP_LOGS", true) && c.UseColor
 }
 
@@ -565,9 +590,7 @@ func (c *Config) parseCompressionSettings() {
 	c.CompressionLevel = c.getInt("COMPRESSION_LEVEL", 6)
 	c.CompressionThreads = c.getInt("COMPRESSION_THREADS", 0) // 0 = auto
 	c.CompressionMode = strings.ToLower(c.getString("COMPRESSION_MODE", "standard"))
-	if c.CompressionMode == "" {
-		c.CompressionMode = "standard"
-	}
+	c.CompressionMode = cmp.Or(c.CompressionMode, "standard")
 	c.CompressionLevel = adjustLevelForMode(c.CompressionType, c.CompressionMode, c.CompressionLevel)
 }
 
@@ -609,6 +632,13 @@ func (c *Config) parseOptimizationSettings() {
 	c.MinDiskPrimaryGB = sanitizeMinDisk(c.getFloat("MIN_DISK_SPACE_PRIMARY_GB", 10.0))
 	c.MinDiskSecondaryGB = sanitizeMinDisk(c.getFloat("MIN_DISK_SPACE_SECONDARY_GB", c.MinDiskPrimaryGB))
 	c.MinDiskCloudGB = sanitizeMinDisk(c.getFloat("MIN_DISK_SPACE_CLOUD_GB", c.MinDiskPrimaryGB))
+	c.MinDiskPBSGB = sanitizeMinDisk(c.getFloat("MIN_DISK_SPACE_PBS_GB", c.MinDiskPrimaryGB))
+
+	// SKIP_PERMISSION_CHECK ships in the template and is listed in envOverrideKeys, so it
+	// was settable and readable while nothing carried it to the checker: the key looked
+	// honoured and was inert. It is read here with the other knobs configurePreBackupChecker
+	// copies into checks.CheckerConfig.
+	c.SkipPermissionCheck = c.getBool("SKIP_PERMISSION_CHECK", false)
 }
 
 func (c *Config) parseSecuritySettings() {
@@ -624,7 +654,7 @@ func (c *Config) parseSecuritySettings() {
 	}
 	_ = os.Setenv("BASE_DIR", c.BaseDir)
 
-	c.SecurityCheckEnabled = c.getBoolWithFallback([]string{"SECURITY_CHECK_ENABLED", "FULL_SECURITY_CHECK"}, true)
+	c.SecurityCheckEnabled = c.getBool("SECURITY_CHECK_ENABLED", true)
 	c.AutoUpdateHashes = c.getBool("AUTO_UPDATE_HASHES", true)
 	// Default true to match the shipped template (backup.env) and the install flow.
 	c.AutoFixPermissions = c.getBool("AUTO_FIX_PERMISSIONS", true)
@@ -683,14 +713,26 @@ func (c *Config) parseSecuritySettings() {
 	c.EncryptArchive = c.getBool("ENCRYPT_ARCHIVE", false)
 	c.AgeRecipientFile = strings.TrimSpace(c.getString("AGE_RECIPIENT_FILE", ""))
 	c.AgeRecipients = c.getStringSlice("AGE_RECIPIENT", nil)
-	if len(c.AgeRecipients) == 0 {
-		c.AgeRecipients = c.getStringSlice("AGE_RECIPIENTS", nil)
-	}
 }
 
 func (c *Config) parsePathSettings() {
-	c.BackupPath = c.getStringWithFallback([]string{"LOCAL_BACKUP_PATH", "BACKUP_PATH"}, filepath.Join(c.BaseDir, "backup"))
-	c.LogPath = c.getStringWithFallback([]string{"LOCAL_LOG_PATH", "LOG_PATH"}, filepath.Join(c.BaseDir, "log"))
+	c.BackupPath = c.getNonEmptyString("BACKUP_PATH", filepath.Join(c.BaseDir, "backup"))
+	c.LogPath = c.getNonEmptyString("LOG_PATH", filepath.Join(c.BaseDir, "log"))
+	// The daemon's own log and those of its admin commands (daemon-*.log), kept apart
+	// from the run logs. Absent or empty means the default, a folder inside LOG_PATH:
+	// whoever wants them with the run logs sets it to ${LOG_PATH}. ${LOG_PATH} in it is
+	// the log folder the run uses, not the line as written: a LOG_PATH left empty or
+	// deleted falls back to its default, and the template's ${LOG_PATH}/daemon would
+	// otherwise put the daemon logs in /daemon.
+	c.DaemonLogPath = ""
+	if raw := strings.TrimSpace(c.raw["DAEMON_LOG_PATH"]); raw != "" {
+		expander := newConfigVarExpander(c.raw, c.BaseDir)
+		expander.cache["LOG_PATH"] = c.LogPath
+		c.DaemonLogPath = strings.TrimSpace(expander.expand(raw))
+	}
+	if c.DaemonLogPath == "" {
+		c.DaemonLogPath = filepath.Join(c.LogPath, "daemon")
+	}
 	c.SecondaryLogPath = c.getString("SECONDARY_LOG_PATH", "")
 	c.CloudLogPath = c.getString("CLOUD_LOG_PATH", "")
 	c.LockPath = c.getString("LOCK_PATH", filepath.Join(c.BaseDir, "lock"))
@@ -698,11 +740,11 @@ func (c *Config) parsePathSettings() {
 }
 
 func (c *Config) parseStorageSettings() {
-	c.SecondaryEnabled = c.getBoolWithFallback([]string{"ENABLE_SECONDARY_BACKUP", "SECONDARY_ENABLED"}, false)
-	c.SecondaryPath = c.getStringWithFallback([]string{"SECONDARY_BACKUP_PATH", "SECONDARY_PATH"}, "")
+	c.SecondaryEnabled = c.getBool("SECONDARY_ENABLED", false)
+	c.SecondaryPath = c.getNonEmptyString("SECONDARY_PATH", "")
 
-	c.CloudEnabled = c.getBoolWithFallback([]string{"ENABLE_CLOUD_BACKUP", "CLOUD_ENABLED"}, false)
-	c.CloudRemote = c.getStringWithFallback([]string{"RCLONE_REMOTE", "CLOUD_REMOTE"}, "")
+	c.CloudEnabled = c.getBool("CLOUD_ENABLED", false)
+	c.CloudRemote = c.getNonEmptyString("CLOUD_REMOTE", "")
 	c.CloudRemotePath = strings.Trim(strings.TrimSpace(c.getString("CLOUD_REMOTE_PATH", "")), "/")
 	// Default to "parallel" to match the shipped template and the documentation
 	// ("Default: parallel" with CLOUD_PARALLEL_MAX_JOBS=2). Unset or blank uses
@@ -725,27 +767,29 @@ func (c *Config) parseStorageSettings() {
 	c.CloudVerifyChecksum = c.getBool("CLOUD_VERIFY_CHECKSUM", true)
 	c.CloudVerifyDownload = c.getBool("CLOUD_VERIFY_DOWNLOAD", false)
 
-	c.RcloneTimeoutConnection = c.getIntWithFallback([]string{"RCLONE_TIMEOUT_CONNECTION", "CLOUD_CONNECTIVITY_TIMEOUT"}, 30)
+	c.PBSTargetEnabled = c.getBool("PBS_TARGET_ENABLED", false)
+	c.PBSTargetStorage = strings.TrimSpace(c.getString("PBS_TARGET_STORAGE", ""))
+
+	c.RcloneTimeoutConnection = c.getInt("RCLONE_TIMEOUT_CONNECTION", 30)
 	c.RcloneTimeoutOperation = c.getInt("RCLONE_TIMEOUT_OPERATION", 300)
 	c.RcloneBandwidthLimit = c.getString("RCLONE_BANDWIDTH_LIMIT", "")
 	c.RcloneTransfers = c.getInt("RCLONE_TRANSFERS", 4)
 	c.RcloneRetries = c.getInt("RCLONE_RETRIES", 3)
 	c.RcloneVerifyMethod = strings.ToLower(c.getString("RCLONE_VERIFY_METHOD", "primary"))
-	if c.RcloneVerifyMethod == "" {
-		c.RcloneVerifyMethod = "primary"
-	}
+	c.RcloneVerifyMethod = cmp.Or(c.RcloneVerifyMethod, "primary")
 	if rawFlags := strings.TrimSpace(c.getString("RCLONE_FLAGS", "")); rawFlags != "" {
 		c.RcloneFlags = strings.Fields(rawFlags)
 	}
 }
 
 func (c *Config) parseRetentionSettings() {
-	c.LocalRetentionDays = c.getIntWithFallback([]string{"MAX_LOCAL_BACKUPS", "LOCAL_RETENTION_DAYS"}, 7)
-	c.SecondaryRetentionDays = c.getIntWithFallback([]string{"MAX_SECONDARY_BACKUPS", "SECONDARY_RETENTION_DAYS"}, 14)
-	c.CloudRetentionDays = c.getIntWithFallback([]string{"MAX_CLOUD_BACKUPS", "CLOUD_RETENTION_DAYS"}, 30)
+	c.LocalRetentionDays = c.getInt("MAX_LOCAL_BACKUPS", 7)
+	c.SecondaryRetentionDays = c.getInt("MAX_SECONDARY_BACKUPS", 14)
+	c.CloudRetentionDays = c.getInt("MAX_CLOUD_BACKUPS", 30)
 	c.MaxLocalBackups = c.LocalRetentionDays
 	c.MaxSecondaryBackups = c.SecondaryRetentionDays
 	c.MaxCloudBackups = c.CloudRetentionDays
+	c.MaxPBSTargetBackups = c.getInt("MAX_PBS_TARGET_BACKUPS", 15)
 
 	c.RetentionDaily = c.getInt("RETENTION_DAILY", 0)
 	c.RetentionWeekly = c.getInt("RETENTION_WEEKLY", 0)
@@ -774,7 +818,19 @@ func (c *Config) parseRetentionSettings() {
 }
 
 func (c *Config) parseNotificationSettings() {
-	c.TelegramEnabled = c.getBoolWithLegacyAlias(telegramEnabledKey, telegramEnableLegacyKey, false)
+	// A shell variable overrides the file (loadEnvOverrides), and a bare "NOTIFY_ON=" takes
+	// the default value, so it is reported as the default too.
+	switch v, ok := c.raw["NOTIFY_ON"]; {
+	case strings.TrimSpace(os.Getenv("NOTIFY_ON")) != "":
+		c.NotifyOnSource = "environment"
+	case ok && strings.TrimSpace(v) != "":
+		c.NotifyOnSource = "backup.env"
+	default:
+		c.NotifyOnSource = "default"
+	}
+	c.NotifyOn = NormalizeNotifyOn(c.getString("NOTIFY_ON", NotifyOnWarning))
+
+	c.TelegramEnabled = c.getBool(telegramEnabledKey, false)
 	c.TelegramBotType = c.getString("BOT_TELEGRAM_TYPE", "centralized")
 	c.TelegramBotToken = c.getString("TELEGRAM_BOT_TOKEN", "")
 	c.TelegramChatID = c.getString("TELEGRAM_CHAT_ID", "")
@@ -785,13 +841,13 @@ func (c *Config) parseNotificationSettings() {
 	c.TelegramConfirmTimeoutS = c.getInt("TELEGRAM_CONFIRM_TIMEOUT_SECONDS", 10)
 	c.TelegramConfirmIntervalS = c.getInt("TELEGRAM_CONFIRM_INTERVAL_SECONDS", 1)
 
-	c.EmailEnabled = c.getBoolWithLegacyAlias(emailEnabledKey, emailEnableLegacyKey, false)
+	c.EmailEnabled = c.getBool(emailEnabledKey, false)
 	c.EmailDeliveryMethod = NormalizeEmailDeliveryMethod(c.getString("EMAIL_DELIVERY_METHOD", "relay"))
-	c.EmailFallbackSendmail = c.getBoolWithFallback([]string{emailFallbackSendmailKey, emailFallbackPMFLegacyKey}, true)
+	c.EmailFallbackSendmail = c.getBool(emailFallbackSendmailKey, true)
 	c.EmailRecipient = c.getString("EMAIL_RECIPIENT", "")
 	c.EmailFrom = c.getString("EMAIL_FROM", "no-reply@proxmox.tis24.it")
 
-	c.GotifyEnabled = c.getBoolWithLegacyAlias(gotifyEnabledKey, gotifyEnableLegacyKey, false)
+	c.GotifyEnabled = c.getBool(gotifyEnabledKey, false)
 	c.GotifyServerURL = strings.TrimSpace(c.getString("GOTIFY_SERVER_URL", ""))
 	c.GotifyToken = strings.TrimSpace(c.getString("GOTIFY_TOKEN", ""))
 	c.GotifyPrioritySuccess = c.ensurePositiveInt("GOTIFY_PRIORITY_SUCCESS", 2)
@@ -799,17 +855,11 @@ func (c *Config) parseNotificationSettings() {
 	c.GotifyPriorityFailure = c.ensurePositiveInt("GOTIFY_PRIORITY_FAILURE", 8)
 
 	c.CloudflareWorkerURL = "https://relay-tis24.weathered-hill-5216.workers.dev/send"
-	// CloudflareWorkerToken/CloudflareHMACSecret are a shared, public anti-abuse
-	// credential, not a confidential secret (see notify.DefaultCloudRelayConfig and
-	// docs/SECURITY.md). They mirror notify.DefaultCloudRelayConfig.
-	c.CloudflareWorkerToken = "v1_public_20251024"
-	// #nosec G101 -- shared public relay HMAC, not a confidential secret (see docs/SECURITY.md).
-	c.CloudflareHMACSecret = "4cc8946c15338082674d7213aee19069571e1afe60ad21b44be4d68260486fb2"
 	c.WorkerTimeout = 30
 	c.WorkerMaxRetries = 2
 	c.WorkerRetryDelay = 2
 
-	c.WebhookEnabled = c.getBoolWithLegacyAlias(webhookEnabledKey, webhookEnableLegacyKey, false)
+	c.WebhookEnabled = c.getBool(webhookEnabledKey, false)
 	c.WebhookDefaultFormat = c.getString("WEBHOOK_FORMAT", "generic")
 	c.WebhookTimeout = c.getInt("WEBHOOK_TIMEOUT", 30)
 	c.WebhookMaxRetries = c.getInt("WEBHOOK_MAX_RETRIES", 3)
@@ -825,12 +875,52 @@ func (c *Config) parseNotificationSettings() {
 		c.WebhookEndpointNames = []string{}
 	}
 
-	c.MetricsEnabled = c.getBoolWithFallback([]string{"PROMETHEUS_ENABLED", "METRICS_ENABLED"}, false)
-	rawMetricsPath := strings.TrimSpace(c.getStringWithFallback([]string{"METRICS_PATH", "PROMETHEUS_TEXTFILE_DIR"}, ""))
+	c.MetricsEnabled = c.getBool("METRICS_ENABLED", false)
+	rawMetricsPath := strings.TrimSpace(c.getNonEmptyString("METRICS_PATH", ""))
 	if rawMetricsPath == "" {
 		c.MetricsPath = "/var/lib/prometheus/node-exporter"
 	} else {
 		c.MetricsPath = rawMetricsPath
+	}
+}
+
+// NOTIFY_ON values. A severity THRESHOLD, not an exact match: NotifyOnWarning
+// delivers warnings AND failures, NotifyOnFailure only failures. NotifyOnWarning is
+// the default; NotifyOnAlways is the behaviour every install had before the key existed.
+const (
+	NotifyOnAlways  = "always"
+	NotifyOnWarning = "warning"
+	NotifyOnFailure = "failure"
+)
+
+// NormalizeNotifyOn canonicalises a NOTIFY_ON value. An empty value is the default
+// (warning), so an unset variable and a bare "NOTIFY_ON=" behave the same. warning applies
+// only when the Healthchecks monitor is confirmed; otherwise the run notifies everything.
+// An unrecognised value is returned as-is rather than silently coerced, exactly like
+// NormalizeEmailDeliveryMethod: the caller warns about it at the point of use, where
+// there is a logger and the operator can see it. Delivery itself fails open.
+func NormalizeNotifyOn(v string) string {
+	normalized := strings.ToLower(strings.TrimSpace(v))
+	switch normalized {
+	case NotifyOnAlways, "all", "any":
+		return NotifyOnAlways
+	case "", NotifyOnWarning, "warn", "warnings":
+		return NotifyOnWarning
+	case NotifyOnFailure, "failures", "failed", "fail", "error", "errors":
+		return NotifyOnFailure
+	default:
+		return normalized
+	}
+}
+
+// IsValidNotifyOn reports whether v is one of the canonical NOTIFY_ON values, i.e.
+// whether NormalizeNotifyOn understood it.
+func IsValidNotifyOn(v string) bool {
+	switch v {
+	case NotifyOnAlways, NotifyOnWarning, NotifyOnFailure:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -839,15 +929,35 @@ func (c *Config) parseNotificationSettings() {
 // wizard or the auto-migration flips SCHEDULER_MODE to daemon.
 func (c *Config) parseSchedulerSettings() {
 	c.SchedulerMode = normalizeSchedulerMode(c.getString("SCHEDULER_MODE", "cron"))
+	c.SchedulerFrequency = strings.TrimSpace(c.getString("SCHEDULER_FREQUENCY", string(cron.FrequencyDaily)))
+	c.SchedulerWeekday = strings.TrimSpace(c.getString("SCHEDULER_WEEKDAY", cron.WeekdayName(cron.DefaultWeekday)))
+	c.SchedulerMonthDay = strings.TrimSpace(c.getString("SCHEDULER_MONTHDAY", strconv.Itoa(cron.DefaultMonthDay)))
 	c.SchedulerTime = strings.TrimSpace(c.getString("SCHEDULER_TIME", "02:00"))
 	c.MaxRunDuration = c.getDuration("MAX_RUN_DURATION", 1*time.Hour)
-	c.DaemonOptOut = c.getBool("DAEMON_OPT_OUT", false)
+}
+
+// SchedulerCadence is when the backup runs, from the four SCHEDULER_* values. The raw fields
+// stay as read so a caller can report exactly what the file said when this returns an error.
+func (c *Config) SchedulerCadence() (cron.Cadence, error) {
+	return cron.ParseCadence(c.SchedulerFrequency, c.SchedulerWeekday, c.SchedulerMonthDay, c.SchedulerTime)
+}
+
+// parsePersonalScriptSettings reads the optional operator scripts started around a daemon
+// run. Both default to empty, so a config that predates the keys, and a fresh install that
+// leaves them blank, behave exactly as before the feature existed. Nothing is validated
+// here: the paths are not stat'ed, not required to be absolute and not checked for an
+// execute bit, which is both what the feature asks for and what the loader already does for
+// every other optional path (AGE_RECIPIENT_FILE, SYSTEM_ROOT_PREFIX).
+func (c *Config) parsePersonalScriptSettings() {
+	c.PersonalScriptPreRun = strings.TrimSpace(c.getString("PERSONAL_SCRIPT_PRE_RUN", ""))
+	c.PersonalScriptPostRun = strings.TrimSpace(c.getString("PERSONAL_SCRIPT_POST_RUN", ""))
 }
 
 // parseHealthcheckSettings reads the healthchecks-connector keys (daemon only).
 func (c *Config) parseHealthcheckSettings() {
 	c.HealthcheckEnabled = c.getBool("HEALTHCHECK_ENABLED", false)
 	c.HealthcheckMode = normalizeHealthcheckMode(c.getString("HEALTHCHECK_MODE", HealthcheckModeCentralized))
+	c.HealthcheckAccountInitialEmail = strings.TrimSpace(c.getString("HEALTHCHECK_ACCOUNT_INITIAL_EMAIL", ""))
 	c.HealthcheckHeartbeatInterval = c.getDuration("HEALTHCHECK_HEARTBEAT_INTERVAL", 5*time.Minute)
 	c.HealthcheckSendLog = c.getBool("HEALTHCHECK_SEND_LOG", true)
 	c.HealthcheckAliveURL = strings.TrimSpace(c.getString("HEALTHCHECK_ALIVE_URL", ""))
@@ -961,11 +1071,11 @@ func (c *Config) parsePBSSettings() {
 	c.BackupPBSNotifications = c.getBool("BACKUP_PBS_NOTIFICATIONS", true)
 	c.BackupPBSNotificationsPriv = c.getBool("BACKUP_PBS_NOTIFICATIONS_PRIV", c.BackupPBSNotifications)
 	c.BackupUserConfigs = c.getBool("BACKUP_USER_CONFIGS", true)
-	c.BackupRemoteConfigs = c.getBoolWithFallback([]string{"BACKUP_REMOTE_CONFIGS", "BACKUP_REMOTE_CFG"}, true)
+	c.BackupRemoteConfigs = c.getBool("BACKUP_REMOTE_CONFIGS", true)
 	c.BackupSyncJobs = c.getBool("BACKUP_SYNC_JOBS", true)
 	c.BackupVerificationJobs = c.getBool("BACKUP_VERIFICATION_JOBS", true)
 	c.BackupTapeConfigs = c.getBool("BACKUP_TAPE_CONFIGS", true)
-	networkFallback := c.getBoolWithFallback([]string{"BACKUP_NETWORK_CONFIGS", "BACKUP_NETWORK_CONFIG"}, true)
+	networkFallback := c.getBool("BACKUP_NETWORK_CONFIGS", true)
 	c.BackupPBSNetworkConfig = c.getBool("BACKUP_PBS_NETWORK_CONFIG", networkFallback)
 	c.BackupPruneSchedules = c.getBool("BACKUP_PRUNE_SCHEDULES", true)
 	// Default false to match the shipped template. It used to compile to true while the
@@ -974,16 +1084,16 @@ func (c *Config) parsePBSSettings() {
 	// the key had it ON and walked every PBS datastore. Nobody chose the second
 	// behaviour -- it fell out of the mismatch -- and the expensive side is the wrong
 	// side for a value nobody set.
-	c.BackupPxarFiles = c.getBoolWithFallback([]string{"PXAR_SCAN_ENABLE", "BACKUP_PXAR_FILES"}, false)
+	c.BackupPxarFiles = c.getBool("PXAR_SCAN_ENABLE", false)
 	c.PxarDatastoreConcurrency = c.getInt("PXAR_SCAN_DS_CONCURRENCY", 3)
-	c.PxarFileIncludePatterns = normalizeList(c.getStringSliceWithFallback([]string{"PXAR_FILE_INCLUDE_PATTERN", "PXAR_INCLUDE_PATTERN"}, nil))
+	c.PxarFileIncludePatterns = normalizeList(c.getPatternList("PXAR_FILE_INCLUDE_PATTERN", nil))
 	c.PxarFileExcludePatterns = normalizeList(c.getStringSlice("PXAR_FILE_EXCLUDE_PATTERN", nil))
 }
 
 func (c *Config) parseSystemSettings() {
-	c.BackupNetworkConfigs = c.getBoolWithFallback([]string{"BACKUP_NETWORK_CONFIGS", "BACKUP_NETWORK_CONFIG"}, true)
+	c.BackupNetworkConfigs = c.getBool("BACKUP_NETWORK_CONFIGS", true)
 	c.BackupAptSources = c.getBool("BACKUP_APT_SOURCES", true)
-	c.BackupCronJobs = c.getBoolWithFallback([]string{"BACKUP_CRON_JOBS", "BACKUP_CRONTABS"}, true)
+	c.BackupCronJobs = c.getBool("BACKUP_CRON_JOBS", true)
 	c.BackupSystemdServices = c.getBool("BACKUP_SYSTEMD_SERVICES", true)
 	c.BackupSSLCerts = c.getBool("BACKUP_SSL_CERTS", true)
 	c.BackupSysctlConfig = c.getBool("BACKUP_SYSCTL_CONFIG", true)
@@ -1201,8 +1311,15 @@ func newConfigVarExpander(raw map[string]string, baseDir string) *configVarExpan
 	}
 }
 
+// expand resolves $VAR and ${VAR} in s. "$$" is a literal "$": os.Expand has no escape
+// and hands it over as the shell name "$", and with no form of quoting able to protect a
+// "$", a credential that holds one (a webhook password, an HMAC secret) could not be
+// written at all.
 func (e *configVarExpander) expand(s string) string {
 	return os.Expand(s, func(key string) string {
+		if key == "$" {
+			return "$"
+		}
 		return e.resolve(key)
 	})
 }
@@ -1253,67 +1370,38 @@ func (c *Config) expandConfigVars(s string) string {
 	return newConfigVarExpander(c.raw, c.BaseDir).expand(s)
 }
 
-func (c *Config) getStringWithFallback(keys []string, defaultValue string) string {
-	for _, key := range keys {
-		upperKey := strings.ToUpper(key)
-		if val, ok := c.raw[upperKey]; ok && val != "" {
-			return c.expandConfigVars(val)
-		}
+// getNonEmptyString is getString for a setting that falls back to its default when it
+// is assigned an empty value too, not only when it is absent.
+func (c *Config) getNonEmptyString(key, defaultValue string) string {
+	if val, ok := c.raw[strings.ToUpper(key)]; ok && val != "" {
+		return c.expandConfigVars(val)
 	}
 	return defaultValue
 }
 
-func (c *Config) getBoolWithFallback(keys []string, defaultValue bool) bool {
-	for _, key := range keys {
-		if val, ok := c.raw[key]; ok {
-			return utils.ParseBool(val)
+// getPatternList splits a list of patterns on , ; : | and newlines, unquoting each
+// item. An absent value, or one with no item in it, is the default.
+func (c *Config) getPatternList(key string, defaultValue []string) []string {
+	val, ok := c.raw[key]
+	if !ok {
+		return defaultValue
+	}
+	parts := strings.FieldsFunc(strings.TrimSpace(val), func(r rune) bool {
+		switch r {
+		case ',', ';', ':', '|', '\n':
+			return true
+		default:
+			return false
+		}
+	})
+	var result []string
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			result = append(result, strings.Trim(trimmed, `"'`))
 		}
 	}
-	return defaultValue
-}
-
-func (c *Config) getBoolWithLegacyAlias(key, legacyKey string, defaultValue bool) bool {
-	return c.getBoolWithFallback([]string{key, legacyKey}, defaultValue)
-}
-
-func (c *Config) getIntWithFallback(keys []string, defaultValue int) int {
-	for _, key := range keys {
-		if val, ok := c.raw[key]; ok {
-			if intVal, err := strconv.Atoi(val); err == nil {
-				return intVal
-			}
-		}
-	}
-	return defaultValue
-}
-
-func (c *Config) getStringSliceWithFallback(keys []string, defaultValue []string) []string {
-	for _, key := range keys {
-		if val, ok := c.raw[key]; ok {
-			val = strings.TrimSpace(val)
-			if val != "" {
-				parts := strings.FieldsFunc(val, func(r rune) bool {
-					switch r {
-					case ',', ';', ':', '|', '\n':
-						return true
-					default:
-						return false
-					}
-				})
-
-				var result []string
-				for _, part := range parts {
-					if trimmed := strings.TrimSpace(part); trimmed != "" {
-						trimmed = strings.Trim(trimmed, `"'`)
-						result = append(result, trimmed)
-					}
-				}
-
-				if len(result) > 0 {
-					return result
-				}
-			}
-		}
+	if len(result) > 0 {
+		return result
 	}
 	return defaultValue
 }
@@ -1352,10 +1440,7 @@ func parseSizeToBytes(value string) (int64, error) {
 	if num < 0 {
 		return 0, fmt.Errorf("size must be positive")
 	}
-	bytes := int64(num * multiplier)
-	if bytes < 0 {
-		bytes = 0
-	}
+	bytes := max(int64(num*multiplier), 0)
 	return bytes, nil
 }
 
@@ -1449,189 +1534,18 @@ func normalizeList(values []string) []string {
 	return clean
 }
 
-// autoDetectPBSAuth automatically detects PBS authentication credentials
-// from environment variables, config files, or system defaults.
-// This function ensures ZERO manual user input is required.
-func (c *Config) autoDetectPBSAuth() {
-	// Priority 1: Check environment variables (set by systemd or shell)
-	if repo := os.Getenv("PBS_REPOSITORY"); repo != "" {
-		c.PBSRepository = repo
-	}
-	if pass := os.Getenv("PBS_PASSWORD"); pass != "" {
-		c.PBSPassword = pass
-	}
-	if fp := os.Getenv("PBS_FINGERPRINT"); fp != "" {
-		c.PBSFingerprint = fp
-	}
-
-	// Priority 2: Check config file for PBS credentials
-	if c.PBSRepository == "" {
-		c.PBSRepository = c.getString("PBS_REPOSITORY", "")
-	}
-	if c.PBSPassword == "" {
-		c.PBSPassword = c.getString("PBS_PASSWORD", "")
-	}
-	if c.PBSFingerprint == "" {
-		c.PBSFingerprint = c.getString("PBS_FINGERPRINT", "")
-	}
-
-	// Priority 3: Auto-detect from local PBS system files only.
-	// Never infer a local certificate fingerprint for an explicitly remote repository.
-	if c.PBSFingerprint == "" && shouldAutoDetectLocalPBSFingerprint(c.PBSRepository) {
-		c.PBSFingerprint = autoDetectPBSFingerprint()
-	}
-
-	// Priority 4: Try to read API token from secure_account directory
-	if c.PBSPassword == "" && c.PBSRepository == "" {
-		token, secret := autoDetectPBSToken(c.SecureAccount)
-		if token != "" && secret != "" {
-			// Use the detected token
-			c.PBSRepository = fmt.Sprintf("%s@localhost", token)
-			c.PBSPassword = secret
-		}
-	}
-
-	// Note: If all detection fails, PBS client commands will fallback gracefully
-	// (see safeCmdOutputWithPBSAuth in collector.go)
-}
-
-// autoDetectPBSFingerprint tries to extract the SSL fingerprint from PBS certificate
-func autoDetectPBSFingerprint() string {
-	for _, certPath := range pbsFingerprintCertPaths {
-		if fp := extractFingerprintFromCert(certPath); fp != "" {
-			return fp
-		}
-	}
-
-	return ""
-}
-
-// extractFingerprintFromCert extracts SHA256 fingerprint from a certificate file
-func extractFingerprintFromCert(certPath string) string {
-	data, err := os.ReadFile(certPath)
-	if err != nil || len(data) == 0 {
-		return ""
-	}
-
-	var certDER []byte
-	foundCert := false
-	rest := data
-	for len(rest) > 0 {
-		block, remaining := pem.Decode(rest)
-		if block == nil {
-			break
-		}
-		rest = remaining
-		if block.Type == "CERTIFICATE" && len(block.Bytes) > 0 {
-			certDER = block.Bytes
-			foundCert = true
-			break
-		}
-	}
-	if !foundCert {
-		return ""
-	}
-
-	cert, err := x509.ParseCertificate(certDER)
-	if err != nil {
-		return ""
-	}
-
-	sum := sha256.Sum256(cert.Raw)
-	parts := make([]string, 0, len(sum))
-	for _, b := range sum {
-		parts = append(parts, fmt.Sprintf("%02x", b))
-	}
-	return strings.Join(parts, ":")
-}
-
-func shouldAutoDetectLocalPBSFingerprint(repo string) bool {
-	repo = strings.TrimSpace(repo)
-	if repo == "" {
-		return true
-	}
-
-	host := parsePBSRepositoryHost(repo)
-	if host == "" {
-		return false
-	}
-	return isLocalPBSHost(host)
-}
-
-func parsePBSRepositoryHost(repo string) string {
-	repo = strings.TrimSpace(repo)
-	if repo == "" {
-		return ""
-	}
-
-	at := strings.LastIndex(repo, "@")
-	hostPart := repo
-	if at >= 0 {
-		if at == len(repo)-1 {
-			return ""
-		}
-		hostPart = strings.TrimSpace(repo[at+1:])
-	}
-	if hostPart == "" {
-		return ""
-	}
-
-	if strings.HasPrefix(hostPart, "[") {
-		end := strings.Index(hostPart, "]")
-		if end <= 1 {
-			return ""
-		}
-		return normalizePBSHost(hostPart[1:end])
-	}
-
-	if colon := strings.LastIndex(hostPart, ":"); colon >= 0 {
-		hostPart = strings.TrimSpace(hostPart[:colon])
-	}
-	if hostPart == "" {
-		return ""
-	}
-	return normalizePBSHost(hostPart)
-}
-
-func isLocalPBSHost(host string) bool {
-	host = normalizePBSHost(host)
-	switch host {
-	case "", "localhost", "127.0.0.1", "::1":
-		return host != ""
-	}
-
-	currentHost, err := configHostnameFunc()
-	if err != nil {
-		return false
-	}
-	currentHost = normalizePBSHost(currentHost)
-	if currentHost == "" {
-		return false
-	}
-	if host == currentHost {
-		return true
-	}
-
-	currentShort := currentHost
-	if dot := strings.Index(currentShort, "."); dot > 0 {
-		currentShort = currentShort[:dot]
-	}
-	hostShort := host
-	if dot := strings.Index(hostShort, "."); dot > 0 {
-		hostShort = hostShort[:dot]
-	}
-	return hostShort == currentShort &&
-		(!strings.Contains(host, ".") || !strings.Contains(currentHost, "."))
-}
-
-func normalizePBSHost(host string) string {
-	host = strings.TrimSpace(strings.ToLower(host))
-	host = strings.Trim(host, "[]")
-	host = strings.TrimSuffix(host, ".")
-	return host
-}
-
 // BuildWebhookConfig constructs a complete webhook configuration with all endpoints
+// ActiveSecondaryPaths returns SECONDARY_PATH and SECONDARY_LOG_PATH when the secondary
+// is enabled, and two empty strings when it is not. The loader keeps both paths with
+// SECONDARY_ENABLED=false, so a pass that walks, chowns or creates them must ask here:
+// a disabled secondary is not the operator's to have ProxSave touch.
+func (c *Config) ActiveSecondaryPaths() (dataPath, logPath string) {
+	if c == nil || !c.SecondaryEnabled {
+		return "", ""
+	}
+	return c.SecondaryPath, c.SecondaryLogPath
+}
+
 func (c *Config) BuildWebhookConfig() *WebhookConfig {
 	endpoints := []WebhookEndpoint{}
 
@@ -1668,8 +1582,8 @@ func (c *Config) BuildWebhookConfig() *WebhookConfig {
 		headersStr := c.getString(prefix+"HEADERS", "")
 		if headersStr != "" {
 			// Format: "Key1:Value1,Key2:Value2"
-			pairs := strings.Split(headersStr, ",")
-			for _, pair := range pairs {
+			pairs := strings.SplitSeq(headersStr, ",")
+			for pair := range pairs {
 				parts := strings.SplitN(strings.TrimSpace(pair), ":", 2)
 				if len(parts) == 2 {
 					headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
@@ -1786,7 +1700,7 @@ type WebhookEndpoint struct {
 	Headers      map[string]string
 	Auth         WebhookAuth
 	Priority     int
-	CustomFields map[string]interface{}
+	CustomFields map[string]any
 }
 
 // WebhookAuth holds authentication configuration for a webhook
@@ -1798,48 +1712,16 @@ type WebhookAuth struct {
 	Secret string
 }
 
-// autoDetectPBSToken tries to read API token from secure_account directory
-func autoDetectPBSToken(secureAccountPath string) (token, secret string) {
+// PBSTokenFiles returns the PBS token files whose permissions the security check verifies, in this order.
+func PBSTokenFiles(secureAccountPath string) []string {
 	if secureAccountPath == "" {
 		secureAccountPath = filepath.Join(defaultBaseDir(), "secure_account")
 	}
-
-	// Try multiple possible token file locations
-	tokenFiles := []string{
+	return []string{
 		filepath.Join(secureAccountPath, "pbs_token"),
 		filepath.Join(secureAccountPath, "pbs_api_token"),
 		"/root/.pbs-token", // Alternative location
 	}
-
-	for _, tokenFile := range tokenFiles {
-		if utils.FileExists(tokenFile) {
-			if data, err := os.ReadFile(tokenFile); err == nil {
-				lines := strings.Split(string(data), "\n")
-				for _, line := range lines {
-					line = strings.TrimSpace(line)
-					if line == "" || strings.HasPrefix(line, "#") {
-						continue
-					}
-					// Format: token_name=token_secret or just token_secret
-					if strings.Contains(line, "=") {
-						parts := strings.SplitN(line, "=", 2)
-						if len(parts) == 2 {
-							token = strings.TrimSpace(parts[0])
-							secret = strings.TrimSpace(parts[1])
-							return
-						}
-					} else {
-						// Just the secret, use default token name
-						secret = line
-						token = "backup@pbs!go-client" // Default token
-						return
-					}
-				}
-			}
-		}
-	}
-
-	return "", ""
 }
 
 // IsGFSRetentionEnabled returns true if GFS retention policy is configured.
@@ -1855,4 +1737,28 @@ func (c *Config) GetRetentionPolicy() string {
 		return "gfs"
 	}
 	return "simple"
+}
+
+// HealthcheckSelfPingURL resolves one self-mode ping target: the full URL when the operator
+// gave one, otherwise HEALTHCHECK_PING_ENDPOINT (plus the optional ping key) and the check
+// id. It returns "" when there is nothing to ping.
+//
+// It lives here because two places answer the same question and used to answer it
+// differently. The daemon assembles the URL from an id, so a host configured with
+// HEALTHCHECK_ALIVE_ID alone pings correctly and its backups exit 0; the dashboard's
+// healthcheck screen read HEALTHCHECK_ALIVE_URL alone and reported that same host as NOT
+// CONFIGURED. One resolver, one answer.
+func (c *Config) HealthcheckSelfPingURL(fullURL, checkID string) string {
+	if url := strings.TrimSpace(fullURL); url != "" {
+		return url
+	}
+	id := strings.TrimSpace(checkID)
+	base := strings.TrimRight(strings.TrimSpace(c.HealthcheckPingEndpoint), "/")
+	if id == "" || base == "" {
+		return ""
+	}
+	if key := strings.TrimSpace(c.HealthcheckPingKey); key != "" {
+		return base + "/" + key + "/" + id
+	}
+	return base + "/" + id
 }

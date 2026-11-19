@@ -7,12 +7,10 @@ import (
 	"os"
 	"strings"
 
-	cronutil "github.com/tis24dev/proxsave/internal/cron"
 	"github.com/tis24dev/proxsave/internal/identity"
 	"github.com/tis24dev/proxsave/internal/installer"
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/orchestrator"
-	"github.com/tis24dev/proxsave/internal/ui/components"
 	"github.com/tis24dev/proxsave/internal/ui/flows/agesetup"
 	flowinstall "github.com/tis24dev/proxsave/internal/ui/flows/install"
 	"github.com/tis24dev/proxsave/internal/ui/shell"
@@ -57,9 +55,9 @@ func runInstallTUI(ctx context.Context, configPath string, bootstrap *logging.Bo
 	baseDir, _ := detectedBaseDirOrFallback()
 	_ = os.Setenv("BASE_DIR", baseDir)
 
-	// Entrypoint cleanup + recreation is deferred to runPostInstallSymlinksAndCron
-	// (success path only), so an aborted/non-interactive install never leaves the
-	// host without a working proxsave/proxmox-backup command.
+	// Entrypoint changes belong to runtime preparation after the configuration
+	// and optional setup writes have completed. A rejected configuration wizard
+	// never changes the executable entrypoints.
 	execInfo := getExecInfo()
 
 	if bootstrap != nil {
@@ -153,6 +151,7 @@ func runInstallTUI(ctx context.Context, configPath string, bootstrap *logging.Bo
 		// mirrored value to prefill "Run at"; without it the wizard would offer the
 		// 02:00 default instead of the host's real run time. Keep existing has no
 		// wizard to carry it, so its write stays deferred to the commit point.
+		logLegacyInstallChanges(bootstrap, "install workflow (tui)", decision.Legacy)
 		baseTemplate = adoptCronRunTimeIntoBase(ctx, decision, configPath, bootstrap)
 	default:
 		logging.DebugStepBootstrap(bootstrap, "install workflow (tui)", "using embedded template")
@@ -234,6 +233,7 @@ func runInstallTUI(ctx context.Context, configPath string, bootstrap *logging.Bo
 
 	// Optional post-install audit: run a dry-run and offer to disable unused collectors
 	// based on actionable warning hints like "set BACKUP_*=false to disable".
+	runtimePreparation := newInstallRuntimePreparation(configPath, baseDir, execInfo, bootstrap)
 	if !skipConfigWizard {
 		auditRes, auditErr := flowinstall.RunPostInstallAudit(ctx, session, execInfo.ExecPath, configPath, false)
 		if abortErr := abortInstallOnOptionalStep(ctx, bootstrap, "Post-install audit", auditErr); abortErr != nil {
@@ -295,7 +295,12 @@ func runInstallTUI(ctx context.Context, configPath string, bootstrap *logging.Bo
 		// the user + (centralized) show the portal magic-link + a connection check, or
 		// (self) verify the pasted alive URL is reachable. Eligibility is decided solely
 		// by RunHealthcheckSetup (re-reads the written config); Shown=false with no UI otherwise.
-		hcRes, hcErr := flowinstall.RunHealthcheckSetup(ctx, session, baseDir, configPath, false)
+		hcRes, hcErr := flowinstall.RunHealthcheckSetup(ctx, session, baseDir, configPath, false, installer.HealthcheckSetupOptions{BeforeBootstrap: runtimePreparation.PrepareCaptured})
+		// The step maps Ctrl+C to "check skipped" (right for the dashboard, which also
+		// runs it), and a Ctrl+C on its spinner to the task's own context.Canceled: either
+		// way the install carried on into finalization on a closed session and ended as
+		// "Installation failed". A closed session here is the operator's Ctrl+C.
+		hcErr = closedSessionIsAbort(session.Done(), hcErr, bootstrap)
 		if abortErr := abortInstallOnOptionalStep(ctx, bootstrap, "Healthcheck setup", hcErr); abortErr != nil {
 			return abortErr
 		}
@@ -312,37 +317,19 @@ func runInstallTUI(ctx context.Context, configPath string, bootstrap *logging.Bo
 	// deferred footer still prints to the persistent scrollback exactly like the CLI.
 	wizardCronSchedule := ""
 	if wizardData != nil {
-		wizardCronSchedule = cronutil.TimeToSchedule(wizardData.CronTime)
+		wizardCronSchedule = installCronSchedule(wizardData)
 	}
-	// Keep-existing kept backup.env untouched, so nothing has carried the adopted run
-	// time into it. Write it now, past every interactive step: the install is
+	// Keep-existing kept backup.env untouched, so nothing has carried the adopted
+	// schedule into it. Write it now, past every interactive step: the install is
 	// committed, and buildInstallCronSchedule below reads the value from the file.
+	// The console is quiet here, so the block reaches the install log only.
 	if skipConfigWizard {
-		if seed := seedSchedulerTimeFromCrontabFn(ctx, configPath); seed.Note != "" {
-			logBootstrapInfo(bootstrap, "%s", seed.Note)
-		}
+		logScheduleLines(bootstrap, seedSchedulerTimeFromCrontabFn(ctx, configPath).Block.lines())
 	}
 
-	cronSchedule := buildInstallCronSchedule(skipConfigWizard, wizardCronSchedule, configPath)
-	wizardMode := ""
-	if wizardData != nil {
-		wizardMode = wizardData.SchedulerMode
-	}
-
-	streamErr := components.RunStreamTask(ctx, session, "Finalizing installation",
-		func(taskCtx context.Context, emit func(line string)) (string, error) {
-			// Route the loggers AND raw os.Stdout (fmt.Println spacers) through one
-			// pipe into the panel; restored on return/panic. So the panel shows the
-			// same colored lines + blank section spacers as the CLI. (captureRunOutput
-			// is defined in backup_stream.go.)
-			defer captureRunOutput(bootstrap, emit)()
-
-			// Finalize legacy-symlink cleanup, entrypoint cleanup/recreation, and cron
-			// via the shared post-install engine (the same runPostInstallSymlinksAndCron
-			// the CLI uses), so TUI and CLI behave identically here.
-			runPostInstallSymlinksAndCron(taskCtx, baseDir, execInfo, bootstrap, cronSchedule)
-			rv, verified := reconcileSchedulerAfterInstall(taskCtx, wizardMode, configPath, execInfo, bootstrap)
-
+	runtimePreparation.cronSchedule = buildInstallCronSchedule(skipConfigWizard, wizardCronSchedule, configPath)
+	streamErr, backendFinalizeErr := runInstallFinalizationTask(ctx, session, runtimePreparation,
+		func(taskCtx context.Context) (string, string) {
 			// Attempt to resolve or create a server identity for Telegram pairing.
 			if info, idErr := identity.DetectWithContext(taskCtx, baseDir, nil); idErr == nil {
 				if code := info.ServerID; code != "" {
@@ -363,11 +350,11 @@ func runInstallTUI(ctx context.Context, configPath string, bootstrap *logging.Bo
 			permStatus, permMessage = fixPermissionsAfterInstall(taskCtx, configPath, baseDir, bootstrap, nil)
 			logging.DebugStepBootstrap(bootstrap, "install workflow (tui)", "permissions status=%s", permStatus)
 
-			return buildInstallOutcomePrompt(rv, verified, permStatus, permMessage), nil
+			return permStatus, permMessage
 		})
 	if streamErr != nil {
-		// Finalization is best-effort (the CLI ignores these errors too): an abort
-		// or UI-death here never fails the install, so only trace it.
+		// Stream presentation errors are best-effort; backend failures are
+		// retained separately and returned below.
 		logging.DebugStepBootstrap(bootstrap, "install workflow (tui)", "finalization stream: %v", streamErr)
 	}
 
@@ -389,6 +376,9 @@ func runInstallTUI(ctx context.Context, configPath string, bootstrap *logging.Bo
 		return wrapInstallError(errInteractiveAborted)
 	}
 
+	if backendFinalizeErr != nil {
+		return backendFinalizeErr
+	}
 	return nil
 }
 

@@ -17,6 +17,7 @@ import (
 	"github.com/tis24dev/proxsave/internal/config"
 	"github.com/tis24dev/proxsave/internal/environment"
 	"github.com/tis24dev/proxsave/internal/logging"
+	"github.com/tis24dev/proxsave/internal/orchestrator"
 	"github.com/tis24dev/proxsave/internal/safefs"
 	"github.com/tis24dev/proxsave/internal/types"
 )
@@ -36,7 +37,7 @@ func detectAndPrintEnvironment(bootstrap *logging.BootstrapLogger) *environment.
 	bootstrap.Println("Detecting Proxmox environment...")
 	envInfo, err := environment.Detect()
 	if err != nil {
-		bootstrap.Warning("WARNING: %v", err)
+		bootstrap.Warning("%v", err)
 		bootstrap.Println("Continuing with limited functionality...")
 	}
 	bootstrap.Printf("✓ Proxmox Type: %s", envInfo.Type)
@@ -46,8 +47,81 @@ func detectAndPrintEnvironment(bootstrap *logging.BootstrapLogger) *environment.
 	} else {
 		bootstrap.Printf("  Version: %s", envInfo.Version)
 	}
+	logDetectionProvenance(bootstrap, envInfo)
 	bootstrap.Println("")
 	return envInfo
+}
+
+// logDetectionProvenance records, at debug, which marker decided each half of the
+// type and the whole ladder that led there. The type drives which recipe the backup
+// runs, so a wrong one aborts a run on a missing command the host never had (issue
+// #315), and until now nothing in the log said what detection had looked at.
+// Bootstrap debug entries are recorded unconditionally and filtered at flush by the
+// resolved run level, so this costs a normal run nothing and still reaches the log
+// when debug comes from backup.env, which is not loaded yet at this point.
+func logDetectionProvenance(bootstrap *logging.BootstrapLogger, info *environment.EnvironmentInfo) {
+	if bootstrap == nil || info == nil {
+		return
+	}
+	bootstrap.Debug("Detection verdict: type %s, PVE decided by %s, PBS decided by %s",
+		info.Type, detectionSourceLabel(info.PVESource), detectionSourceLabel(info.PBSSource))
+	for _, step := range info.Steps {
+		bootstrap.Debug("Detection probe: %s", step)
+	}
+	reportDetectionResidue(bootstrap, info)
+}
+
+// reportDetectionResidue reports a product whose files are present while no marker
+// proved it installed. The trace above says the same thing, but only on a debug run,
+// and the operator who needs this is the one looking at a type they did not expect:
+// they see PVE where a PBS directory exists, and nothing at a normal level tells them
+// that ProxSave looked at that directory and decided it does not count (issue #315).
+//
+// INFO, not warning, and the level is the point. A residue is recorded only when a
+// product was NOT proved installed, which leaves exactly two situations, and the
+// mount-shape matrix confirms there is no third:
+//
+//   - the type came out pve, pbs or dual: the product is genuinely absent, the backup
+//     is complete and correct, and the leftovers are untidy filesystem, not a fault.
+//     Warning here pinned such a host at exit 1 on every run, for something its
+//     operator often cannot remove (/var/lib/proxmox-backup belongs to the PVE
+//     file-restore stack), so a nightly monitor would alarm forever on a healthy node.
+//   - the type came out unknown: that IS a fault, and it already carries three
+//     warnings that decide the exit code between them - the detection error here,
+//     which now names the residue, the host-backup mount warning, and the collector
+//     saying it is collecting generic system info only. A fourth would be noise.
+//
+// The wording also stops short of declaring the package absent, which the residue does
+// not prove: dpkgPackageInstalled returns false both when the stanza says
+// not-installed and when the status file cannot be read, and under SYSTEM_ROOT_PREFIX
+// the second is the common case.
+func reportDetectionResidue(bootstrap *logging.BootstrapLogger, info *environment.EnvironmentInfo) {
+	if bootstrap == nil || info == nil {
+		return
+	}
+	for _, residue := range []struct {
+		product string
+		marker  string
+		pkg     string
+	}{
+		{"PVE", info.PVEResidual, "pve-manager"},
+		{"PBS", info.PBSResidual, "proxmox-backup-server"},
+	} {
+		if strings.TrimSpace(residue.marker) == "" {
+			continue
+		}
+		bootstrap.Info("%s files without a %s install - %s is present but nothing proved %s is installed, so this host is collected as %s",
+			residue.product, residue.product, residue.marker, residue.pkg, info.Type)
+	}
+}
+
+// detectionSourceLabel keeps the verdict line readable when a product was not
+// detected at all and so has no deciding marker.
+func detectionSourceLabel(source string) string {
+	if strings.TrimSpace(source) == "" {
+		return "no marker"
+	}
+	return source
 }
 
 // redetectHostBackupEnvironment re-runs Proxmox detection under SYSTEM_ROOT_PREFIX
@@ -62,7 +136,7 @@ func redetectHostBackupEnvironment(rt *appRuntime) {
 	prefix := strings.TrimSpace(rt.cfg.SystemRootPrefix)
 	if prefix == "" || prefix == string(filepath.Separator) {
 		if rt.cfg.HostBackupMode {
-			rt.bootstrap.Warning("WARNING: HOST_BACKUP_MODE is set but SYSTEM_ROOT_PREFIX is empty; host-backup mode has no effect")
+			rt.bootstrap.Warning("HOST_BACKUP_MODE is set but SYSTEM_ROOT_PREFIX is empty; host-backup mode has no effect")
 		}
 		return
 	}
@@ -80,6 +154,7 @@ func redetectHostBackupEnvironment(rt *appRuntime) {
 	}
 	info := environment.DetectHostUnderPrefix(prefix)
 	rt.envInfo = info
+	logDetectionProvenance(rt.bootstrap, info)
 
 	if info.Type == types.ProxmoxUnknown {
 		// Fail closed: PVE/PBS collectors are skipped and the manifest records
@@ -90,9 +165,9 @@ func redetectHostBackupEnvironment(rt *appRuntime) {
 		// (chroot/snapshot/CI) on a non-Proxmox live system stays quiet to avoid spam.
 		switch {
 		case rt.cfg.HostBackupMode:
-			rt.bootstrap.Warning("WARNING: no Proxmox host detected under SYSTEM_ROOT_PREFIX=%s; the host filesystem may not be mounted (archive labeled unknown)", prefix)
+			rt.bootstrap.Warning("no Proxmox host detected under SYSTEM_ROOT_PREFIX=%s; the host filesystem may not be mounted (archive labeled unknown)", prefix)
 		case liveType.SupportsPVE() || liveType.SupportsPBS():
-			rt.bootstrap.Warning("WARNING: %s detected on the live system but none under SYSTEM_ROOT_PREFIX=%s; the host filesystem may not be mounted (archive labeled unknown)", liveType, prefix)
+			rt.bootstrap.Warning("%s detected on the live system but none under SYSTEM_ROOT_PREFIX=%s; the host filesystem may not be mounted (archive labeled unknown)", liveType, prefix)
 		default:
 			rt.bootstrap.Debug("no Proxmox detected under SYSTEM_ROOT_PREFIX=%s; archive labeled unknown", prefix)
 		}
@@ -128,7 +203,7 @@ func warnHostBackupMountShape(rt *appRuntime, prefix string, detected types.Prox
 	}
 	pvePath := filepath.Join(prefix, "etc", "pve")
 	if info, err := os.Stat(pvePath); err != nil || !info.IsDir() {
-		rt.bootstrap.Warning("WARNING: %s is not present; the /etc/pve bind mount may be missing (cluster and Ceph config will be incomplete)", pvePath)
+		rt.bootstrap.Warning("%s is not present; the /etc/pve bind mount may be missing (cluster and Ceph config will be incomplete)", pvePath)
 	}
 }
 
@@ -168,14 +243,17 @@ func bootstrapRuntime(ctx context.Context, args *cli.Args, bootstrap *logging.Bo
 	initializeRunLogFile(rt)
 	bootstrap.Flush(rt.logger)
 	rt.updateInfo = checkForUpdates(ctx, rt.logger, toolVersion)
-	// Resolve the seen-flag base with the SAME executable-detected resolver the dashboard
-	// Screen 0 and the install seed use (detectedBaseDirOrFallback), not rt.cfg.BaseDir: the
-	// read here must match those writes on every host. cfg.BaseDir is derived from and equal to
+	logUpdateAvailable(rt.logger, rt.cfg, rt.updateInfo)
+	// The seen-flag lives in LOG_PATH, taken from this run's configuration like the dashboard
+	// Screen 0 and the install seed take it from theirs, and every operation on it is bounded by
+	// FS_IO_TIMEOUT. The base (the old identity/ location the first read moves the flag from)
+	// is resolved with the SAME executable-detected resolver those callers use
+	// (detectedBaseDirOrFallback), not rt.cfg.BaseDir: cfg.BaseDir is derived from and equal to
 	// this today (config BASE_DIR is deprecated/ignored), but going through the config package
-	// couples the warn path to that invariant, so resolve it directly. Under --dry-run the
-	// self-heal write is skipped inside maybeWarnWhatsnew (rt.dryRun).
+	// couples the warn path to that invariant, so resolve it directly. Under --dry-run every
+	// write is skipped inside maybeWarnWhatsnew (rt.dryRun).
 	whatsnewBaseDir, _ := detectedBaseDirOrFallback()
-	maybeWarnWhatsnew(rt.logger, whatsnewBaseDir, toolVersion, rt.dryRun)
+	maybeWarnWhatsnew(rt.logger, whatsnewLocationFromConfig(rt.cfg, whatsnewBaseDir), toolVersion, rt.dryRun)
 	applyRunPermissions(rt)
 	initializeRunProfiling(rt)
 	rt.unprivilegedInfo = environment.DetectUnprivilegedContainer()
@@ -190,7 +268,7 @@ func loadRunConfig(args *cli.Args, bootstrap *logging.BootstrapLogger) (*config.
 
 	initialEnvBaseDir := os.Getenv("BASE_DIR")
 	if err := ensureConfigExists(args.ConfigPath, bootstrap); err != nil {
-		bootstrap.Error("ERROR: %v", err)
+		bootstrap.Error("%v", err)
 		return nil, "", false, types.ExitConfigError.Int(), false
 	}
 
@@ -198,7 +276,7 @@ func loadRunConfig(args *cli.Args, bootstrap *logging.BootstrapLogger) (*config.
 	logging.DebugStepBootstrap(bootstrap, "main run", "loading configuration")
 	cfg, err := config.LoadConfigWithBaseDir(args.ConfigPath, autoBaseDir)
 	if err != nil {
-		bootstrap.Error("ERROR: Failed to load configuration: %v", err)
+		bootstrap.Error("Failed to load configuration: %v", err)
 		return nil, "", false, types.ExitConfigError.Int(), false
 	}
 	_ = os.Setenv("BASE_DIR", cfg.BaseDir)
@@ -207,9 +285,13 @@ func loadRunConfig(args *cli.Args, bootstrap *logging.BootstrapLogger) (*config.
 }
 
 func validateRunConfig(rt *appRuntime) (int, bool) {
+	// Before printDryRunBootstrapStatus, which closes the configuration section with a
+	// blank line, and well before the effective-settings recap: a value the loader
+	// discarded has to be reported before the recap that shows the surviving one.
+	auditRunConfigFile(rt)
 	printDryRunBootstrapStatus(rt)
 	if err := validateFutureFeatures(rt.cfg); err != nil {
-		rt.bootstrap.Error("ERROR: Invalid configuration: %v", err)
+		rt.bootstrap.Error("Invalid configuration: %v", err)
 		return types.ExitConfigError.Int(), false
 	}
 	warnLogPathConfiguration(rt.cfg, rt.bootstrap)
@@ -230,13 +312,13 @@ func printDryRunBootstrapStatus(rt *appRuntime) {
 
 func warnLogPathConfiguration(cfg *config.Config, bootstrap *logging.BootstrapLogger) {
 	if strings.TrimSpace(cfg.LogPath) == "" {
-		bootstrap.Warning("WARNING: LOG_PATH is empty - file logging disabled, using stdout only")
+		bootstrap.Warning("LOG_PATH is empty - file logging disabled, using stdout only")
 	}
 	if cfg.SecondaryEnabled && strings.TrimSpace(cfg.SecondaryLogPath) == "" {
-		bootstrap.Warning("WARNING: Secondary storage enabled but SECONDARY_LOG_PATH is empty - secondary log copy and cleanup will be disabled for this run")
+		bootstrap.Warning("Secondary storage enabled but SECONDARY_LOG_PATH is empty - secondary log copy and cleanup will be disabled for this run")
 	}
 	if cfg.CloudEnabled && strings.TrimSpace(cfg.CloudLogPath) == "" {
-		bootstrap.Warning("WARNING: Cloud storage enabled but CLOUD_LOG_PATH is empty - cloud log copy and cleanup will be disabled for this run")
+		bootstrap.Warning("Cloud storage enabled but CLOUD_LOG_PATH is empty - cloud log copy and cleanup will be disabled for this run")
 	}
 }
 
@@ -246,12 +328,12 @@ func runNetworkPreflight(cfg *config.Config, bootstrap *logging.BootstrapLogger)
 		return
 	}
 	if cfg.DisableNetworkPreflight {
-		bootstrap.Warning("WARNING: Network preflight disabled via DISABLE_NETWORK_PREFLIGHT; features: %s", strings.Join(reasons, ", "))
+		bootstrap.Warning("Network preflight disabled via DISABLE_NETWORK_PREFLIGHT; features: %s", strings.Join(reasons, ", "))
 		return
 	}
 	if err := checkInternetConnectivity(networkPreflightTimeout); err != nil {
-		bootstrap.Warning("WARNING: Network connectivity unavailable for: %s. %v", strings.Join(reasons, ", "), err)
-		bootstrap.Warning("WARNING: Disabling network-dependent features for this run")
+		bootstrap.Warning("Network connectivity unavailable for: %s. %v", strings.Join(reasons, ", "), err)
+		bootstrap.Warning("Disabling network-dependent features for this run")
 		disableNetworkFeaturesForRun(cfg, bootstrap)
 	}
 }
@@ -292,17 +374,34 @@ func initializeRunLogger(rt *appRuntime) *logging.Logger {
 	return logger
 }
 
+// restoreRunDir is the directory the restore session log goes into: the same one
+// the restore workflow writes its safety backup, rollback archives and detailed
+// logs to. A var only so tests can redirect it; production never reassigns it.
+var restoreRunDir = orchestrator.RestoreRunDir
+
 func initializeRestoreSessionLogger(rt *appRuntime, fallback *logging.Logger) *logging.Logger {
 	logging.DebugStepBootstrap(rt.bootstrap, "main run", "restore log enabled")
-	restoreLogger, restoreLogPath, closeFn, err := logging.StartSessionLogger("restore", rt.logLevel, rt.cfg.UseColor)
+	restoreLogger, restoreLogPath, closeFn, err := logging.StartSessionLoggerIn(restoreRunDir(), "restore", rt.logLevel, rt.cfg.UseColor)
 	if err != nil {
-		rt.bootstrap.Warning("WARNING: Unable to start restore log: %v", err)
+		rt.bootstrap.Warning("Unable to start restore log: %v", err)
 		return fallback
 	}
 	rt.sessionLogCloser = closeFn
 	rt.bootstrap.Info("Restore log: %s", restoreLogPath)
 	_ = os.Setenv("LOG_FILE", restoreLogPath)
 	return restoreLogger
+}
+
+// runLogLocation is the folder and name prefix of this run's log. The resident daemon
+// and its admin commands write daemon-<host>-<ts>.log into DAEMON_LOG_PATH: they never
+// produce an archive, so in LOG_PATH their logs had nothing to be rotated with
+// (discussion #336), and the daemon keeps its own last three (rotateDaemonLogs). Every
+// other run writes backup-<host>-<ts>.log into LOG_PATH, rotated with its archive.
+func runLogLocation(args *cli.Args, cfg *config.Config) (dir, prefix string) {
+	if args != nil && (args.Daemon || args.DaemonSetup || args.DaemonRemove || args.DaemonStatus) {
+		return cfg.DaemonLogPath, daemonLogPrefix
+	}
+	return cfg.LogPath, "backup"
 }
 
 func initializeRunLogFile(rt *appRuntime) {
@@ -313,12 +412,13 @@ func initializeRunLogFile(rt *appRuntime) {
 		return
 	}
 
-	logFileName := fmt.Sprintf("backup-%s-%s.log", rt.hostname, rt.timestampStr)
-	logFilePath := filepath.Join(rt.cfg.LogPath, logFileName)
+	logDir, logPrefix := runLogLocation(rt.args, rt.cfg)
+	logFileName := fmt.Sprintf("%s-%s-%s.log", logPrefix, rt.hostname, rt.timestampStr)
+	logFilePath := filepath.Join(logDir, logFileName)
 	// Bounded so a dead/stale LOG_PATH mount cannot wedge the run here, before the
 	// security preflight even starts, in an uninterruptible syscall.
-	if err := safefs.MkdirAll(rt.ctx, rt.cfg.LogPath, defaultDirPerm, fsIoTimeoutDuration(rt.cfg)); err != nil {
-		logging.Warning("Failed to create log directory %s: %v", rt.cfg.LogPath, err)
+	if err := safefs.MkdirAll(rt.ctx, logDir, defaultDirPerm, fsIoTimeoutDuration(rt.cfg)); err != nil {
+		logging.Warning("Failed to create log directory %s: %v", logDir, err)
 		return
 	}
 	// Bound the log-file open/write/close on the run logger so a dead/stale LOG_PATH
@@ -369,6 +469,7 @@ func initializeRunProfiling(rt *appRuntime) {
 		return
 	}
 	rt.cpuProfileFile = f
+	rt.cpuProfilePath = cpuProfilePath
 	logging.Info("CPU profiling enabled: %s", cpuProfilePath)
 	rt.heapProfilePath = filepath.Join(profileDir, fmt.Sprintf("heap-%s-%s.pprof", rt.hostname, rt.timestampStr))
 }

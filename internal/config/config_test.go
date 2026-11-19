@@ -1,30 +1,16 @@
 package config
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"fmt"
-	"math/big"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/tis24dev/proxsave/internal/types"
 )
-
-func clearPBSAuthEnvForTest(t *testing.T) {
-	t.Helper()
-	t.Setenv("PBS_FINGERPRINT", "")
-	t.Setenv("PBS_REPOSITORY", "")
-	t.Setenv("PBS_PASSWORD", "")
-}
 
 func setBaseDirEnv(t *testing.T, value string) {
 	t.Helper()
@@ -65,7 +51,7 @@ LOG_PATH=/test/log
 LOCK_PATH=/test/lock
 SECONDARY_ENABLED=true
 SECONDARY_PATH=/test/secondary
-LOCAL_RETENTION_DAYS=7
+MAX_LOCAL_BACKUPS=7
 TELEGRAM_ENABLED=false
 METRICS_ENABLED=true
 BACKUP_PVE_JOBS=false
@@ -625,7 +611,9 @@ func TestConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadConfigNotificationLegacyEnableAliases(t *testing.T) {
+// The variable names of the Bash version are no longer read: the configuration upgrade
+// renames them, and a line left under an old name has no effect.
+func TestLoadConfigIgnoresLegacyNotificationNames(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "legacy_notifications.env")
 
@@ -645,17 +633,60 @@ WEBHOOK_ENABLE=true
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
 
-	if !cfg.TelegramEnabled {
-		t.Error("Expected TelegramEnabled to be true via TELEGRAM_ENABLE")
+	if cfg.TelegramEnabled || cfg.EmailEnabled || cfg.GotifyEnabled || cfg.WebhookEnabled {
+		t.Errorf("a legacy name enabled a channel: telegram=%v email=%v gotify=%v webhook=%v",
+			cfg.TelegramEnabled, cfg.EmailEnabled, cfg.GotifyEnabled, cfg.WebhookEnabled)
 	}
-	if !cfg.EmailEnabled {
-		t.Error("Expected EmailEnabled to be true via EMAIL_ENABLE")
+}
+
+// Every variable name of the Bash version is ignored, the seven the loader used to
+// consult before the current name included.
+func TestLoadConfigIgnoresEveryLegacyName(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "legacy_all.env")
+
+	content := `LOCAL_BACKUP_PATH=/legacy/backup
+BACKUP_PATH=/current/backup
+LOCAL_LOG_PATH=/legacy/log
+ENABLE_SECONDARY_BACKUP=true
+SECONDARY_BACKUP_PATH=/legacy/secondary
+ENABLE_CLOUD_BACKUP=true
+RCLONE_REMOTE=legacyremote
+PROMETHEUS_ENABLED=true
+EMAIL_ENABLED=true
+EMAIL_FALLBACK_PMF=false
+FULL_SECURITY_CHECK=false
+CLOUD_CONNECTIVITY_TIMEOUT=99
+LOCAL_RETENTION_DAYS=99
+AGE_RECIPIENTS=age1legacy
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("Failed to create test config: %v", err)
 	}
-	if !cfg.GotifyEnabled {
-		t.Error("Expected GotifyEnabled to be true via GOTIFY_ENABLE")
+	setBaseDirEnv(t, "/legacy/all/base")
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
 	}
-	if !cfg.WebhookEnabled {
-		t.Error("Expected WebhookEnabled to be true via WEBHOOK_ENABLE")
+	if cfg.BackupPath != "/current/backup" {
+		t.Errorf("BackupPath = %q; want the current name's /current/backup", cfg.BackupPath)
+	}
+	if cfg.LogPath != filepath.Join(cfg.BaseDir, "log") {
+		t.Errorf("LogPath = %q; want the default", cfg.LogPath)
+	}
+	if cfg.SecondaryEnabled || cfg.SecondaryPath != "" || cfg.CloudEnabled || cfg.CloudRemote != "" || cfg.MetricsEnabled {
+		t.Errorf("a legacy name was read: secondary=%v %q cloud=%v %q metrics=%v",
+			cfg.SecondaryEnabled, cfg.SecondaryPath, cfg.CloudEnabled, cfg.CloudRemote, cfg.MetricsEnabled)
+	}
+	if !cfg.EmailFallbackSendmail || !cfg.SecurityCheckEnabled {
+		t.Errorf("a legacy name was read: sendmail fallback=%v security check=%v", cfg.EmailFallbackSendmail, cfg.SecurityCheckEnabled)
+	}
+	if cfg.RcloneTimeoutConnection != 30 || cfg.LocalRetentionDays != 7 {
+		t.Errorf("a legacy name was read: rclone timeout=%d local retention=%d", cfg.RcloneTimeoutConnection, cfg.LocalRetentionDays)
+	}
+	if len(cfg.AgeRecipients) != 0 {
+		t.Errorf("AgeRecipients = %v; AGE_RECIPIENTS must not be read", cfg.AgeRecipients)
 	}
 }
 
@@ -706,7 +737,6 @@ func TestLoadConfigEmailDeliveryAliasesAndFallbackSendmail(t *testing.T) {
 	content := `EMAIL_ENABLED=true
 EMAIL_DELIVERY_METHOD=proxmox-notifications
 EMAIL_FALLBACK_SENDMAIL=false
-EMAIL_FALLBACK_PMF=true
 `
 	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
 		t.Fatalf("Failed to create test config: %v", err)
@@ -723,7 +753,7 @@ EMAIL_FALLBACK_PMF=true
 		t.Fatalf("EmailDeliveryMethod=%q, want pmf", cfg.EmailDeliveryMethod)
 	}
 	if cfg.EmailFallbackSendmail {
-		t.Fatalf("EMAIL_FALLBACK_SENDMAIL should take precedence over transitional EMAIL_FALLBACK_PMF")
+		t.Fatalf("EmailFallbackSendmail = true; want the false EMAIL_FALLBACK_SENDMAIL sets")
 	}
 }
 
@@ -747,7 +777,8 @@ func TestNormalizeEmailDeliveryMethod(t *testing.T) {
 	}
 }
 
-func TestLoadEnvOverridesNotificationLegacyEnableAliases(t *testing.T) {
+// The environment no longer accepts the legacy notification names either.
+func TestLoadEnvOverridesIgnoreLegacyNotificationNames(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "legacy_notification_env_override.env")
 
@@ -777,17 +808,9 @@ BOT_TELEGRAM_TYPE=centralized
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
 
-	if !cfg.TelegramEnabled {
-		t.Error("Expected TelegramEnabled to be true via TELEGRAM_ENABLE env override")
-	}
-	if !cfg.EmailEnabled {
-		t.Error("Expected EmailEnabled to be true via EMAIL_ENABLE env override")
-	}
-	if !cfg.GotifyEnabled {
-		t.Error("Expected GotifyEnabled to be true via GOTIFY_ENABLE env override")
-	}
-	if !cfg.WebhookEnabled {
-		t.Error("Expected WebhookEnabled to be true via WEBHOOK_ENABLE env override")
+	if cfg.TelegramEnabled || cfg.EmailEnabled || cfg.GotifyEnabled || cfg.WebhookEnabled {
+		t.Errorf("a legacy environment name enabled a channel: telegram=%v email=%v gotify=%v webhook=%v",
+			cfg.TelegramEnabled, cfg.EmailEnabled, cfg.GotifyEnabled, cfg.WebhookEnabled)
 	}
 	if cfg.TelegramBotType != "personal" {
 		t.Errorf("TelegramBotType = %q; want personal from env override", cfg.TelegramBotType)
@@ -1006,13 +1029,7 @@ func TestNormalizeAndMergeLists(t *testing.T) {
 		t.Fatalf("mergeStringSlices unexpected length: %#v", merged)
 	}
 	for _, must := range []string{"a", "b", "c"} {
-		found := false
-		for _, v := range merged {
-			if v == must {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(merged, must)
 		if !found {
 			t.Fatalf("mergeStringSlices missing %s: %#v", must, merged)
 		}
@@ -1100,41 +1117,35 @@ WEBHOOK_TIMEOUT=30
 	}
 }
 
-func TestConfigFallbackHelpers(t *testing.T) {
+func TestConfigSingleNameHelpers(t *testing.T) {
 	cfg := &Config{
 		raw: map[string]string{
 			"STR_PRIMARY": "value1",
 			"STR_EMPTY":   "",
-			"BOOL_YES":    "true",
-			"INT_NUM":     "42",
 			"SLICE_MULTI": "a, b; c\n\"d\"",
+			"SLICE_EMPTY": " ,; ",
 		},
 	}
 
-	if got := cfg.getStringWithFallback([]string{"MISSING", "STR_PRIMARY"}, "def"); got != "value1" {
-		t.Fatalf("getStringWithFallback primary = %q; want value1", got)
+	if got := cfg.getNonEmptyString("STR_PRIMARY", "def"); got != "value1" {
+		t.Fatalf("getNonEmptyString = %q; want value1", got)
 	}
-	if got := cfg.getStringWithFallback([]string{"STR_EMPTY", "MISSING"}, "fallback"); got != "fallback" {
-		t.Fatalf("getStringWithFallback empty = %q; want fallback", got)
+	if got := cfg.getNonEmptyString("STR_EMPTY", "fallback"); got != "fallback" {
+		t.Fatalf("getNonEmptyString empty = %q; want fallback", got)
 	}
-
-	if got := cfg.getBoolWithFallback([]string{"MISSING", "BOOL_YES"}, false); !got {
-		t.Fatalf("getBoolWithFallback = false; want true")
-	}
-	if got := cfg.getBoolWithFallback([]string{"MISSING"}, true); !got {
-		t.Fatalf("getBoolWithFallback default = false; want true")
+	if got := cfg.getNonEmptyString("MISSING", "fallback"); got != "fallback" {
+		t.Fatalf("getNonEmptyString missing = %q; want fallback", got)
 	}
 
-	if got := cfg.getIntWithFallback([]string{"MISSING", "INT_NUM"}, 7); got != 42 {
-		t.Fatalf("getIntWithFallback = %d; want 42", got)
-	}
-	if got := cfg.getIntWithFallback([]string{"MISSING"}, 7); got != 7 {
-		t.Fatalf("getIntWithFallback default = %d; want 7", got)
-	}
-
-	slice := cfg.getStringSliceWithFallback([]string{"SLICE_MULTI"}, nil)
+	slice := cfg.getPatternList("SLICE_MULTI", nil)
 	if len(slice) != 4 || slice[0] != "a" || slice[1] != "b" || slice[2] != "c" || slice[3] != "d" {
-		t.Fatalf("getStringSliceWithFallback = %#v; want [a b c d]", slice)
+		t.Fatalf("getPatternList = %#v; want [a b c d]", slice)
+	}
+	if got := cfg.getPatternList("SLICE_EMPTY", []string{"def"}); len(got) != 1 || got[0] != "def" {
+		t.Fatalf("getPatternList with no item = %#v; want the default", got)
+	}
+	if got := cfg.getPatternList("MISSING", nil); got != nil {
+		t.Fatalf("getPatternList missing = %#v; want nil", got)
 	}
 }
 
@@ -1261,196 +1272,19 @@ func TestBuildWebhookConfigParsesConfiguredEndpoints(t *testing.T) {
 	}
 }
 
-func TestAutoDetectPBSTokenParsesFiles(t *testing.T) {
-	tmpDir := t.TempDir()
-	tokenFile := filepath.Join(tmpDir, "pbs_token")
-
-	if err := os.WriteFile(tokenFile, []byte("mytoken=mysecret\n"), 0644); err != nil {
-		t.Fatalf("failed to write token file: %v", err)
+func TestPBSTokenFilesOrderAndFallback(t *testing.T) {
+	got := PBSTokenFiles("/srv/secure")
+	want := []string{"/srv/secure/pbs_token", "/srv/secure/pbs_api_token", "/root/.pbs-token"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("PBSTokenFiles(/srv/secure) = %v; want %v", got, want)
 	}
 
-	token, secret := autoDetectPBSToken(tmpDir)
-	if token != "mytoken" || secret != "mysecret" {
-		t.Fatalf("autoDetectPBSToken pair = (%q,%q); want (\"mytoken\",\"mysecret\")", token, secret)
+	fallback := filepath.Join(defaultBaseDir(), "secure_account")
+	got = PBSTokenFiles("")
+	want = []string{filepath.Join(fallback, "pbs_token"), filepath.Join(fallback, "pbs_api_token"), "/root/.pbs-token"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("PBSTokenFiles(\"\") = %v; want %v", got, want)
 	}
-
-	if err := os.WriteFile(tokenFile, []byte("onlysecret\n"), 0644); err != nil {
-		t.Fatalf("failed to overwrite token file: %v", err)
-	}
-
-	token, secret = autoDetectPBSToken(tmpDir)
-	if token != "backup@pbs!go-client" || secret != "onlysecret" {
-		t.Fatalf("autoDetectPBSToken default name = (%q,%q); want (\"backup@pbs!go-client\",\"onlysecret\")", token, secret)
-	}
-}
-
-func TestAutoDetectPBSAuthEnvAndTokenPriority(t *testing.T) {
-	setBaseDirEnv(t, "/pbs/base")
-
-	tmpDir := t.TempDir()
-	tokenFile := filepath.Join(tmpDir, "pbs_token")
-	if err := os.WriteFile(tokenFile, []byte("envtoken=envsecret\n"), 0644); err != nil {
-		t.Fatalf("failed to write token file: %v", err)
-	}
-
-	// Case 1: environment variables have highest priority
-	t.Setenv("PBS_REPOSITORY", "envrepo")
-	t.Setenv("PBS_PASSWORD", "envpass")
-	t.Setenv("PBS_FINGERPRINT", "envfp")
-
-	cfg := &Config{
-		SecureAccount: tmpDir,
-		raw: map[string]string{
-			"PBS_REPOSITORY":  "filerepo",
-			"PBS_PASSWORD":    "filepass",
-			"PBS_FINGERPRINT": "filefp",
-		},
-	}
-	cfg.autoDetectPBSAuth()
-	if cfg.PBSRepository != "envrepo" || cfg.PBSPassword != "envpass" || cfg.PBSFingerprint != "envfp" {
-		t.Fatalf("autoDetectPBSAuth env priority failed: repo=%q pass=%q fp=%q", cfg.PBSRepository, cfg.PBSPassword, cfg.PBSFingerprint)
-	}
-
-	// Case 2: no env, use raw config values
-	t.Setenv("PBS_REPOSITORY", "")
-	t.Setenv("PBS_PASSWORD", "")
-	t.Setenv("PBS_FINGERPRINT", "")
-
-	cfg2 := &Config{
-		SecureAccount: tmpDir,
-		raw: map[string]string{
-			"PBS_REPOSITORY": "filerepo2",
-			"PBS_PASSWORD":   "filepass2",
-		},
-	}
-	cfg2.autoDetectPBSAuth()
-	if cfg2.PBSRepository != "filerepo2" || cfg2.PBSPassword != "filepass2" {
-		t.Fatalf("autoDetectPBSAuth file priority failed: repo=%q pass=%q", cfg2.PBSRepository, cfg2.PBSPassword)
-	}
-
-	// Case 3: no env and no raw -> token file detection
-	cfg3 := &Config{
-		SecureAccount: tmpDir,
-		raw:           map[string]string{},
-	}
-	cfg3.autoDetectPBSAuth()
-	if cfg3.PBSRepository == "" || cfg3.PBSPassword == "" {
-		t.Fatalf("autoDetectPBSAuth should populate from token file, got repo=%q pass=%q", cfg3.PBSRepository, cfg3.PBSPassword)
-	}
-}
-
-func TestExtractFingerprintFromCert(t *testing.T) {
-	certPath, expected := writeTestPBSCertificate(t)
-	got := extractFingerprintFromCert(certPath)
-	if got != expected {
-		t.Fatalf("extractFingerprintFromCert() = %q, want %q", got, expected)
-	}
-}
-
-func TestExtractFingerprintFromCertInvalid(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "invalid.pem")
-	if err := os.WriteFile(path, []byte("not-a-certificate"), 0o600); err != nil {
-		t.Fatalf("failed to write invalid cert file: %v", err)
-	}
-	if got := extractFingerprintFromCert(path); got != "" {
-		t.Fatalf("extractFingerprintFromCert() = %q, want empty", got)
-	}
-}
-
-func TestAutoDetectPBSAuthLocalRepositoryAutoDetectsFingerprint(t *testing.T) {
-	clearPBSAuthEnvForTest(t)
-	setBaseDirEnv(t, "/pbs/base")
-	certPath, expected := writeTestPBSCertificate(t)
-	setPBSFingerprintCertPathsForTest(t, []string{certPath})
-
-	cfg := &Config{
-		raw: map[string]string{
-			"PBS_REPOSITORY": "backup@pbs!token@localhost:store1",
-		},
-	}
-	cfg.autoDetectPBSAuth()
-	if cfg.PBSFingerprint != expected {
-		t.Fatalf("PBSFingerprint = %q, want %q", cfg.PBSFingerprint, expected)
-	}
-}
-
-func TestAutoDetectPBSAuthRemoteRepositorySkipsLocalFingerprint(t *testing.T) {
-	clearPBSAuthEnvForTest(t)
-	setBaseDirEnv(t, "/pbs/base")
-	certPath, _ := writeTestPBSCertificate(t)
-	setPBSFingerprintCertPathsForTest(t, []string{certPath})
-
-	cfg := &Config{
-		raw: map[string]string{
-			"PBS_REPOSITORY": "backup@pbs!token@remote.example.com:store1",
-		},
-	}
-	cfg.autoDetectPBSAuth()
-	if cfg.PBSFingerprint != "" {
-		t.Fatalf("PBSFingerprint = %q, want empty for remote repository", cfg.PBSFingerprint)
-	}
-}
-
-func TestAutoDetectPBSAuthEmptyRepositoryAutoDetectsFingerprint(t *testing.T) {
-	clearPBSAuthEnvForTest(t)
-	setBaseDirEnv(t, "/pbs/base")
-	certPath, expected := writeTestPBSCertificate(t)
-	setPBSFingerprintCertPathsForTest(t, []string{certPath})
-
-	cfg := &Config{raw: map[string]string{}}
-	cfg.autoDetectPBSAuth()
-	if cfg.PBSFingerprint != expected {
-		t.Fatalf("PBSFingerprint = %q, want %q", cfg.PBSFingerprint, expected)
-	}
-}
-
-func setPBSFingerprintCertPathsForTest(t *testing.T, paths []string) {
-	t.Helper()
-	orig := pbsFingerprintCertPaths
-	pbsFingerprintCertPaths = append([]string(nil), paths...)
-	t.Cleanup(func() {
-		pbsFingerprintCertPaths = orig
-	})
-}
-
-func writeTestPBSCertificate(t *testing.T) (string, string) {
-	t.Helper()
-
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("generate rsa key: %v", err)
-	}
-
-	tpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			CommonName: "proxsave-test-pbs",
-		},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-	}
-
-	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatalf("create certificate: %v", err)
-	}
-
-	path := filepath.Join(t.TempDir(), "proxy.pem")
-	pemData := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	if err := os.WriteFile(path, pemData, 0o600); err != nil {
-		t.Fatalf("write certificate: %v", err)
-	}
-
-	sum := sha256.Sum256(der)
-	parts := make([]string, 0, len(sum))
-	for _, b := range sum {
-		parts = append(parts, fmt.Sprintf("%02x", b))
-	}
-	return path, strings.Join(parts, ":")
 }
 
 func TestParseSecuritySettingsParsesSafeProcesses(t *testing.T) {
@@ -1726,5 +1560,58 @@ func TestBackupFirewallRulesHonoursAnExplicitValue(t *testing.T) {
 				t.Fatalf("BackupFirewallRules = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// A value the collection or cloud settings cannot use stops the load: parse returns the
+// error of the step that rejected it instead of carrying on with the remaining steps.
+func TestParseRejectsInvalidCollectionAndCloudSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "unparsable PVE backup size",
+			content: "MAX_PVE_BACKUP_SIZE=abc\n",
+			want:    "invalid MAX_PVE_BACKUP_SIZE",
+		},
+		{
+			name:    "cloud remote starting with a dash",
+			content: "CLOUD_ENABLED=true\nCLOUD_REMOTE=-remote:backups\n",
+			want:    "CLOUD_REMOTE invalid",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := loadEnvErrForTest(t, "invalid.env", tc.content)
+			if err == nil {
+				t.Fatal("expected the configuration to be rejected")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want substring %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// COMPRESSION_MODE assigned an empty value falls back to "standard".
+func TestParseCompressionSettingsDefaultsABlankMode(t *testing.T) {
+	cfg := &Config{raw: map[string]string{"COMPRESSION_MODE": ""}}
+
+	cfg.parseCompressionSettings()
+
+	if cfg.CompressionMode != "standard" {
+		t.Fatalf("CompressionMode = %q; want %q", cfg.CompressionMode, "standard")
+	}
+}
+
+// RCLONE_VERIFY_METHOD assigned an empty value falls back to "primary".
+func TestParseStorageSettingsDefaultsABlankRcloneVerifyMethod(t *testing.T) {
+	cfg := &Config{raw: map[string]string{"RCLONE_VERIFY_METHOD": ""}}
+
+	cfg.parseStorageSettings()
+
+	if cfg.RcloneVerifyMethod != "primary" {
+		t.Fatalf("RcloneVerifyMethod = %q; want %q", cfg.RcloneVerifyMethod, "primary")
 	}
 }

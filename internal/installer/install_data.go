@@ -8,12 +8,14 @@ package installer
 
 import (
 	"bufio"
+	"cmp"
 	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
 	"github.com/tis24dev/proxsave/internal/config"
+	"github.com/tis24dev/proxsave/internal/cron"
 	"github.com/tis24dev/proxsave/pkg/utils"
 )
 
@@ -50,7 +52,13 @@ type InstallWizardPrefill struct {
 	EncryptionEnabled   bool
 	SchedulerMode       string // "cron" | "daemon" (empty on a fresh config)
 	SchedulerTime       string // HH:MM "Run at" time (empty on a fresh config)
+	SchedulerFrequency  string // SCHEDULER_FREQUENCY as stored (empty when absent)
+	SchedulerWeekday    string // SCHEDULER_WEEKDAY as stored (empty when absent)
+	SchedulerMonthDay   string // SCHEDULER_MONTHDAY as stored (empty when absent)
 	HealthcheckMode     string // "off" | "centralized" | "self" (empty on a fresh/pre-daemon config)
+	// HealthcheckAccountInitialEmail is HEALTHCHECK_ACCOUNT_INITIAL_EMAIL as stored ("" when absent).
+	HealthcheckAccountInitialEmail string
+	NotifyOn                       string // "always" | "warning" | "failure"; empty when absent or not valid
 }
 
 // InstallWizardData holds the collected installation data.
@@ -77,9 +85,16 @@ type InstallWizardData struct {
 	EmailDeliveryMethod    string // "relay", "sendmail", or "pmf"
 	EmailFallbackSendmail  *bool  // nil from BOTH front-ends on purpose - see the type doc
 	CronTime               string // HH:MM (the "Run at" time)
+	ScheduleFrequency      string // daily | weekly | monthly; empty -> SCHEDULER_FREQUENCY left as stored
+	ScheduleWeekday        string // mon ... sun; empty -> SCHEDULER_WEEKDAY left as stored
+	ScheduleMonthDay       string // 1-28; empty -> SCHEDULER_MONTHDAY left as stored
 	EnableEncryption       bool
 	SchedulerMode          string // "cron" | "daemon"
 	HealthcheckMode        string // "off" | "centralized" | "self"; empty with daemon -> backward-compat centralized-on
+	// HealthcheckAccountInitialEmail is the portal's initial email (issue 347), required with the
+	// centralized mode and written only then; with any other mode the stored value is kept.
+	HealthcheckAccountInitialEmail string
+	NotifyOn                       string // Notify level: "always" | "warning" | "failure"; empty -> NOTIFY_ON left as stored
 }
 
 // HealthcheckSelfParams holds the full ping URLs the self-mode params screen
@@ -187,6 +202,12 @@ func ValidateOptionalHealthcheckPingURL(v string) error {
 // ExistingConfigAction represents how to handle an already-present configuration file.
 
 // If baseTemplate is empty, the embedded default template is used.
+// Cadence is the schedule the wizard collected; empty answers take the defaults, so the
+// crontab line of a front-end that asked only the time stays daily.
+func (d *InstallWizardData) Cadence() (cron.Cadence, error) {
+	return cron.ParseCadence(d.ScheduleFrequency, d.ScheduleWeekday, d.ScheduleMonthDay, d.CronTime)
+}
+
 func ApplyInstallData(baseTemplate string, data *InstallWizardData) (string, error) {
 	if data == nil {
 		return "", ErrNilInstallData
@@ -221,15 +242,12 @@ func ApplyInstallData(baseTemplate string, data *InstallWizardData) (string, err
 	)
 
 	// Apply cloud storage
-	if data.EnableCloudStorage {
-		template = setEnvValue(template, "CLOUD_ENABLED", "true")
-		template = setEnvValue(template, "CLOUD_REMOTE", data.RcloneBackupRemote)
-		template = setEnvValue(template, "CLOUD_LOG_PATH", data.RcloneLogRemote)
-	} else {
-		template = setEnvValue(template, "CLOUD_ENABLED", "false")
-		template = setEnvValue(template, "CLOUD_REMOTE", "")
-		template = setEnvValue(template, "CLOUD_LOG_PATH", "")
-	}
+	template = config.ApplyCloudStorageSettings(
+		template,
+		data.EnableCloudStorage,
+		data.RcloneBackupRemote,
+		data.RcloneLogRemote,
+	)
 
 	// Apply firewall rules backup. A nil field means no front-end asked, and the key is
 	// then not written AT ALL -- which is not the same thing on both paths: on a fresh
@@ -282,9 +300,7 @@ func ApplyInstallData(baseTemplate string, data *InstallWizardData) (string, err
 		//	explicit answer        -> write it (the seam a future prompt plugs into)
 		//	EMAIL_FALLBACK_SENDMAIL
 		//	  present at all       -> PRESERVE it, byte for byte
-		//	only the legacy
-		//	  EMAIL_FALLBACK_PMF   -> migrate its value onto the current spelling
-		//	neither key present    -> seed true (a blank Edit; the shipped template
+		//	not present            -> seed true (a blank Edit; the shipped template
 		//	                          already carries the key, so a fresh install and
 		//	                          an Overwrite both take the preserve arm)
 		//
@@ -293,26 +309,13 @@ func ApplyInstallData(baseTemplate string, data *InstallWizardData) (string, err
 		// EMAIL_FALLBACK_SENDMAIL=false back to true and silently re-opened a delivery
 		// route the operator had closed.
 		//
-		// Every arm of this switch drops the transitional key, so a config that carried
-		// both spellings leaves with one. That is safe because the arms read
-		// existingValues, parsed from the UNTOUCHED baseTemplate, so the migrate arm
-		// still has the value after the line is gone from template. It is not lossless
-		// in general -- on the migrate arm the alias IS the key the loader was reading
-		// -- which is exactly why that arm copies the value across before it is lost.
-		// The drop stays INSIDE the email-enabled branch on purpose: the email-off
-		// branch writes no EMAIL_FALLBACK_SENDMAIL, so removing the alias there would
-		// flip a PMF-only config to the loader's true default.
-		//
 		// PRESENCE in existingValues, not emptiness of the value, is what selects the
 		// arm. The two are different: parseEnvTemplate records a bare "KEY=" line as a
-		// present, empty value, and the loader reads that as FALSE
-		// (getBoolWithFallback stops at the first key it finds; utils.ParseBool("") is
-		// false). Keying off the value instead treated "KEY=" as "nothing stored" and
+		// present, empty value, and the loader reads that as FALSE (utils.ParseBool("")
+		// is false). Keying off the value instead treated "KEY=" as "nothing stored" and
 		// seeded true over it -- the same silent re-open this switch exists to prevent,
 		// just spelled with an empty value instead of "false".
 		_, sendmailStored := existingValues["EMAIL_FALLBACK_SENDMAIL"]
-		legacyRaw, legacyStored := existingValues["EMAIL_FALLBACK_PMF"]
-		template = unsetEnvValue(template, "EMAIL_FALLBACK_PMF")
 		switch {
 		case data.EmailFallbackSendmail != nil:
 			template = setEnvValue(template, "EMAIL_FALLBACK_SENDMAIL", fmt.Sprintf("%t", *data.EmailFallbackSendmail))
@@ -320,8 +323,6 @@ func ApplyInstallData(baseTemplate string, data *InstallWizardData) (string, err
 			// PRESERVE: write nothing at all. Not even a canonicalising rewrite -- the
 			// operator's own spelling (quotes, an export prefix, yes/on/0) survives an
 			// edit verbatim, and utils.ParseBool and the loader accept all of them.
-		case legacyStored:
-			template = setEnvValue(template, "EMAIL_FALLBACK_SENDMAIL", fmt.Sprintf("%t", utils.ParseBool(legacyRaw)))
 		default:
 			template = setEnvValue(template, "EMAIL_FALLBACK_SENDMAIL", "true")
 		}
@@ -342,6 +343,15 @@ func ApplyInstallData(baseTemplate string, data *InstallWizardData) (string, err
 	template = setEnvValue(template, "SCHEDULER_MODE", mode)
 	if strings.TrimSpace(data.CronTime) != "" {
 		template = setEnvValue(template, "SCHEDULER_TIME", strings.TrimSpace(data.CronTime))
+	}
+	for _, kv := range [][2]string{
+		{"SCHEDULER_FREQUENCY", data.ScheduleFrequency},
+		{"SCHEDULER_WEEKDAY", data.ScheduleWeekday},
+		{"SCHEDULER_MONTHDAY", data.ScheduleMonthDay},
+	} {
+		if v := strings.TrimSpace(kv[1]); v != "" {
+			template = setEnvValue(template, kv[0], v)
+		}
 	}
 
 	// Apply the healthchecks connector mode. Healthchecks require the daemon (the
@@ -381,6 +391,18 @@ func ApplyInstallData(baseTemplate string, data *InstallWizardData) (string, err
 		template = setEnvValue(template, "HEALTHCHECK_ENABLED", "true")
 		template = setEnvValue(template, "HEALTHCHECK_MODE", "centralized")
 		clearURLs()
+		if email := strings.TrimSpace(data.HealthcheckAccountInitialEmail); email != "" {
+			template = setEnvValue(template, "HEALTHCHECK_ACCOUNT_INITIAL_EMAIL", email)
+		}
+	}
+
+	// Notify level (NOTIFY_ON). Below always it applies only with a Healthchecks monitor, so without
+	// one (off, or the cron engine) the wizard writes always (maintainer decision). With a monitor
+	// the operator's answer wins; no answer leaves the stored value alone.
+	if hcMode == "off" {
+		template = setEnvValue(template, "NOTIFY_ON", config.NotifyOnAlways)
+	} else if level := config.NormalizeNotifyOn(data.NotifyOn); strings.TrimSpace(data.NotifyOn) != "" && config.IsValidNotifyOn(level) {
+		template = setEnvValue(template, "NOTIFY_ON", level)
 	}
 
 	return template, nil
@@ -392,11 +414,6 @@ func normalizeSchedulerMode(v string) string {
 		return "daemon"
 	}
 	return "cron"
-}
-
-// ValidateSecondaryInstallData validates the secondary-storage fields.
-func ValidateSecondaryInstallData(data *InstallWizardData) error {
-	return validateSecondaryInstallData(data)
 }
 
 func validateSecondaryInstallData(data *InstallWizardData) error {
@@ -413,11 +430,6 @@ func validateSecondaryInstallData(data *InstallWizardData) error {
 		return err
 	}
 	return nil
-}
-
-// ValidateCloudInstallData validates the cloud-storage fields.
-func ValidateCloudInstallData(data *InstallWizardData) error {
-	return validateCloudInstallData(data)
 }
 
 // validateCloudInstallData mirrors the wizard's own onSubmit checks: when cloud
@@ -440,48 +452,6 @@ func validateCloudInstallData(data *InstallWizardData) error {
 	return nil
 }
 
-// setEnvValue sets or updates an environment variable in the template
-
-// UnsetEnvValueInTemplate removes a key from the template entirely.
-func UnsetEnvValueInTemplate(template, key string) string {
-	return unsetEnvValue(template, key)
-}
-
-func unsetEnvValue(template, key string) string {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return template
-	}
-
-	lines := strings.Split(template, "\n")
-	out := make([]string, 0, len(lines))
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if utils.IsComment(trimmed) {
-			out = append(out, line)
-			continue
-		}
-
-		parts := strings.SplitN(trimmed, "=", 2)
-		if len(parts) != 2 {
-			out = append(out, line)
-			continue
-		}
-
-		parsedKey := strings.TrimSpace(parts[0])
-		if fields := strings.Fields(parsedKey); len(fields) >= 2 && fields[0] == "export" {
-			parsedKey = fields[1]
-		}
-		if strings.EqualFold(parsedKey, key) {
-			continue
-		}
-		out = append(out, line)
-	}
-
-	return strings.Join(out, "\n")
-}
-
 // DeriveInstallWizardPrefill parses an existing backup.env template into an
 // InstallWizardPrefill. Both the TUI wizard and the CLI install wizard call this
 // so each prompt/field defaults to the stored value.
@@ -492,12 +462,12 @@ func DeriveInstallWizardPrefill(baseTemplate string) InstallWizardPrefill {
 	}
 	values := parseEnvTemplate(baseTemplate)
 
-	out.SecondaryEnabled = readTemplateBool(values, "SECONDARY_ENABLED", "ENABLE_SECONDARY_BACKUP")
-	out.SecondaryPath = readTemplateString(values, "SECONDARY_PATH", "SECONDARY_BACKUP_PATH")
+	out.SecondaryEnabled = readTemplateBool(values, "SECONDARY_ENABLED")
+	out.SecondaryPath = readTemplateString(values, "SECONDARY_PATH")
 	out.SecondaryLogPath = readTemplateString(values, "SECONDARY_LOG_PATH")
 
-	out.CloudEnabled = readTemplateBool(values, "CLOUD_ENABLED", "ENABLE_CLOUD_BACKUP")
-	out.CloudRemote = readTemplateString(values, "CLOUD_REMOTE", "RCLONE_REMOTE")
+	out.CloudEnabled = readTemplateBool(values, "CLOUD_ENABLED")
+	out.CloudRemote = readTemplateString(values, "CLOUD_REMOTE")
 	out.CloudLogPath = readTemplateString(values, "CLOUD_LOG_PATH")
 
 	out.FirewallEnabled = readTemplateBool(values, "BACKUP_FIREWALL_RULES")
@@ -510,25 +480,29 @@ func DeriveInstallWizardPrefill(baseTemplate string) InstallWizardPrefill {
 	out.EncryptionEnabled = readTemplateBool(values, "ENCRYPT_ARCHIVE")
 	out.SchedulerMode = readTemplateString(values, "SCHEDULER_MODE")
 	out.SchedulerTime = readTemplateString(values, "SCHEDULER_TIME")
+	out.SchedulerFrequency = readTemplateString(values, "SCHEDULER_FREQUENCY")
+	out.SchedulerWeekday = readTemplateString(values, "SCHEDULER_WEEKDAY")
+	out.SchedulerMonthDay = readTemplateString(values, "SCHEDULER_MONTHDAY")
 
 	// Healthchecks mode: not-enabled -> "off"; otherwise the normalized MODE value
 	// (defaulting to centralized when MODE is absent but the connector is enabled).
 	if readTemplateBool(values, "HEALTHCHECK_ENABLED") {
 		hcMode := normalizeHealthcheckMode(readTemplateString(values, "HEALTHCHECK_MODE"))
-		if hcMode == "" {
-			hcMode = "centralized"
-		}
+		hcMode = cmp.Or(hcMode, "centralized")
 		out.HealthcheckMode = hcMode
 	} else {
 		out.HealthcheckMode = "off"
 	}
 
-	return out
-}
+	out.HealthcheckAccountInitialEmail = strings.TrimSpace(readTemplateString(values, "HEALTHCHECK_ACCOUNT_INITIAL_EMAIL"))
 
-// ParseEnvTemplate parses KEY=VALUE lines from a backup.env template.
-func ParseEnvTemplate(template string) map[string]string {
-	return parseEnvTemplate(template)
+	if raw := readTemplateString(values, "NOTIFY_ON"); strings.TrimSpace(raw) != "" {
+		if level := config.NormalizeNotifyOn(raw); config.IsValidNotifyOn(level) {
+			out.NotifyOn = level
+		}
+	}
+
+	return out
 }
 
 func parseEnvTemplate(template string) map[string]string {
@@ -598,3 +572,34 @@ func installEmailDeliveryMethodOrDefault(method string) string {
 		return "relay"
 	}
 }
+
+// ValidateHealthcheckInitialEmail checks the address the install wizard asks with the centralized
+// Healthchecks mode (issue 347): required, then a minimal form check (one "@", a dotted domain,
+// printable characters without spaces or "$": loading backup.env expands $NAME and ${NAME}, so an
+// address with "$" would not be the one saved). The ProxSave HC Server checks it again.
+func ValidateHealthcheckInitialEmail(value string) error {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return wizardMessage("Required with ProxSave HC Server")
+	}
+	local, domain, ok := strings.Cut(v, "@")
+	usable := ok && local != "" && !strings.Contains(domain, "@") && strings.Contains(domain, ".") &&
+		!strings.HasPrefix(domain, ".") && !strings.HasSuffix(domain, ".") && !strings.Contains(domain, "..") &&
+		len(v) <= 254
+	for _, r := range v {
+		if r <= ' ' || r > '~' || r == '$' {
+			usable = false
+		}
+	}
+	if !usable {
+		return wizardMessage("Not a usable email address")
+	}
+	return nil
+}
+
+// wizardMessage is a validation answer the install wizard shows to the operator as it is (the TUI under
+// the field, --install --cli before asking again): an approved sentence, capitalized, never wrapped into
+// another error.
+type wizardMessage string
+
+func (m wizardMessage) Error() string { return string(m) }

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"archive/tar"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -86,8 +87,8 @@ func (r nicMappingResult) Details() string {
 	var b strings.Builder
 	b.WriteString("NIC mapping (backup -> current):\n")
 	entries := append([]nicMappingEntry(nil), r.Entries...)
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].OldName < entries[j].OldName
+	slices.SortFunc(entries, func(a, b nicMappingEntry) int {
+		return strings.Compare(a.OldName, b.OldName)
 	})
 	for _, e := range entries {
 		line := fmt.Sprintf("- %s -> %s (%s=%s)\n", e.OldName, e.NewName, e.Method, e.Identifier)
@@ -99,6 +100,9 @@ func (r nicMappingResult) Details() string {
 type nicNameConflict struct {
 	Mapping  nicMappingEntry
 	Existing archivedNetworkInterface
+	// Chained is a mapping held back by demoteChainedNICMappings: its old name does not
+	// exist here, its new name is the old name of a conflict listed before it.
+	Chained bool
 }
 
 func (c nicNameConflict) Details() string {
@@ -112,10 +116,17 @@ func (c nicNameConflict) Details() string {
 	if v := strings.TrimSpace(c.Existing.PCIPath); v != "" {
 		existingParts = append(existingParts, "pci="+v)
 	}
-	existing := strings.Join(existingParts, " ")
-	if existing == "" {
-		existing = "no identifiers"
+	if c.Chained {
+		return fmt.Sprintf("- %s -> %s (%s=%s) held back: %s is renamed by the conflict above",
+			c.Mapping.OldName,
+			c.Mapping.NewName,
+			c.Mapping.Method,
+			c.Mapping.Identifier,
+			c.Mapping.NewName,
+		)
 	}
+	existing := strings.Join(existingParts, " ")
+	existing = cmp.Or(existing, "no identifiers")
 	return fmt.Sprintf("- %s -> %s (%s=%s) but current %s exists (%s)",
 		c.Mapping.OldName,
 		c.Mapping.NewName,
@@ -235,8 +246,50 @@ func planNICNameRepair(ctx context.Context, archivePath string) (*nicRepairPlan,
 			plan.SafeMappings = append(plan.SafeMappings, e)
 		}
 	}
+	plan.SafeMappings, plan.Conflicts = demoteChainedNICMappings(plan.SafeMappings, plan.Conflicts, currentByName)
 	plan.Mapping = mapping
 	return plan, nil
+}
+
+// nicConflictsHeader introduces the conflict list of the confirmation prompt. A chained
+// mapping's old name does not exist on this system, so the list then says it applies
+// together with the conflict that renames its target.
+func nicConflictsHeader(conflicts []nicNameConflict) string {
+	for _, c := range conflicts {
+		if c.Chained {
+			return "Some of these interface names exist on the current system; the others rename onto one of those names and are applied together with it:"
+		}
+	}
+	return "These interface names exist on the current system but map to different NICs in the backup inventory:"
+}
+
+// demoteChainedNICMappings moves to the conflicts every safe mapping whose new name is
+// the old name of a conflict ({A_old->A_new, A_new->B_new}): applied alone it renames
+// A_old onto a name the file still uses for the conflicting interface, and the file
+// ends with two stanzas and two bridge-ports/bond-slaves references under one name.
+// The chain is then applied whole, in one pass, or not at all. Repeated until stable,
+// for chains longer than two.
+func demoteChainedNICMappings(safe []nicMappingEntry, conflicts []nicNameConflict, currentByName map[string]archivedNetworkInterface) ([]nicMappingEntry, []nicNameConflict) {
+	for {
+		blocked := make(map[string]bool, len(conflicts))
+		for _, c := range conflicts {
+			blocked[c.Mapping.OldName] = true
+		}
+		kept := safe[:0:0]
+		moved := false
+		for _, e := range safe {
+			if blocked[e.NewName] {
+				conflicts = append(conflicts, nicNameConflict{Mapping: e, Existing: currentByName[e.NewName], Chained: true})
+				moved = true
+				continue
+			}
+			kept = append(kept, e)
+		}
+		safe = kept
+		if !moved {
+			return safe, conflicts
+		}
+	}
 }
 
 func applyNICNameRepair(logger *logging.Logger, plan *nicRepairPlan, includeConflicts bool) (result *nicRepairResult, err error) {
@@ -444,8 +497,8 @@ func collectCurrentNetworkInventory(ctx context.Context) (*archivedNetworkInvent
 		inv.Interfaces = append(inv.Interfaces, profile)
 	}
 
-	sort.Slice(inv.Interfaces, func(i, j int) bool {
-		return inv.Interfaces[i].Name < inv.Interfaces[j].Name
+	slices.SortFunc(inv.Interfaces, func(a, b archivedNetworkInterface) int {
+		return strings.Compare(a.Name, b.Name)
 	})
 	return inv, nil
 }
@@ -468,7 +521,7 @@ func readUdevProperties(ctx context.Context, netPath string) (map[string]string,
 		return nil, err
 	}
 	props := make(map[string]string)
-	for _, line := range strings.Split(string(output), "\n") {
+	for line := range strings.SplitSeq(string(output), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.Contains(line, "=") {
 			continue
@@ -485,7 +538,7 @@ func readUdevProperties(ctx context.Context, netPath string) (map[string]string,
 
 func parsePermanentMAC(output string) string {
 	const prefix = "permanent address:"
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		line = strings.TrimSpace(line)
 		lower := strings.ToLower(line)
 		if strings.HasPrefix(lower, prefix) {
@@ -707,7 +760,7 @@ func rewriteIfupdownConfigFiles(logger *logging.Logger, renameMap map[string]str
 		logging.DebugStep(logger, "NIC repair rewrite", "interfaces.d not readable; scanning only /etc/network/interfaces (error=%v)", err)
 	}
 
-	sort.Strings(paths)
+	slices.Sort(paths)
 	logging.DebugStep(logger, "NIC repair rewrite", "Scan %d file(s) for interface renames", len(paths))
 
 	type fileSnapshot struct {
@@ -750,9 +803,9 @@ func rewriteIfupdownConfigFiles(logger *logging.Logger, renameMap map[string]str
 		return nil, "", nil
 	}
 
-	baseDir := "/tmp/proxsave"
+	baseDir := RestoreRunDir()
 	logging.DebugStep(logger, "NIC repair rewrite", "Create backup directory under %s", baseDir)
-	if err := restoreFS.MkdirAll(baseDir, 0o755); err != nil {
+	if err := restoreFS.MkdirAll(baseDir, 0o700); err != nil {
 		return nil, "", fmt.Errorf("create nic repair base directory: %w", err)
 	}
 
@@ -806,8 +859,8 @@ func mapToEntries(renameMap map[string]string) []nicMappingEntry {
 			Method:  "text_replace",
 		})
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].OldName < entries[j].OldName
+	slices.SortFunc(entries, func(a, b nicMappingEntry) int {
+		return strings.Compare(a.OldName, b.OldName)
 	})
 	return entries
 }

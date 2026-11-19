@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"io"
@@ -20,7 +21,7 @@ import (
 
 var (
 	dashboardUpgradeCheck   = checkForUpdates
-	dashboardUpgradeRun     = runUpgrade
+	dashboardUpgradeRun     = runUpgradeWithOptions
 	dashboardUpgradeVersion = buildinfo.String
 )
 
@@ -67,7 +68,7 @@ func releaseTagURL(tag string) string {
 // screen carries the other's button: "Check upgrade" opens the binary upgrade screen
 // (runDashboardUpgrade), "Check config" opens the config upgrade flow (--upgrade-config),
 // and Back/esc returns to the dashboard menu. It loops so each sub-flow returns here.
-func runDashboardUpgradeMenu(ctx context.Context, session *shell.Session, configPath string) {
+func runDashboardUpgradeMenu(ctx context.Context, session *shell.Session, configPath string) dashboardActionDisposition {
 	back := errors.New("back")
 	for {
 		prompt := theme.Emphasis.Render("Current version: ") + theme.Text.Render(upgradeSafeToken(dashboardUpgradeVersion()))
@@ -80,11 +81,13 @@ func runDashboardUpgradeMenu(ctx context.Context, session *shell.Session, config
 			components.WithSelectorPromptStyled[upgAct](prompt),
 			components.WithSelectorBack[upgAct](back)))
 		if err != nil || a == upgBack {
-			return
+			return dashboardActionHandled
 		}
 		switch a {
 		case upgGo:
-			runDashboardUpgrade(ctx, session, configPath)
+			if disposition := runDashboardUpgrade(ctx, session, configPath); disposition == dashboardActionReload {
+				return disposition
+			}
 		case upgConfig:
 			runDashboardUpdateConfig(ctx, session, configPath)
 		}
@@ -96,7 +99,7 @@ func runDashboardUpgradeMenu(ctx context.Context, session *shell.Session, config
 // "Run upgrade" streams the upgrade INSIDE the altscreen session via components.RunStreamTask
 // (upgRun), the same contained viewport panel backup and install-finalize use, then drives
 // the single daemon restart. It loops back to the menu on Back.
-func runDashboardUpgrade(ctx context.Context, session *shell.Session, configPath string) {
+func runDashboardUpgrade(ctx context.Context, session *shell.Session, configPath string) dashboardActionDisposition {
 	cur := upgradeSafeToken(dashboardUpgradeVersion())
 	// Symbols on the RESULT keyword (consistent with the Telegram/healthcheck check
 	// screens): green ✓ ok, yellow ⚠ attention, red ✗ error. The pre-check "NOT CHECKED"
@@ -117,9 +120,7 @@ func runDashboardUpgrade(ctx context.Context, session *shell.Session, configPath
 				avail, kw, sty, sym, notes, url = false, "CHECK FAILED", theme.WarningText, symWarn, "", ""
 			case info.NewVersion:
 				latest := upgradeSafeToken(info.Latest)
-				if latest == "" {
-					latest = "UPDATE AVAILABLE"
-				}
+				latest = cmp.Or(latest, "UPDATE AVAILABLE")
 				avail, kw, sty, sym, notes, url = true, latest, theme.WarningText, symWarn, info.Notes, releaseTagURL(info.Tag)
 			default:
 				avail, kw, sty, sym, notes, url = false, "NO UPGRADE ("+cur+")", theme.SuccessText, symOk, info.Notes, releaseTagURL(info.Tag)
@@ -145,7 +146,7 @@ func runDashboardUpgrade(ctx context.Context, session *shell.Session, configPath
 			},
 			components.WithSelectorPromptStyled[upgAct](p), components.WithSelectorBack[upgAct](back)))
 		if err != nil || a == upgBack {
-			return
+			return dashboardActionHandled
 		}
 		if !avail {
 			pendingCheck = true // "Re-check" pressed: re-run the check on the next loop
@@ -153,12 +154,12 @@ func runDashboardUpgrade(ctx context.Context, session *shell.Session, configPath
 		}
 		avail = false
 		if upgRun(ctx, session, configPath) == types.ExitSuccess.Int() {
-			kw, sty, sym = "UPGRADED", theme.SuccessText, symOk
 			dashboardUpgradeRestartDaemon(ctx, session, configPath)
+			return dashboardActionReload
 		} else {
 			kw, sty, sym = "FAILED", theme.ErrorText, symErr
 			showDaemonResultScreen(ctx, session, "Upgrade failed", orchestrator.HealthcheckSetupLevelError,
-				"FAILED", "Run 'proxsave --upgrade' from a shell for details.")
+				"FAILED", "The cause is in the upgrade log shown before this screen.")
 		}
 	}
 }
@@ -176,7 +177,7 @@ func renderReleaseNotes(notes string) string {
 	notes = strings.ReplaceAll(notes, "**", "")
 	var b strings.Builder
 	shown := 0
-	for _, raw := range strings.Split(notes, "\n") {
+	for raw := range strings.SplitSeq(notes, "\n") {
 		if shown >= maxLines {
 			b.WriteString(theme.Subtle.Render("  ..."))
 			b.WriteString("\n")
@@ -249,7 +250,7 @@ func upgRun(ctx context.Context, session *shell.Session, configPath string) int 
 			// pipe into the panel (restored on return/panic), so the panel shows the same
 			// colored [ts] LEVEL lines as the CLI instead of losing them to the altscreen.
 			defer captureRunOutput(bl, emit)()
-			code = dashboardUpgradeRun(taskCtx, ar, bl)
+			code = dashboardUpgradeRun(taskCtx, ar, bl, upgradeRunOptions{deferWhatsnew: true})
 			return buildUpgradeOutcomePrompt(code), nil
 		})
 	if streamErr != nil {
@@ -281,14 +282,16 @@ func buildUpgradeOutcomePrompt(code int) string {
 // the resident daemon (when active) so it loads the freshly installed binary, then shows
 // the outcome via the SAME styled result screen as the daemon-status check
 // (showDaemonResultScreen), so the post-upgrade restart result matches the daemon menu.
-// When the daemon is not active there is nothing to restart -- the new binary just needs a
-// relaunch of this process. This is the SINGLE restart on the dashboard path: runUpgrade's
+// When the daemon is not active there is nothing to restart and the screen only says the new
+// binary is on disk. Neither screen asks the operator to relaunch anything: leaving it returns
+// dashboardActionReload, and the dashboard relaunches itself from the new binary
+// (closeDashboardAndRelaunch). This is the SINGLE restart on the dashboard path: runUpgrade's
 // own inline restart is suppressed (upgradeRestartsDaemon is set false in upgRun), so there
 // is no double restart.
 func dashboardUpgradeRestartDaemon(ctx context.Context, session *shell.Session, configPath string) {
 	if !daemonIsActive(ctx) {
 		showDaemonResultScreen(ctx, session, "Upgrade complete", orchestrator.HealthcheckSetupLevelOk,
-			"NEW BINARY ON DISK", "New binary on disk. This process still runs the old version; relaunch proxsave.")
+			"NEW BINARY ON DISK", "")
 		return
 	}
 	baseDir, _ := detectedBaseDirOrFallback()
@@ -301,15 +304,5 @@ func dashboardUpgradeRestartDaemon(ctx context.Context, session *shell.Session, 
 			return nil
 		})
 	level, keyword, explanation := restartVerifyStatus(rv)
-	// The daemon was restarted onto the new binary, but THIS interactive process is still
-	// the old one, so append the relaunch note (as the daemon-inactive branch above does).
-	// restartVerifyStatus is shared with the plain Restart button, where this note would be
-	// wrong, so append here rather than in the shared helper.
-	const relaunch = "This process still runs the old version; relaunch proxsave."
-	if strings.TrimSpace(explanation) == "" {
-		explanation = relaunch
-	} else {
-		explanation += " " + relaunch
-	}
 	showDaemonResultScreen(ctx, session, "Daemon restart", level, keyword, explanation)
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -50,7 +51,7 @@ func uniquePveMountTestStorageID(t *testing.T, label string) string {
 	if label == "" {
 		label = "x"
 	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d", t.Name(), label, os.Getpid())))
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s|%s|%d", t.Name(), label, os.Getpid()))
 	return pveMountIntegrationStoragePrefix + hex.EncodeToString(sum[:6]) + "-" + label
 }
 
@@ -196,13 +197,13 @@ func TestApplyPVEVzdumpConfFromStage_Branches(t *testing.T) {
 	logger := newTestLogger()
 	stageRoot := "/stage"
 
-	if err := applyPVEVzdumpConfFromStage(logger, stageRoot); err != nil {
+	if err := applyPVEVzdumpConfFromStage(context.Background(), logger, stageRoot); err != nil {
 		t.Fatalf("missing staged file should be ignored: %v", err)
 	}
 
 	stagePath := filepath.Join(stageRoot, "etc/vzdump.conf")
 	restoreFS = readFileFailFS{FS: fakeFS, failPath: stagePath, err: errors.New("boom")}
-	if err := applyPVEVzdumpConfFromStage(logger, stageRoot); err == nil || !strings.Contains(err.Error(), "read staged etc/vzdump.conf") {
+	if err := applyPVEVzdumpConfFromStage(context.Background(), logger, stageRoot); err == nil || !strings.Contains(err.Error(), "read staged etc/vzdump.conf") {
 		t.Fatalf("expected staged read error, got %v", err)
 	}
 	restoreFS = fakeFS
@@ -213,7 +214,7 @@ func TestApplyPVEVzdumpConfFromStage_Branches(t *testing.T) {
 	if err := fakeFS.AddFile(stagePath, []byte(" \n\t")); err != nil {
 		t.Fatalf("write staged empty vzdump.conf: %v", err)
 	}
-	if err := applyPVEVzdumpConfFromStage(logger, stageRoot); err != nil {
+	if err := applyPVEVzdumpConfFromStage(context.Background(), logger, stageRoot); err != nil {
 		t.Fatalf("empty staged vzdump.conf: %v", err)
 	}
 	if _, err := fakeFS.Stat("/etc/vzdump.conf"); err == nil || !os.IsNotExist(err) {
@@ -223,7 +224,7 @@ func TestApplyPVEVzdumpConfFromStage_Branches(t *testing.T) {
 	if err := fakeFS.AddFile(stagePath, []byte("  dumpdir /mnt/backup  \n\n")); err != nil {
 		t.Fatalf("write staged non-empty vzdump.conf: %v", err)
 	}
-	if err := applyPVEVzdumpConfFromStage(logger, stageRoot); err != nil {
+	if err := applyPVEVzdumpConfFromStage(context.Background(), logger, stageRoot); err != nil {
 		t.Fatalf("non-empty staged vzdump.conf: %v", err)
 	}
 	got, err := fakeFS.ReadFile("/etc/vzdump.conf")
@@ -405,7 +406,12 @@ func TestApplyPVEDatacenterCfgFromStage_Branches(t *testing.T) {
 		}
 	})
 
-	t.Run("runPvesh error and success", func(t *testing.T) {
+	t.Run("pmxcfs refusal and pmxcfs success", func(t *testing.T) {
+		// The pvesh endpoint the old arm called does not exist on a live node
+		// ("No 'set' handler defined for '/cluster/config'", probed 2026-09-02);
+		// the arm now writes the staged file into pmxcfs and pvesh is not
+		// involved. The two arms pinned here are the mounted-guard refusal and
+		// the write itself.
 		origFS := restoreFS
 		origCmd := restoreCmd
 		t.Cleanup(func() {
@@ -416,30 +422,25 @@ func TestApplyPVEDatacenterCfgFromStage_Branches(t *testing.T) {
 		fakeFS := NewFakeFS()
 		t.Cleanup(func() { _ = os.RemoveAll(fakeFS.Root) })
 		restoreFS = fakeFS
+		restoreCmd = &FakeCommandRunner{}
 
 		stagePath := "/stage/etc/pve/datacenter.cfg"
 		if err := fakeFS.AddFile(stagePath, []byte("keyboard: it\n")); err != nil {
 			t.Fatalf("write staged datacenter.cfg: %v", err)
 		}
 
-		failCmd := &FakeCommandRunner{
-			Errors: map[string]error{
-				"pvesh set /cluster/config -conf " + stagePath: errors.New("pvesh failed"),
-			},
-		}
-		restoreCmd = failCmd
-		if err := applyPVEDatacenterCfgFromStage(ctx, logger, "/stage"); err == nil || !strings.Contains(err.Error(), "pvesh [set /cluster/config -conf") {
-			t.Fatalf("expected pvesh failure, got %v", err)
+		seamPmxcfs(t, "/etc/pve", false, nil)
+		if err := applyPVEDatacenterCfgFromStage(ctx, logger, "/stage"); err == nil || !strings.Contains(err.Error(), "not mounted") {
+			t.Fatalf("expected the mounted-guard refusal, got %v", err)
 		}
 
-		okCmd := &FakeCommandRunner{}
-		restoreCmd = okCmd
+		seamPmxcfs(t, "/etc/pve", true, nil)
 		if err := applyPVEDatacenterCfgFromStage(ctx, logger, "/stage"); err != nil {
 			t.Fatalf("expected success, got %v", err)
 		}
-		calls := strings.Join(okCmd.CallsList(), "\n")
-		if !strings.Contains(calls, "pvesh set /cluster/config -conf "+stagePath) {
-			t.Fatalf("missing datacenter apply call; calls=%v", okCmd.CallsList())
+		got, err := fakeFS.ReadFile("/etc/pve/datacenter.cfg")
+		if err != nil || string(got) != "keyboard: it\n" {
+			t.Fatalf("datacenter.cfg not written into pmxcfs: %q err=%v", got, err)
 		}
 	})
 }
@@ -645,18 +646,13 @@ func TestPVEStorageMountGuardItems_CoversFilteringAndFallbacks(t *testing.T) {
 }
 
 func containsGuardTarget(values []string, want string) bool {
-	for _, v := range values {
-		if v == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, want)
 }
 
 func TestMaybeApplyPVEStorageMountGuardsFromStage_EarlyAndFallback(t *testing.T) {
 	ctx := context.Background()
 	logger := newTestLogger()
-	withTempGuardBaseDir(t) // keep the chattr index off the real /var/lib/proxsave
+	withTempGuardBaseDir(t) // keep the chattr index off the real guard directories
 
 	if err := maybeApplyPVEStorageMountGuardsFromStage(ctx, logger, nil, "/stage", "/"); err != nil {
 		t.Fatalf("nil plan: expected nil error, got %v", err)
@@ -813,7 +809,7 @@ func TestMaybeApplyPVEStorageMountGuardsFromStage_ActivateAndGuardBranches(t *te
 	logger := newTestLogger()
 	plan := pvePlan(false, "storage_pve")
 	requireWritablePveMountRoot(t)
-	withTempGuardBaseDir(t) // keep any chattr index off the real /var/lib/proxsave
+	withTempGuardBaseDir(t) // keep any chattr index off the real guard directories
 
 	origFS := restoreFS
 	origCmd := restoreCmd

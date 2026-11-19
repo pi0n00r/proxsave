@@ -17,7 +17,7 @@ const bootstrapTimeFormat = "2006-01-02 15:04:05"
 
 // consoleUseColor decides whether the bootstrap console prefix carries ANSI
 // color for the given target stream. The main Logger's color is config-driven
-// (USE_COLOR/DISABLE_COLORS), but the bootstrap runs before config is loaded,
+// (USE_COLOR), but the bootstrap runs before config is loaded,
 // so it falls back to the conventional rule: color only on a real terminal and
 // only when NO_COLOR is unset.
 func consoleUseColor(f *os.File) bool {
@@ -39,6 +39,9 @@ type bootstrapEntry struct {
 	// time is the authoritative timestamp for the event). Empty for raw entries.
 	ts  string
 	raw bool
+	// printed: the line already reached the console (printed live, or replayed by
+	// ReplayConsoleSince), so Flush writes it to the log file only.
+	printed bool
 }
 
 // BootstrapLogger accumulates logs generated before the main logger is initialized,
@@ -121,6 +124,11 @@ func (b *BootstrapLogger) ReplayConsoleSince(mark int) {
 			// Same "[ts] LEVEL   message" prefix as the live console path, so a
 			// replayed line is indistinguishable from a normally printed one.
 			fmt.Fprint(os.Stderr, FormatConsoleLogLine(ts, e.level, e.message, consoleUseColor(os.Stderr)))
+			b.mu.Lock()
+			if i < len(b.entries) {
+				b.entries[i].printed = true
+			}
+			b.mu.Unlock()
 		}
 	}
 }
@@ -159,17 +167,17 @@ func (b *BootstrapLogger) Println(message string) {
 }
 
 // Debug records a debug message without printing it to the console.
-func (b *BootstrapLogger) Debug(format string, args ...interface{}) {
+func (b *BootstrapLogger) Debug(format string, args ...any) {
 	if b == nil {
 		return
 	}
 	msg := fmt.Sprintf(format, args...)
 	b.mirrorLog(types.LogLevelDebug, msg)
-	b.record(types.LogLevelDebug, msg)
+	b.record(types.LogLevelDebug, msg, false)
 }
 
 // Printf records a formatted line as raw.
-func (b *BootstrapLogger) Printf(format string, args ...interface{}) {
+func (b *BootstrapLogger) Printf(format string, args ...any) {
 	if b == nil {
 		return
 	}
@@ -182,7 +190,7 @@ func (b *BootstrapLogger) Printf(format string, args ...interface{}) {
 }
 
 // Info logs an early informational message.
-func (b *BootstrapLogger) Info(format string, args ...interface{}) {
+func (b *BootstrapLogger) Info(format string, args ...any) {
 	if b == nil {
 		return
 	}
@@ -195,11 +203,11 @@ func (b *BootstrapLogger) Info(format string, args ...interface{}) {
 		_, _ = fmt.Fprint(os.Stdout, line)
 	}
 	b.mirrorLog(types.LogLevelInfo, msg)
-	b.record(types.LogLevelInfo, msg)
+	b.record(types.LogLevelInfo, msg, !b.consoleQuietEnabled())
 }
 
 // Warning records an early warning message (printed to stderr).
-func (b *BootstrapLogger) Warning(format string, args ...interface{}) {
+func (b *BootstrapLogger) Warning(format string, args ...any) {
 	if b == nil {
 		return
 	}
@@ -211,11 +219,11 @@ func (b *BootstrapLogger) Warning(format string, args ...interface{}) {
 		fmt.Fprint(os.Stderr, line)
 	}
 	b.mirrorLog(types.LogLevelWarning, msg)
-	b.record(types.LogLevelWarning, msg)
+	b.record(types.LogLevelWarning, msg, !b.consoleQuietEnabled())
 }
 
 // Error records an early error message (stderr).
-func (b *BootstrapLogger) Error(format string, args ...interface{}) {
+func (b *BootstrapLogger) Error(format string, args ...any) {
 	if b == nil {
 		return
 	}
@@ -227,16 +235,17 @@ func (b *BootstrapLogger) Error(format string, args ...interface{}) {
 		fmt.Fprint(os.Stderr, line)
 	}
 	b.mirrorLog(types.LogLevelError, msg)
-	b.record(types.LogLevelError, msg)
+	b.record(types.LogLevelError, msg, !b.consoleQuietEnabled())
 }
 
-func (b *BootstrapLogger) record(level types.LogLevel, message string) {
+func (b *BootstrapLogger) record(level types.LogLevel, message string, printed bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.entries = append(b.entries, bootstrapEntry{
 		level:   level,
 		message: message,
 		ts:      time.Now().Format(bootstrapTimeFormat),
+		printed: printed,
 	})
 }
 
@@ -266,6 +275,11 @@ func (b *BootstrapLogger) Flush(logger *Logger) {
 			continue
 		}
 		if entry.level > b.minLevel {
+			continue
+		}
+		if entry.printed {
+			// Already on the console: the log file, counters and issues only.
+			logger.logFileOnly(entry.level, entry.message)
 			continue
 		}
 		switch entry.level {

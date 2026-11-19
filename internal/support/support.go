@@ -103,7 +103,7 @@ func RunIntro(ctx context.Context, bootstrap *logging.BootstrapLogger) (meta Met
 				bootstrap.Warning("Support mode interrupted by signal")
 				return Meta{}, false, true
 			}
-			bootstrap.Error("ERROR: %v", err)
+			bootstrap.Error("Failed to read input: %v", err)
 			return Meta{}, false, false
 		}
 		if !granted {
@@ -121,7 +121,7 @@ func RunIntro(ctx context.Context, bootstrap *logging.BootstrapLogger) (meta Met
 				bootstrap.Warning("Support mode interrupted by signal")
 				return Meta{}, false, true
 			}
-			bootstrap.Error("ERROR: Failed to read input: %v", err)
+			bootstrap.Error("Failed to read input: %v", err)
 			return Meta{}, false, false
 		}
 		nickname := strings.TrimSpace(line)
@@ -142,7 +142,7 @@ func RunIntro(ctx context.Context, bootstrap *logging.BootstrapLogger) (meta Met
 				bootstrap.Warning("Support mode interrupted by signal")
 				return Meta{}, false, true
 			}
-			bootstrap.Error("ERROR: Failed to read input: %v", err)
+			bootstrap.Error("Failed to read input: %v", err)
 			return Meta{}, false, false
 		}
 		issue := strings.TrimSpace(line)
@@ -262,11 +262,20 @@ func SendEmail(ctx context.Context, cfg *config.Config, logger *logging.Logger, 
 		logging.Warning("Support mode: failed to initialize support email notifier: %v", err)
 		return
 	}
+	if !emailNotifier.IsEnabled() {
+		logging.Warning("Support mode: support email notifier is disabled; skipping the support email")
+		return
+	}
 
 	adapter := orchestrator.NewNotificationAdapter(emailNotifier, logger)
-	if err := adapter.Notify(ctx, stats); err != nil {
-		logging.Critical("Support mode: FAILED to send support email: %v", err)
-		fmt.Println("\033[33m⚠️  CRITICAL: Support email failed to send!\033[0m")
+	// Notify keeps delivery failures non-fatal (it returns nil for them) and records the
+	// actual outcome in NotifyResults. The adapter's own WARNING names only the Email
+	// channel, so the failure of the support email gets its own line after it.
+	notifyErr := adapter.Notify(ctx, stats)
+	outcome := stats.NotifyResults[emailNotifier.Name()]
+	if notifyErr != nil || (outcome != "ok" && outcome != "warning") {
+		logging.Debug("Support mode: support email outcome=%q err=%v", outcome, notifyErr)
+		logging.Warning("Support mode: FAILED to send support email to %s", recipient)
 		return
 	}
 

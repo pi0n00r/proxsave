@@ -4,6 +4,7 @@ package orchestrator
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/tis24dev/proxsave/internal/logging"
@@ -26,9 +27,16 @@ const mountGuardChattrTargetsName = "chattr-targets"
 // `chattr -i` manually, exactly as before this index existed.
 const maxChattrIndexBytes = 1 << 20 // 1 MiB
 
-// mountGuardChattrTargetsPath returns the absolute path of the immutable-guard index.
+// mountGuardChattrTargetsPath returns the absolute path of the immutable-guard index
+// in the current guard directory.
 func mountGuardChattrTargetsPath() string {
-	return filepath.Join(mountGuardBaseDir, mountGuardChattrTargetsName)
+	return mountGuardChattrTargetsPathIn(mountGuardBaseDir)
+}
+
+// mountGuardChattrTargetsPathIn returns the path of the immutable-guard index in
+// guardDir. Cleanup reads it in the current and in the legacy guard directory.
+func mountGuardChattrTargetsPathIn(guardDir string) string {
+	return filepath.Join(guardDir, mountGuardChattrTargetsName)
 }
 
 // isUnsafeIndexRune reports control characters that have no place in a
@@ -67,7 +75,7 @@ func parseImmutableGuardTargets(data []byte) []string {
 	}
 	seen := make(map[string]struct{})
 	var out []string
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		clean := filepath.Clean(strings.TrimSpace(line))
 		if !isValidGuardTarget(clean) {
 			continue
@@ -114,10 +122,8 @@ func recordImmutableGuardTarget(logger *logging.Logger, target string) {
 
 	indexPath := mountGuardChattrTargetsPath()
 	existing := readImmutableGuardIndex(indexPath)
-	for _, t := range existing {
-		if t == clean {
-			return // already recorded; keep the index stable
-		}
+	if slices.Contains(existing, clean) {
+		return // already recorded; keep the index stable
 	}
 
 	payload := strings.Join(append(existing, clean), "\n") + "\n"
@@ -149,11 +155,23 @@ func readImmutableGuardIndex(path string) []string {
 }
 
 // recordedImmutableGuardTargets returns the immutable-guard targets currently
-// recorded in the index (read-only; never mutates). Empty if the index is
+// recorded in the index of the current and of the legacy guard directory, without
+// duplicates (read-only; never mutates). Empty if every index is
 // missing/unreadable/empty. Used by the restore-start legacy warning and any
 // read-only listing.
 func recordedImmutableGuardTargets() []string {
-	return readImmutableGuardIndex(mountGuardChattrTargetsPath())
+	seen := make(map[string]struct{})
+	var out []string
+	for _, dir := range mountGuardBaseDirs() {
+		for _, t := range readImmutableGuardIndex(mountGuardChattrTargetsPathIn(dir)) {
+			if _, dup := seen[t]; dup {
+				continue
+			}
+			seen[t] = struct{}{}
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // warnLegacyImmutableGuards alerts the operator, at the start of a restore, about
@@ -176,7 +194,7 @@ func warnLegacyImmutableGuards(logger *logging.Logger) {
 }
 
 // writeImmutableGuardIndex writes the index atomically (temp file + rename) on the
-// REAL host filesystem. The index is host state under /var/lib/proxsave — it is not
+// REAL host filesystem. The index is host state in the guard directory — it is not
 // part of the staged restore tree — so it deliberately uses os.* directly rather
 // than the restoreFS abstraction (which may be a fake/overlay during restore).
 func writeImmutableGuardIndex(path string, data []byte, perm os.FileMode) error {

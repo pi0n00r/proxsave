@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tis24dev/proxsave/internal/backup"
 	"github.com/tis24dev/proxsave/internal/checks"
 	"github.com/tis24dev/proxsave/internal/config"
 	"github.com/tis24dev/proxsave/internal/environment"
@@ -84,36 +83,34 @@ func TestBackupStatsToPrometheusMetrics(t *testing.T) {
 	}
 }
 
-func TestDescribeTelegramConfigVariants(t *testing.T) {
-	logger := logging.New(types.LogLevelError, false)
-	o := &Orchestrator{logger: logger}
-	if got := o.describeTelegramConfig(); got != "disabled" {
-		t.Fatalf("describeTelegramConfig nil cfg = %q, want disabled", got)
+func TestDescribeTelegramStatusVariants(t *testing.T) {
+	if got := describeTelegramStatus(nil); got != "disabled" {
+		t.Fatalf("describeTelegramStatus nil cfg = %q, want disabled", got)
 	}
 
-	o.cfg = &config.Config{TelegramEnabled: false}
-	if got := o.describeTelegramConfig(); got != "disabled" {
-		t.Fatalf("describeTelegramConfig disabled = %q, want disabled", got)
+	cfg := &config.Config{TelegramEnabled: false}
+	if got := describeTelegramStatus(cfg); got != "disabled" {
+		t.Fatalf("describeTelegramStatus disabled = %q, want disabled", got)
 	}
 
-	o.cfg.TelegramEnabled = true
-	o.cfg.TelegramBotType = ""
-	if got := o.describeTelegramConfig(); got != "personal" {
+	cfg.TelegramEnabled = true
+	cfg.TelegramBotType = ""
+	if got := describeTelegramStatus(cfg); got != "personal" {
 		t.Fatalf("empty bot type => %q, want personal", got)
 	}
 
-	o.cfg.TelegramBotType = "personal"
-	if got := o.describeTelegramConfig(); got != "personal" {
+	cfg.TelegramBotType = "personal"
+	if got := describeTelegramStatus(cfg); got != "personal" {
 		t.Fatalf("personal => %q, want personal", got)
 	}
 
-	o.cfg.TelegramBotType = "centralized"
-	if got := o.describeTelegramConfig(); got != "centralized" {
+	cfg.TelegramBotType = "centralized"
+	if got := describeTelegramStatus(cfg); got != "centralized" {
 		t.Fatalf("centralized => %q, want centralized", got)
 	}
 
-	o.cfg.TelegramBotType = " custom "
-	if got := o.describeTelegramConfig(); got != "custom" {
+	cfg.TelegramBotType = " custom "
+	if got := describeTelegramStatus(cfg); got != "custom" {
 		t.Fatalf("trimmed custom => %q, want custom", got)
 	}
 }
@@ -133,7 +130,7 @@ func TestLogGlobalRetentionPolicySimpleAndGFS(t *testing.T) {
 	}
 	o := &Orchestrator{logger: logger, cfg: cfgGFS}
 	o.logGlobalRetentionPolicy()
-	if !strings.Contains(buf.String(), "Policy: GFS") {
+	if !strings.Contains(buf.String(), "INFO       Retention policy: GFS (daily=1, weekly=2, monthly=3, yearly=4)\n") {
 		t.Fatalf("expected GFS policy log, got: %s", buf.String())
 	}
 
@@ -144,11 +141,29 @@ func TestLogGlobalRetentionPolicySimpleAndGFS(t *testing.T) {
 		LocalRetentionDays:     7,
 		SecondaryRetentionDays: 14,
 		CloudRetentionDays:     30,
+		SecondaryEnabled:       true,
+		CloudEnabled:           true,
 	}
 	o.cfg = cfgSimple
 	o.logGlobalRetentionPolicy()
-	if !strings.Contains(buf.String(), "Policy: simple") {
+	if !strings.Contains(buf.String(), "INFO       Retention policy: simple (local=7, secondary=14, cloud=30)\n") {
 		t.Fatalf("expected simple policy log, got: %s", buf.String())
+	}
+
+	// Only the enabled destinations are listed: a disabled one has no retention to apply.
+	buf.Reset()
+	cfgSimple.SecondaryEnabled = false
+	cfgSimple.CloudEnabled = false
+	o.logGlobalRetentionPolicy()
+	if !strings.Contains(buf.String(), "INFO       Retention policy: simple (local=7)\n") {
+		t.Fatalf("expected the disabled destinations left out of the policy line, got: %s", buf.String())
+	}
+
+	buf.Reset()
+	cfgSimple.LocalRetentionDays = 0
+	o.logGlobalRetentionPolicy()
+	if !strings.Contains(buf.String(), "INFO       Retention policy: simple (disabled)\n") {
+		t.Fatalf("expected the disabled policy line when no enabled destination has a limit, got: %s", buf.String())
 	}
 }
 
@@ -188,7 +203,7 @@ func TestApplyStorageStatsSimplePrimary(t *testing.T) {
 	storageStats := &storage.StorageStats{TotalBackups: 3, AvailableSpace: 100, UsedSpace: 80, TotalSpace: 200}
 	retentionCfg := storage.RetentionConfig{Policy: "simple", MaxBackups: 5}
 
-	adapter.applyStorageStats(storageStats, retentionCfg, stats)
+	adapter.applyStorageStats(storageStats, retentionCfg, -1, stats)
 
 	if stats.LocalBackups != 3 || stats.LocalFreeSpace != 100 || stats.LocalUsedSpace != 80 || stats.LocalTotalSpace != 200 {
 		t.Fatalf("local stats not set correctly: %+v", stats)
@@ -216,13 +231,22 @@ func TestApplyStorageStatsGFSPrimary(t *testing.T) {
 	storageStats := &storage.StorageStats{TotalBackups: len(backups), AvailableSpace: 500, UsedSpace: 400, TotalSpace: 1000}
 	retentionCfg := storage.RetentionConfig{Policy: "gfs", Daily: 1, Weekly: 1, Monthly: 1, Yearly: 1}
 
-	adapter.applyStorageStats(storageStats, retentionCfg, stats)
+	adapter.applyStorageStats(storageStats, retentionCfg, -1, stats)
 
 	if stats.LocalBackups != len(backups) {
 		t.Fatalf("LocalBackups = %d, want %d", stats.LocalBackups, len(backups))
 	}
-	if stats.LocalGFSCurrentDaily == 0 || stats.LocalGFSCurrentWeekly == 0 || stats.LocalGFSCurrentMonthly == 0 || stats.LocalGFSCurrentYearly == 0 {
-		t.Fatalf("GFS counters not populated: %+v", stats)
+	// The "current" GFS tier counters this used to assert on are gone. They were
+	// classified from a second unscoped listing, so on a shared location they
+	// described every host's archives while retention only moved this host's between
+	// tiers, and nothing ever rendered them: no template, no Telegram body, no
+	// webhook payload. Deleting them also removed a full extra listing per backend
+	// per run under GFS, an extra rclone lsl on cloud. The configured limits below
+	// are still pinned, but be clear about why: nothing renders them either, so this
+	// pins the plumbing rather than anything an operator sees. They are kept because
+	// they are cheap and already correct, not because they are displayed.
+	if stats.LocalGFSDaily != 1 || stats.LocalGFSWeekly != 1 || stats.LocalGFSMonthly != 1 || stats.LocalGFSYearly != 1 {
+		t.Fatalf("GFS limits not populated: %+v", stats)
 	}
 	if stats.LocalRetentionPolicy != "gfs" {
 		t.Fatalf("LocalRetentionPolicy = %q, want gfs", stats.LocalRetentionPolicy)
@@ -238,7 +262,7 @@ func TestApplyStorageStatsSimpleSecondaryUsesUsedSpace(t *testing.T) {
 	storageStats := &storage.StorageStats{TotalBackups: 4, AvailableSpace: 300, UsedSpace: 700, TotalSpace: 1000}
 	retentionCfg := storage.RetentionConfig{Policy: "simple", MaxBackups: 7}
 
-	adapter.applyStorageStats(storageStats, retentionCfg, stats)
+	adapter.applyStorageStats(storageStats, retentionCfg, -1, stats)
 
 	if !stats.SecondaryEnabled {
 		t.Fatalf("SecondaryEnabled = false, want true")
@@ -278,16 +302,13 @@ func TestSetAndFinalizeStorageStatus(t *testing.T) {
 	}
 }
 
-func TestSplitExportCategoriesAndRedirectCluster(t *testing.T) {
-	categories := []Category{
+func TestRedirectClusterCategoryToExport_WithExistingExport(t *testing.T) {
+	normal := []Category{
 		{ID: "pve_cluster", ExportOnly: false},
 		{ID: "network", ExportOnly: false},
-		{ID: "pve_config_export", ExportOnly: true},
 	}
-
-	normal, export := splitExportCategories(categories)
-	if len(normal) != 2 || len(export) != 1 {
-		t.Fatalf("unexpected split result normal=%d export=%d", len(normal), len(export))
+	export := []Category{
+		{ID: "pve_config_export", ExportOnly: true},
 	}
 
 	normal2, export2 := redirectClusterCategoryToExport(normal, export)
@@ -315,9 +336,6 @@ func TestExportDestRootAndHelpers(t *testing.T) {
 	}
 	if got := shortHost("hostname"); got != "hostname" {
 		t.Fatalf("shortHost no dot = %q, want hostname", got)
-	}
-	if got := sanitizeID("stor@ge-1.*"); got != "stor_ge-1__" {
-		t.Fatalf("sanitizeID = %q, want stor_ge-1__", got)
 	}
 }
 
@@ -749,7 +767,7 @@ func TestDispatchNotificationsUsesNameMappingNotRegistrationOrder(t *testing.T) 
 	}
 }
 
-func TestDispatchPostBackupSnapshotsIssuesImmediatelyBeforeNotifications(t *testing.T) {
+func TestFinalizeAfterRunSnapshotsIssuesImmediatelyBeforeNotifications(t *testing.T) {
 	logger := logging.New(types.LogLevelInfo, false)
 	var buf bytes.Buffer
 	logger.SetOutput(&buf)
@@ -789,9 +807,10 @@ func TestDispatchPostBackupSnapshotsIssuesImmediatelyBeforeNotifications(t *test
 		TelegramStatus:   "unknown",
 	}
 
-	if err := o.dispatchPostBackup(context.Background(), stats); err != nil {
-		t.Fatalf("dispatchPostBackup returned error: %v", err)
+	if err := o.syncStorageTargets(context.Background(), stats); err != nil {
+		t.Fatalf("syncStorageTargets returned error: %v", err)
 	}
+	o.FinalizeAfterRun(context.Background(), stats)
 
 	if !email.called || !telegram.called {
 		t.Fatalf("expected both notifiers to be called (email=%v telegram=%v)", email.called, telegram.called)
@@ -1575,22 +1594,9 @@ func TestApplyStorageStatsCloud(t *testing.T) {
 	stats := &BackupStats{}
 	storageStats := &storage.StorageStats{TotalBackups: 2}
 	retentionCfg := storage.RetentionConfig{Policy: "gfs", Daily: 1}
-	adapter.applyStorageStats(storageStats, retentionCfg, stats)
+	adapter.applyStorageStats(storageStats, retentionCfg, -1, stats)
 	if stats.CloudBackups != 2 || stats.CloudRetentionPolicy != "gfs" {
 		t.Fatalf("cloud stats not populated correctly: %+v", stats)
-	}
-}
-
-func TestFileExistsHelper(t *testing.T) {
-	tmp := filepath.Join(t.TempDir(), "file.txt")
-	if fileExists(tmp) {
-		t.Fatalf("file should not exist yet")
-	}
-	if err := os.WriteFile(tmp, []byte("x"), 0o600); err != nil {
-		t.Fatalf("write file: %v", err)
-	}
-	if !fileExists(tmp) {
-		t.Fatalf("fileExists should return true for existing file")
 	}
 }
 
@@ -1732,17 +1738,55 @@ func TestDispatchNotificationsAndLogsSkipsWithNoLog(t *testing.T) {
 	stats := &BackupStats{SecondaryEnabled: false, CloudEnabled: false}
 	orch.dispatchNotificationsAndLogs(context.Background(), stats)
 
-	if !strings.Contains(buf.String(), "Secondary Storage: disabled") || !strings.Contains(buf.String(), "Cloud Storage: disabled") {
+	// The SKIP lines of the disabled storage tiers close step [6] now, not step [7].
+	if strings.Contains(buf.String(), "Storage: disabled") {
+		t.Fatalf("the storage SKIP lines must not be printed by the notification phase, got: %s", buf.String())
+	}
+
+	buf.Reset()
+	orch.logDisabledStorageTargets(stats)
+	if !strings.Contains(buf.String(), "SKIP     Secondary Storage: disabled\n") || !strings.Contains(buf.String(), "SKIP     Cloud Storage: disabled\n") {
 		t.Fatalf("expected skip logs for disabled storage, got: %s", buf.String())
 	}
 }
 
-func TestCheckSystemRequirementsNoPanic(t *testing.T) {
-	// manifest nil
-	CheckSystemRequirements(nil)
-	// just ensure no panic
+// An Email channel that failed to initialize with no delivery method configured names
+// the default method in its warning.
+func TestDispatchNotificationsNamesTheDefaultEmailMethod(t *testing.T) {
+	logger := logging.New(types.LogLevelInfo, false)
+	var buf bytes.Buffer
+	logger.SetOutput(&buf)
+	o := &Orchestrator{logger: logger, cfg: &config.Config{EmailEnabled: true}}
 
-	manifest := &backup.Manifest{ProxmoxType: "pbs", Hostname: "pbs-node"}
-	CheckSystemRequirements(manifest)
-	// no specific assertions; just ensure call succeeds
+	o.dispatchNotifications(context.Background(), &BackupStats{})
+
+	if want := `EMAIL_DELIVERY_METHOD="relay"`; !strings.Contains(buf.String(), want) {
+		t.Fatalf("log missing %q:\n%s", want, buf.String())
+	}
+}
+
+// A blank compression mode is stored as "standard".
+func TestSetBackupConfigDefaultsABlankCompressionMode(t *testing.T) {
+	o := &Orchestrator{}
+	o.SetBackupConfig(t.TempDir(), t.TempDir(), types.CompressionNone, 0, 0, " ", nil)
+	if o.compressionMode != "standard" {
+		t.Fatalf("compressionMode = %q, want %q", o.compressionMode, "standard")
+	}
+}
+
+// Stats without a version record the placeholder version 0.0.0.
+func TestWriteBackupMetadataDefaultsABlankVersion(t *testing.T) {
+	o := &Orchestrator{logger: logging.New(types.LogLevelError, false)}
+	tempDir := t.TempDir()
+
+	if err := o.writeBackupMetadata(tempDir, &BackupStats{ProxmoxType: types.ProxmoxVE, Hostname: "host1"}); err != nil {
+		t.Fatalf("writeBackupMetadata error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(tempDir, "var/lib/proxsave-info/backup_metadata.txt"))
+	if err != nil {
+		t.Fatalf("failed reading metadata: %v", err)
+	}
+	if !strings.Contains(string(data), "VERSION=0.0.0\n") {
+		t.Fatalf("metadata missing VERSION=0.0.0:\n%s", data)
+	}
 }

@@ -1,5 +1,7 @@
 # Security
 
+For operational instructions, use [encryption](ENCRYPTION.md), [release verification](PROVENANCE_VERIFICATION.md) and [support preparation](TROUBLESHOOTING.md#getting-help). This reference explains the implementation boundaries behind those procedures
+
 This document describes the ProxSave runtime security model: the trust boundary,
 how external commands are executed, the preflight checks, and the layers that keep
 secrets and untrusted data from doing harm. For the notification and relay security
@@ -29,7 +31,9 @@ The interesting boundaries are the few places where **untrusted content** enters
 - **Release artifacts.** `install.sh` and `proxsave --upgrade` check the detached ECDSA
   P-256 signature over `SHA256SUMS` against a public key pinned in the tool itself, then
   check the downloaded archive's SHA256 against that authenticated list. A missing or
-  invalid signature aborts. That is the **download** path only: `proxsave --upgrade
+  invalid signature aborts. The dashboard's **Upgrade** > **Check upgrade** row runs that
+  same `--upgrade` code in-session, so it is the same check, not a second one. That is the
+  **download** path only: `proxsave --upgrade
   --localfile` skips the release check and the download, so it verifies nothing at all and
   just finalizes around the binary already on disk. Every release also publishes SLSA build
   provenance, but that
@@ -37,12 +41,94 @@ The interesting boundaries are the few places where **untrusted content** enters
   step with the GitHub CLI (see
   [PROVENANCE_VERIFICATION.md](PROVENANCE_VERIFICATION.md)).
 
+**Which binary runs the upgrade.** An in-place `proxsave --upgrade`, including the
+dashboard row, is executed by the binary already on the host: the release check, the
+download, the signature and checksum verification and the install are all the OLD
+release's code. That is deliberate for the verification itself, since a downloaded binary
+cannot be the party that verifies itself. Only the post-install **finalize** phase (the
+config merge, the daemon migration, the footer) is handed to the freshly installed binary
+through the internal `--upgrade-finalize` flag, and only when both ends are new enough: a
+host whose current binary predates that split does the finalize itself, and so does one
+whose freshly installed binary will not start as a child. So a fix to the upgrade flow
+shipped in a new release cannot help a host upgrading from an older one. The externally
+fetched route downloads and swaps the binary first, then runs the finalize on the new one:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/tis24dev/proxsave/main/install.sh)" -- --upgrade
+```
+
+Use it when a release note says the upgrade path itself changed.
+
 ## Execution model
 
 Every external process ProxSave runs goes through `internal/safeexec`, which builds argv
-directly and never wraps a caller's command in a shell. The single exception is the resident
-daemon's backup child (see **Self re-execution** below), which re-execs the running binary
-with a raw `exec.CommandContext` under a documented `#nosec G204`, bypassing the allowlist.
+directly and never wraps a caller's command in a shell. There are two exceptions, both in the resident
+daemon and both under a documented `#nosec G204` that bypasses the allowlist. The first is the
+daemon's backup child (see **Self re-execution** below), which re-execs the running binary. The
+second is the operator's own `PERSONAL_SCRIPT_PRE_RUN` and `PERSONAL_SCRIPT_POST_RUN`
+(`cmd/proxsave/personal_scripts.go`), read from the root-owned `backup.env` and executed
+directly: no shell, no arguments, the daemon's own environment minus `LOG_FILE` and `BASE_DIR`
+and nothing added to it, every descriptor on `/dev/null`, a
+hard `SIGKILL` at 10 minutes for the script process itself, and an exit status that is
+discarded. That kill reaches one pid: anything the script forks and leaves running survives it,
+and is collected only when the unit's cgroup is torn down, since the unit keeps systemd's
+default `KillMode=control-group`. The 10-minute kill holds on every path but one: on the
+abandoned-child unwind the daemon exits immediately so systemd can restart it, so there the
+post-run script is started and left to the cgroup instead of being waited for and killed (see
+[DAEMON.md](DAEMON.md)). The allowlist is for the
+external tools ProxSave itself drives; the scripts instead pass a trusted-path gate at daemon
+startup (`validatePersonalScripts`). The path may not traverse a symlink. The script target
+itself must belong to root or the daemon's own UID, must be executable, and must not be writable
+by group or others. A group/other-writable directory must carry the sticky bit.
+
+Root can traverse a UID-1000 mode-0700 home; that home therefore does not need to be renamed or
+made root-owned. ProxSave intentionally accepts a foreign-owned, non-loosely-writable ancestor
+selected in root-owned configuration. This is an explicit administrator trust decision, not a
+claim that the path is immutable: the ancestor owner can replace descendants that the daemon
+later executes with daemon privileges. The target itself remains root/daemon-owned and
+non-loosely-writable. This shape is `READY WITH WARNING`, remains enabled, and produces one
+startup warning per advisory setting. A symlink, unsafe target, or loosely writable non-sticky
+ancestor is `REFUSED`, blanked for that daemon, and produces one startup warning per refused
+setting, so neither policy result becomes silent non-execution.
+
+An administrator who wants the advisory gone has two options beyond moving the script, and they
+differ in what they change. A **hard link** of the script into a root-owned directory removes the
+cause: the ancestor chain becomes root-owned and the inode is still one the other user cannot
+modify. A **bind mount** of the user-owned directory onto a root-owned mountpoint removes only
+the advisory: `filepath.EvalSymlinks` does not see a bind mount, so the chain the gate reads is
+the mountpoint's while the real directory stays writable by its owner. Neither touches the per-run
+gate below, which is where the actual protection lives, so masking the chain costs the operator
+the statement of the risk and nothing else. Chowning a user home to root is not one of the
+options: root already traverses a mode-0700 home, which is the reason the shape is accepted.
+
+**What actually holds the accepted ancestor, and what it rests on.** The startup gate is a
+DIAGNOSTIC; it is not what protects the interval between startup and a run. Every invocation goes
+through a second gate (`openPersonalScriptForExecution`), silent when it passes: the final component is opened
+with `O_NOFOLLOW`, the OPENED INODE is then checked for regular/executable/not group- or
+other-writable/owned by root or the daemon UID, and the child execs `/proc/self/fd/3`, so
+replacing the pathname after the check cannot change the inode that runs. That gate is the reason
+a foreign-owned ancestor can be accepted at all.
+
+Its whole strength is the ownership check, and that check has exactly one bypass: the ancestor's
+owner cannot `chown` a file to root, but they could **hard-link** an existing root-owned
+executable into the name the daemon runs. `fs.protected_hardlinks=1` forbids linking a file the
+linker neither owns nor can write, and it is the kernel default on Proxmox VE; with it set to `0`
+the ownership check stops nothing and the trust decision has no mitigation behind it. The startup
+advisory therefore names the setting's current value alongside the ownership warning, so the
+operator sees the dependency rather than inferring it. Two limits are worth stating plainly: the
+per-run gate opens through `safefs.OpenFileUnderRoot`, which roots at the PARENT directory and so
+guards only the final component - an ancestor owner can still swap an intermediate directory for a
+symlink, they just cannot make a non-root-owned file pass - and the check is repeated per run, not
+held, so it proves what the inode was at exec time and nothing about later runs.
+
+**A per-run refusal is reported.** The gate is silent about what the script does and loud about
+ProxSave's own decision not to start it: a refusal writes one `WARNING` to the daemon's log
+naming the variable and the specific reason (`PERSONAL_SCRIPT_PRE_RUN was not started for this
+run: ...`). This closes the gap the startup warning could not: a file replaced after startup with
+one the gate will not run left the daemon knowing the script had not run while the operator saw
+an ordinary successful backup. The script's own output, exit code and timeout kill are still
+discarded, and the line lands in the daemon's log rather than the run's, so no recap,
+notification, healthchecks ping or metric is affected.
 Several callers do invoke `/bin/sh`
 on purpose, but only one of them puts shell **text** on a command line: the background
 rollback timer runs `sh -c '<compile-time constant>'` and passes the sleep seconds and the
@@ -54,13 +140,15 @@ on a command line (see **Generated rollback scripts** below).
   to be an exact key in a static, package-level allowlist (76 literal command names
   today). Each entry builds `exec.CommandContext(ctx, "<literal>")` with the binary name
   hard-coded and appends the caller's arguments as argv, with no metacharacter
-  interpretation. `CombinedOutput` and `Output` wrap the same gate.
+  interpretation.
 - **Name validation.** Before the allowlist lookup, a name that is empty, has leading or
   trailing whitespace, or contains a path separator (`/` or `\`) is rejected with
   `command not allowed` (`ErrCommandNotAllowed`). A name not in the allowlist is rejected
   the same way.
-- **`/proc` access is narrowed.** `ProcPath(pid, leaf)` only permits the leaves `comm`,
-  `status`, and `exe`, so an arbitrary `/proc` path can never be constructed.
+- **`/proc` access goes through one process directory.** `OpenProcDir(pid)` accepts
+  only a positive pid and opens `/proc/<pid>` as an `os.Root`; the one caller reads
+  `comm`, `status` and the `exe` link through that handle, so the three values come
+  from the same process.
 - **The allowlist includes `sh`**, along with `cat` and `tail`. Those two take an ordinary
   argv, which carries no metacharacter interpretation. `cat` is the one that takes a
   computed path (`cat <SYSTEM_ROOT_PREFIX>/proc/cmdline`); the single non-test `tail` call
@@ -90,13 +178,13 @@ a `nohup` background timer when `systemd-run` is unavailable **or its invocation
 only the network flow also has an immediate path that runs its script inline. Each script embeds three runtime values, the
 log path, the marker path, and the rollback archive path (the access-control script adds
 five compile-time `/etc/pve` target paths). None of them is operator, backup, or server
-input: the three runtime values are composed from a fixed `/tmp/proxsave` base, a
-compile-time prefix, and a timestamp. **That provenance is the guarantee.** A `shellQuote`
-helper is applied on the way in, but it only quotes a value containing whitespace or one of
-`"'\$&;|<>`, so in practice every one of these paths is emitted verbatim, and its trigger
-set omits the backtick, the glob characters `*` `?` `[` `]`, the grouping `(` `)`, the
-comment `#`, tilde expansion `~` and brace expansion `{` `}`. Treat it as incidental, not as
-the control.
+input: the three runtime values are composed from a fixed base (`/tmp/proxsave` for the
+marker, the restore's own `<BASE_DIR>/restore/<timestamp>` for the log and the rollback
+archive), a compile-time prefix, and a timestamp. Each script creates its log `0600` in a
+subshell (`umask 077`), so the umask of the rest of the script, and of what it runs, is
+unchanged. **That provenance is the guarantee.** A `shellQuote`
+helper single-quotes each value on the way in (an embedded `'` is written as `'\''`), so no
+character of it is read as shell syntax. It is a second layer, not the control.
 
 ## Security preflight
 
@@ -109,7 +197,8 @@ each need a second key of their own; and finally, always, the suspicious-process
 
 The resident daemon and the `--daemon-*` admin commands are dispatched before it and skip it
 (each supervised backup child runs its own). The same preflight also runs once at the end of
-`--install` and `--upgrade`, but there the gates are **overridden in code**:
+`--install` and `--upgrade`, which is also what the dashboard's **Install** and **Upgrade**
+rows run, but there the gates are **overridden in code**:
 `SECURITY_CHECK_ENABLED`, `AUTO_FIX_PERMISSIONS` and `CONTINUE_ON_SECURITY_ISSUES` are all
 forced to `true`, and the network block is forced off. So an upgrade runs the preflight and
 auto-fixes modes and ownership even on a host where you turned both off, and it can never
@@ -125,8 +214,12 @@ but a group- or world-writable executable is flagged and, on auto-fix, narrowed 
 ever widening.
 
 **Permissions and ownership.** Sensitive files are enforced at `0600` (the config file,
-`identity/.server_identity`, the AGE recipient file, and every `secure_account/*.json`),
-directories at `0700`/`0755`, all owned `root:root`. The exception is `BACKUP_PATH`,
+`identity/.server_identity`, the AGE recipient file, every `secure_account/*.json`, and
+the PBS token files when they exist: `secure_account/pbs_token`,
+`secure_account/pbs_api_token` and `/root/.pbs-token`),
+directories at `0700`/`0755`, all owned `root:root`. `SECONDARY_PATH` and
+`SECONDARY_LOG_PATH` are checked, and created when missing, only when
+`SECONDARY_ENABLED=true`. The exception is `BACKUP_PATH`,
 `LOG_PATH`, `SECONDARY_PATH` and `SECONDARY_LOG_PATH`: their owner **and** mode checks are
 skipped entirely when `SET_BACKUP_PERMISSIONS=true` (see below) or when the path sits on a
 filesystem without Unix ownership. With `AUTO_FIX_PERMISSIONS`
@@ -175,21 +268,28 @@ aborts the run rather than letting it proceed on an unverified binary or config.
 The bound is per syscall and it does not cover the whole preflight. Once the executable is
 open, the fstat on it and the SHA256 read of the entire binary are raw unbounded calls, and
 inside the private-key scan the directory walk is bounded but the per-file open and read
-are not. A mount that goes stale inside one of those windows still wedges the preflight, and
-**the daemon watchdog does not save you there**. A child that merely overruns
-`MAX_RUN_DURATION` gets `SIGTERM`, then `SIGKILL` after a 30s grace, and is reported as a
-hang. A child stuck in uninterruptible sleep is not reported at all: the daemon reports only
-after the child is reaped, and a D-state process is never reaped, so the daemon blocks in the
-same wedge and stops scheduling. Only the monitor's silence on the missing finish ping
-catches that case (see [DAEMON.md](DAEMON.md)). The daemon also supervises `--backup`
-children only, so a restore, a manual run, or a dashboard "run now" has no watchdog at all.
+are not. A mount that goes stale inside one of those windows can still wedge the preflight.
+For a supervised child, the daemon applies `MAX_RUN_DURATION`, sends `SIGTERM`, then
+`SIGKILL` after the grace period, and bounds the final reap wait. If the child still cannot
+be reaped, the daemon reports abandonment, persists the orphan's identity and exits for
+systemd to restart it. The restarted daemon retains the degraded monitoring state while
+that orphan remains. This reports the outage; it cannot repair the mount or kill a task
+stuck in kernel I/O. See the [D-state caveat](DAEMON.md#caveat-uninterruptible-sleep-d-state)
+for the timeout sequence and recovery conditions. The daemon supervises `--backup`
+children only, so a restore, a manual run, or a dashboard **Backup** has no watchdog at all
+(the dashboard backup is not a daemon child: it runs in the same process as the menu, which
+keeps its session open and hands it to the run).
 `FS_IO_TIMEOUT=0` disables bounding everywhere.
 
-**Preflight configuration keys** (`backup.env`):
+**Preflight configuration keys** (`backup.env`). None of these are fields in the install
+wizard, so the dashboard cannot set them: edit `backup.env` directly. What the dashboard
+does offer for the config file is **Upgrade** > **Check config**, which merges keys the
+shipped template has and your file does not (the same operation as `--upgrade-config`), so
+a key added by a newer release appears with its default instead of staying absent.
 
 | Key | Default | Effect |
 |-----|---------|--------|
-| `SECURITY_CHECK_ENABLED` | `true` | run the preflight (legacy alias `FULL_SECURITY_CHECK`) |
+| `SECURITY_CHECK_ENABLED` | `true` | run the preflight |
 | `AUTO_FIX_PERMISSIONS` | `true` | auto-correct mode/owner (never on a symlink) |
 | `AUTO_UPDATE_HASHES` | `true` | create/refresh the `<exe>.md5` integrity hash |
 | `CONTINUE_ON_SECURITY_ISSUES` | `false` | if false, a security error aborts the run |
@@ -199,15 +299,19 @@ children only, so a restore, a manual run, or a dashboard "run now" has no watch
 | `CHECK_OPEN_PORTS` | `false` | run the suspicious-port check (needs `CHECK_NETWORK_SECURITY` too) |
 | `SUSPICIOUS_PORTS` | built-in list | ports the suspicious-port check flags; read by that check only |
 | `PORT_WHITELIST` | _(empty)_ | `program:port` pairs exempted from the suspicious-port warning |
-| `SET_BACKUP_PERMISSIONS` | `false` | when true, the run chowns the backup/log dirs to `BACKUP_USER:BACKUP_GROUP`, and the preflight then skips their owner **and mode** checks |
+| `SET_BACKUP_PERMISSIONS` | `false` | when true, the run chowns the backup/log dirs to `BACKUP_USER:BACKUP_GROUP`, opens the backup files to that group (`0640`), and the preflight then skips the dirs' owner **and mode** checks |
 
 `SET_BACKUP_PERMISSIONS` is not a passive opt-out. When it is true, every run walks
-`BACKUP_PATH`, `LOG_PATH`, `SECONDARY_PATH` and `SECONDARY_LOG_PATH` **recursively, before
-the preflight**, sets every entry to `BACKUP_USER:BACKUP_GROUP`, and sets directories to
-`0750`; files keep their mode. `--install` and `--upgrade` never reach that pre-preflight
-pass, because they are dispatched before the runtime is built; the finalization pass at the
-end of each is the only one they run, and it forces the mutation: it hardcodes
-`dryRun=false`, so `DRY_RUN=true` does not hold the recursive chown back there.
+`BACKUP_PATH` and `LOG_PATH`, plus `SECONDARY_PATH` and `SECONDARY_LOG_PATH` when
+`SECONDARY_ENABLED=true`, **recursively, before the preflight**, sets every entry to `BACKUP_USER:BACKUP_GROUP`, sets directories to
+`0750` and the files of a backup set (the archive or bundle and its `.sha256`, `.metadata`
+and `.manifest.json`) to `0640`; every other file, logs included, keeps its mode. The
+storage step of the same run then gives the backup it has just written on `BACKUP_PATH`
+and `SECONDARY_PATH` the same owner and `0640`, so the group can read the current run's
+backup, not only the ones earlier runs left. `--install` and `--upgrade` never reach that
+pre-preflight pass, because they are dispatched before the runtime is built; the
+finalization pass at the end of each is the only one they run, and it forces the mutation:
+it hardcodes `dryRun=false`, so `DRY_RUN=true` does not hold the recursive chown back there.
 
 The preflight skip is keyed on the **flag alone**, not on the chown having succeeded:
 whenever `SET_BACKUP_PERMISSIONS=true`, those four paths are skipped entirely, the mode
@@ -220,6 +324,19 @@ That last case is the common one on a `SECONDARY_PATH` whose mount is not up yet
 preflight then creates the directory itself at `0755` `root:root` and skips it, so the run
 ends with a root-owned directory and no warning. In each of these cases the ownership stays
 as it was **and** the check that would have flagged it is off.
+
+**Backup file modes.** Every file of a backup set on `BACKUP_PATH` and `SECONDARY_PATH`
+(the archive or bundle, `.sha256`, `.metadata`, `.manifest.json`) is created `0600` and
+stored `root:root` `0600`: only root can read a backup. Group read is opt-in: it takes
+`SET_BACKUP_PERMISSIONS=true` with both `BACKUP_USER` and `BACKUP_GROUP` set and resolvable,
+and then those files are `0640` owned by `BACKUP_USER:BACKUP_GROUP`. Turning
+`SET_BACKUP_PERMISSIONS` off later does not narrow the files already at `0640`: they stay
+as they are until retention removes them, while new backups are `0600` `root:root` again.
+On a filesystem without Unix ownership (CIFS/SMB, NTFS, FAT, FUSE) no owner or mode is
+applied after creation, so the mount options decide. The preflight never checks the files
+inside these directories, so neither mode raises a warning or an `AUTO_FIX_PERMISSIONS`
+change. Cloud copies are outside all of this: their mode is whatever the rclone backend
+gives them.
 
 Ownership is applied with `lchown`, so a symlink is never followed out of the backup tree,
 and no failure aborts the run. Only the per-path failures warn (an empty or unresolvable
@@ -291,7 +408,7 @@ MS_NOSUID | MS_NOEXEC`), so nothing can write into the root filesystem while the
 storage is missing. Only mountpoints under `/mnt/`, `/media/`, or `/run/media/` are
 eligible, and the target is resolved through symlinks and re-checked against that
 allowlist **before** any `mkdir` or `mount`, closing a parent-component symlink escape.
-Guards live under `/var/lib/proxsave/guards`; a bind guard is shadowed by the real mount
+Guards live under `<BASE_DIR>/guards` (`/opt/proxsave/guards` by default; `--cleanup-guards` also clears the ones older versions left in `/var/lib/proxsave/guards`); a bind guard is shadowed by the real mount
 when it returns and is discarded on reboot. Legacy immutable (`chattr +i`) fallbacks are
 recorded in a `0600` index so `proxsave --cleanup-guards` can clear exactly those. See
 [RESTORE_TECHNICAL.md](RESTORE_TECHNICAL.md) and
@@ -312,8 +429,8 @@ CI runs gosec (`.github/workflows/security-ultimate.yml`). Three rules deserve a
 - **G101** ("potential hardcoded credentials"): **kept enabled**. With one intentional
   exception (below), every current finding is a **name-only false positive**: a constant
   whose name matches `token`/`secret`/`salt` but whose value is a file path
-  (`/etc/pve/priv/token.cfg`), a KDF domain-separation salt (public by construction), a
-  token *name* (`backup@pbs!go-client`, not its secret), or an enum id
+  (`/etc/pve/priv/token.cfg`), a KDF domain-separation salt (public by construction),
+  or an enum id
   (`pbs_runtime_access_user_tokens`). These are dismissed as false positives rather than
   renamed, since the names are correct as written.
 

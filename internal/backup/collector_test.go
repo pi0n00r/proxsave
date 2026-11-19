@@ -1,7 +1,6 @@
 package backup
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -32,6 +31,26 @@ func (fi testFileInfo) Mode() os.FileMode  { return fi.mode }
 func (fi testFileInfo) ModTime() time.Time { return fi.modTime }
 func (fi testFileInfo) IsDir() bool        { return fi.isDir }
 func (fi testFileInfo) Sys() any           { return fi.sys }
+
+// NewCollector creates a new backup collector
+func NewCollector(logger *logging.Logger, config *CollectorConfig, tempDir string, proxType types.ProxmoxType, dryRun bool) *Collector {
+	return NewCollectorWithDeps(logger, config, tempDir, proxType, dryRun, defaultCollectorDeps())
+}
+
+// defaultCollectorDeps leaves the command hooks nil on purpose. The Collector already
+// falls back to the package-level runners when a hook is unset, so nil here means the
+// split-stream runner is used by default while a caller that overrides only RunCommand
+// still has its override honoured.
+func defaultCollectorDeps() CollectorDeps {
+	return CollectorDeps{
+		LookPath: func(name string) (string, error) {
+			return execLookPath(name)
+		},
+		Stat: func(path string) (os.FileInfo, error) {
+			return statFunc(path)
+		},
+	}
+}
 
 func TestNewCollector(t *testing.T) {
 	logger := logging.New(types.LogLevelInfo, false)
@@ -405,9 +424,16 @@ func TestCollectorDryRun(t *testing.T) {
 	}
 }
 
+// The collection runs on a fake root, never on the host that runs the tests: on the real
+// one it copies every /home/<user> whole, which on a CI runner is the checkout, the Go
+// module and build caches and the image's toolchains. Three tests doing that took the
+// race job past its 10-minute package timeout.
 func TestCollectSystemInfo(t *testing.T) {
 	logger := logging.New(types.LogLevelInfo, false)
 	config := GetDefaultCollectorConfig()
+	config.SystemRootPrefix = t.TempDir()
+	writeRootFile(t, config.SystemRootPrefix, "etc/os-release", "ID=debian\nVERSION_ID=\"13\"\n", 0o644)
+	writeRootFile(t, config.SystemRootPrefix, "home/admin/.bashrc", "# test\n", 0o644)
 	tempDir := t.TempDir()
 
 	collector := NewCollector(logger, config, tempDir, types.ProxmoxUnknown, false)
@@ -456,7 +482,6 @@ func TestCollectSystemInfoWithCustomRootPrefix(t *testing.T) {
 	deps := defaultCollectorDeps()
 	deps.LookPath = func(string) (string, error) { return "/bin/true", nil }
 	deps.RunCommand = func(context.Context, string, ...string) ([]byte, error) { return []byte("stub"), nil }
-	deps.RunCommandWithEnv = func(context.Context, []string, string, ...string) ([]byte, error) { return []byte("stub"), nil }
 
 	collector := NewCollectorWithDeps(logger, cfg, tempDir, types.ProxmoxUnknown, false, deps)
 
@@ -532,35 +557,12 @@ func TestCollectorShouldExcludePatterns(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			result := collector.shouldExclude(tc.path)
 			if result != tc.expected {
 				t.Fatalf("shouldExclude(%s) = %v, want %v", tc.path, result, tc.expected)
 			}
 		})
-	}
-}
-
-func TestSummarizeCommandOutput(t *testing.T) {
-	var buf bytes.Buffer
-	if got := summarizeCommandOutput(&buf); got != "(no stdout/stderr)" {
-		t.Fatalf("empty buffer summary = %q", got)
-	}
-
-	buf.WriteString("line1\nline2")
-	if got := summarizeCommandOutput(&buf); got != "line1 | line2" {
-		t.Fatalf("summary unexpected: %q", got)
-	}
-
-	buf.Reset()
-	buf.WriteString(strings.Repeat("x", 2100))
-	summary := summarizeCommandOutput(&buf)
-	if !strings.HasSuffix(summary, "…") {
-		t.Fatalf("expected summary to end with ellipsis, got %q", summary[len(summary)-1:])
-	}
-	if len([]rune(summary)) != 2049 {
-		t.Fatalf("expected rune length 2049, got %d", len([]rune(summary)))
 	}
 }
 
@@ -899,11 +901,9 @@ func TestSafeCopyFile_SkipsNonRegularFIFO(t *testing.T) {
 func TestCollectorDepsFallbacksToGlobalFunctions(t *testing.T) {
 	origLookPath := execLookPath
 	origRun := runCommand
-	origRunWithEnv := runCommandWithEnv
 	t.Cleanup(func() {
 		execLookPath = origLookPath
 		runCommand = origRun
-		runCommandWithEnv = origRunWithEnv
 	})
 
 	execLookPath = func(name string) (string, error) {
@@ -920,16 +920,6 @@ func TestCollectorDepsFallbacksToGlobalFunctions(t *testing.T) {
 		return []byte("ok"), nil
 	}
 
-	runCommandWithEnv = func(ctx context.Context, extraEnv []string, name string, args ...string) ([]byte, error) {
-		if name != "cmd-env" || len(args) != 1 || args[0] != "x" {
-			return nil, errors.New("unexpected args")
-		}
-		if len(extraEnv) != 2 || extraEnv[0] != "A=1" || extraEnv[1] != "B=2" {
-			return nil, errors.New("unexpected env")
-		}
-		return []byte("env-ok"), nil
-	}
-
 	logger := logging.New(types.LogLevelError, false)
 	cfg := GetDefaultCollectorConfig()
 	tmp := t.TempDir()
@@ -943,11 +933,6 @@ func TestCollectorDepsFallbacksToGlobalFunctions(t *testing.T) {
 	out, err := c.depRunCommand(context.Background(), "cmd", "a", "b")
 	if err != nil || string(out) != "ok" {
 		t.Fatalf("depRunCommand fallback failed: out=%q err=%v", string(out), err)
-	}
-
-	out, err = c.depRunCommandWithEnv(context.Background(), []string{"A=1", "B=2"}, "cmd-env", "x")
-	if err != nil || string(out) != "env-ok" {
-		t.Fatalf("depRunCommandWithEnv fallback failed: out=%q err=%v", string(out), err)
 	}
 }
 

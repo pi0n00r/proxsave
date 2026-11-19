@@ -147,8 +147,8 @@ func TestResetInstallBaseDirPreservesCoreDirectories(t *testing.T) {
 	}
 
 	logger := logging.NewBootstrapLogger()
-	if err := resetInstallBaseDir(base, logger); err != nil {
-		t.Fatalf("resetInstallBaseDir returned error: %v", err)
+	if err := resetInstallBaseDirWithContext(context.Background(), base, logger); err != nil {
+		t.Fatalf("resetInstallBaseDirWithContext returned error: %v", err)
 	}
 
 	if _, err := os.Stat(filepath.Join(base, "delete.txt")); !os.IsNotExist(err) {
@@ -194,8 +194,8 @@ func TestResetInstallBaseDirRespectsSharedPreserveSet(t *testing.T) {
 	}
 
 	logger := logging.NewBootstrapLogger()
-	if err := resetInstallBaseDir(base, logger); err != nil {
-		t.Fatalf("resetInstallBaseDir returned error: %v", err)
+	if err := resetInstallBaseDirWithContext(context.Background(), base, logger); err != nil {
+		t.Fatalf("resetInstallBaseDirWithContext returned error: %v", err)
 	}
 
 	for _, entry := range newInstallPreservedEntries() {
@@ -225,8 +225,8 @@ func TestResetInstallBaseDirAllowsNilBootstrap(t *testing.T) {
 	}
 
 	captureStdout(t, func() {
-		if err := resetInstallBaseDir(base, nil); err != nil {
-			t.Fatalf("resetInstallBaseDir returned error: %v", err)
+		if err := resetInstallBaseDirWithContext(context.Background(), base, nil); err != nil {
+			t.Fatalf("resetInstallBaseDirWithContext returned error: %v", err)
 		}
 	})
 
@@ -240,7 +240,7 @@ func TestResetInstallBaseDirAllowsNilBootstrap(t *testing.T) {
 
 func TestResetInstallBaseDirRefusesRoot(t *testing.T) {
 	logger := logging.NewBootstrapLogger()
-	if err := resetInstallBaseDir("/", logger); err == nil {
+	if err := resetInstallBaseDirWithContext(context.Background(), "/", logger); err == nil {
 		t.Fatal("expected error when trying to reset root directory")
 	}
 }
@@ -356,12 +356,14 @@ func TestPromptSecondaryStorageEnabled(t *testing.T) {
 	}
 }
 
-func TestPromptSecondaryStorageEnabledWithEmptyLogPath(t *testing.T) {
+// With the secondary enabled an empty SECONDARY_LOG_PATH is refused: it made every
+// run warn and exit 1. The wizard asks again until a path is given.
+func TestPromptSecondaryStorageEnabledRefusesAnEmptyLogPath(t *testing.T) {
 	var enabled bool
 	var path, logPath string
 	var err error
 	ctx := context.Background()
-	reader := bufio.NewReader(strings.NewReader("y\n/mnt/secondary\n\n"))
+	reader := bufio.NewReader(strings.NewReader("y\n/mnt/secondary\n\n/mnt/secondary/log\n"))
 	captureStdout(t, func() {
 		enabled, path, logPath, err = promptSecondaryStorage(ctx, reader, installer.DeriveInstallWizardPrefill(""))
 	})
@@ -374,8 +376,8 @@ func TestPromptSecondaryStorageEnabledWithEmptyLogPath(t *testing.T) {
 	if path != "/mnt/secondary" {
 		t.Fatalf("secondary path = %q, want /mnt/secondary", path)
 	}
-	if logPath != "" {
-		t.Fatalf("secondary log path = %q, want empty", logPath)
+	if logPath != "/mnt/secondary/log" {
+		t.Fatalf("secondary log path = %q, want /mnt/secondary/log", logPath)
 	}
 }
 
@@ -383,7 +385,7 @@ func TestPromptSecondaryStorageRejectsInvalidBackupPath(t *testing.T) {
 	var path string
 	var err error
 	ctx := context.Background()
-	reader := bufio.NewReader(strings.NewReader("y\nrelative/path\n/mnt/secondary\n\n"))
+	reader := bufio.NewReader(strings.NewReader("y\nrelative/path\n/mnt/secondary\n/mnt/secondary/log\n"))
 	captureStdout(t, func() {
 		_, path, _, err = promptSecondaryStorage(ctx, reader, installer.DeriveInstallWizardPrefill(""))
 	})
@@ -399,15 +401,20 @@ func TestPromptSecondaryStorageRejectsInvalidLogPath(t *testing.T) {
 	var logPath string
 	var err error
 	ctx := context.Background()
-	reader := bufio.NewReader(strings.NewReader("y\n/mnt/secondary\nremote:/logs\n\n"))
-	captureStdout(t, func() {
+	// An invalid log path, then an empty one (required with the secondary enabled),
+	// then a valid one.
+	reader := bufio.NewReader(strings.NewReader("y\n/mnt/secondary\nremote:/logs\n\n/mnt/secondary/log\n"))
+	out := captureStdout(t, func() {
 		_, _, logPath, err = promptSecondaryStorage(ctx, reader, installer.DeriveInstallWizardPrefill(""))
 	})
 	if err != nil {
 		t.Fatalf("promptSecondaryStorage error: %v", err)
 	}
-	if logPath != "" {
-		t.Fatalf("expected empty secondary log path, got %q", logPath)
+	if logPath != "/mnt/secondary/log" {
+		t.Fatalf("expected the corrected secondary log path, got %q", logPath)
+	}
+	if !strings.Contains(out, "SECONDARY_LOG_PATH is required when SECONDARY_ENABLED=true") {
+		t.Fatalf("an empty log path must be refused as required, output:\n%s", out)
 	}
 }
 
@@ -708,11 +715,44 @@ func TestPromptEncryption(t *testing.T) {
 	}
 }
 
+// configureCronTime drives the Schedule section with the frequency left at daily, so the
+// time-prompt cases below keep testing the time prompt.
+func configureCronTime(ctx context.Context, reader *bufio.Reader, def string) (string, error) {
+	s, err := configureSchedule(ctx, reader, cliSchedule{Frequency: "daily", Weekday: "mon", MonthDay: "1", Time: def})
+	return s.Time, err
+}
+
+func TestConfigureScheduleWeeklyAndMonthly(t *testing.T) {
+	def := cliSchedule{Frequency: "daily", Weekday: "mon", MonthDay: "1", Time: "02:00"}
+	var got cliSchedule
+	var err error
+	out := captureStdout(t, func() {
+		got, err = configureSchedule(context.Background(), bufio.NewReader(strings.NewReader("yearly\nweekly\nfunday\nfri\n03:30\n")), def)
+	})
+	if err != nil || got != (cliSchedule{Frequency: "weekly", Weekday: "fri", MonthDay: "1", Time: "03:30"}) {
+		t.Fatalf("weekly = %+v, %v", got, err)
+	}
+	for _, want := range []string{"frequency must be daily, weekly, or monthly", "weekday must be one of mon, tue, wed, thu, fri, sat, sun", "Weekday: mon, tue, wed, thu, fri, sat, or sun [mon]: "} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	out = captureStdout(t, func() {
+		got, err = configureSchedule(context.Background(), bufio.NewReader(strings.NewReader("monthly\n31\n15\n\n")), def)
+	})
+	if err != nil || got != (cliSchedule{Frequency: "monthly", Weekday: "mon", MonthDay: "15", Time: "02:00"}) {
+		t.Fatalf("monthly = %+v, %v", got, err)
+	}
+	if !strings.Contains(out, "day of month must be between 1 and 28") || strings.Contains(out, "Weekday:") {
+		t.Fatalf("monthly output:\n%s", out)
+	}
+}
+
 func TestConfigureCronTime(t *testing.T) {
 	t.Run("empty input uses default", func(t *testing.T) {
 		var cronTime string
 		var err error
-		reader := bufio.NewReader(strings.NewReader("\n"))
+		reader := bufio.NewReader(strings.NewReader("\n\n"))
 		captureStdout(t, func() {
 			cronTime, err = configureCronTime(context.Background(), reader, cronutil.DefaultTime)
 		})
@@ -727,7 +767,7 @@ func TestConfigureCronTime(t *testing.T) {
 	t.Run("invalid input re-prompts until valid", func(t *testing.T) {
 		var cronTime string
 		var err error
-		reader := bufio.NewReader(strings.NewReader("24:00\n3:7\n"))
+		reader := bufio.NewReader(strings.NewReader("\n24:00\n3:7\n"))
 		output := captureStdout(t, func() {
 			cronTime, err = configureCronTime(context.Background(), reader, cronutil.DefaultTime)
 		})
@@ -759,8 +799,9 @@ func TestRunConfigWizardCLIReturnsCronSchedule(t *testing.T) {
 	tmpConfigPath := configPath + ".tmp"
 	// 6 toggle declines, empty scheduler-engine answer (defaults to daemon on a
 	// fresh install), empty healthcheck-mode answer (daemon-only prompt, defaults
-	// to centralized), then the run-at time.
-	reader := bufio.NewReader(strings.NewReader("n\nn\nn\nn\nn\nn\n\n\n03:15\n"))
+	// to centralized), empty notify-level answer (defaults to warning), then the run-at time.
+	// The HC initial account email follows the centralized mode answer (required there).
+	reader := bufio.NewReader(strings.NewReader("n\nn\nn\nn\nn\nn\n\n\nops@example.org\n\n\n03:15\n"))
 
 	var result installConfigResult
 	var err error
@@ -796,7 +837,7 @@ func TestRunConfigWizardCLIEditExistingRemovesRuntimeDerivedKeys(t *testing.T) {
 	cfgFile := createTempFile(t, "BASE_DIR=/custom\nCRON_HOUR=2\nMARKER=1\n")
 	tmpConfigPath := cfgFile + ".tmp"
 	// "2" = overwrite/keep decision, 6 toggle declines, empty scheduler answer, run-at.
-	reader := bufio.NewReader(strings.NewReader("2\nn\nn\nn\nn\nn\nn\n\n03:15\n"))
+	reader := bufio.NewReader(strings.NewReader("2\nn\nn\nn\nn\nn\nn\n\n\n03:15\n"))
 
 	var err error
 	captureStdout(t, func() {
@@ -846,11 +887,11 @@ func TestRunConfigWizardCLIAbortAtCronPromptDoesNotWriteConfig(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "env", "backup.env")
 	tmpConfigPath := configPath + ".tmp"
 
-	originalConfigureCronTime := configureCronTimeFunc
-	t.Cleanup(func() { configureCronTimeFunc = originalConfigureCronTime })
+	originalConfigureSchedule := configureScheduleFunc
+	t.Cleanup(func() { configureScheduleFunc = originalConfigureSchedule })
 
-	configureCronTimeFunc = func(ctx context.Context, reader *bufio.Reader, defaultCron string) (string, error) {
-		return "", errInteractiveAborted
+	configureScheduleFunc = func(ctx context.Context, reader *bufio.Reader, def cliSchedule) (cliSchedule, error) {
+		return cliSchedule{}, errInteractiveAborted
 	}
 
 	reader := bufio.NewReader(strings.NewReader("n\nn\nn\nn\nn\nn\n"))
@@ -882,7 +923,7 @@ func createTempFile(t *testing.T, content string) string {
 
 func parseWrittenEnvForTest(content string) map[string]string {
 	values := map[string]string{}
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
@@ -964,9 +1005,9 @@ func TestRunConfigWizardCLIHealthcheckModeResult(t *testing.T) {
 		wantHCPrompt  bool
 		wantScheduler string
 	}{
-		{"daemon self", "n\nn\nn\nn\nn\nn\ndaemon\nself\n03:15\n", "self", true, "daemon"},
-		{"daemon off", "n\nn\nn\nn\nn\nn\ndaemon\noff\n03:15\n", "off", true, "daemon"},
-		{"cron forces off without a prompt", "n\nn\nn\nn\nn\nn\ncron\n03:15\n", "off", false, "cron"},
+		{"daemon self", "n\nn\nn\nn\nn\nn\ndaemon\nself\n\n\n03:15\n", "self", true, "daemon"},
+		{"daemon off", "n\nn\nn\nn\nn\nn\ndaemon\noff\n\n03:15\n", "off", true, "daemon"},
+		{"cron forces off without a prompt", "n\nn\nn\nn\nn\nn\ncron\n\n03:15\n", "off", false, "cron"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1006,7 +1047,7 @@ func TestCollectInstallWizardDataCLIBlankEditKeepsStoredDefaults(t *testing.T) {
 	var result installConfigResult
 	var err error
 	output := captureStdout(t, func() {
-		reader := bufio.NewReader(strings.NewReader("2\nn\nn\nn\nn\nn\nn\n\n03:15\n"))
+		reader := bufio.NewReader(strings.NewReader("2\nn\nn\nn\nn\nn\nn\n\n\n03:15\n"))
 		result, err = runConfigWizardCLI(context.Background(), reader, cfgFile, cfgFile+".tmp", "/opt/proxsave", nil)
 	})
 	if err != nil {
@@ -1032,7 +1073,7 @@ func TestCollectInstallWizardDataCLIBlankEditKeepsStoredDefaults(t *testing.T) {
 	// instead of the stand-in, and deleting wizardBlankBaseStandIn would not fail it.
 	daemonCfgFile := createTempFile(t, "")
 	daemonOutput := captureStdout(t, func() {
-		reader := bufio.NewReader(strings.NewReader("2\nn\nn\nn\nn\nn\nn\ndaemon\n\n03:15\n"))
+		reader := bufio.NewReader(strings.NewReader("2\nn\nn\nn\nn\nn\nn\ndaemon\n\n\n03:15\n"))
 		_, err = runConfigWizardCLI(context.Background(), reader, daemonCfgFile, daemonCfgFile+".tmp", "/opt/proxsave", nil)
 	})
 	if err != nil {
@@ -1062,7 +1103,7 @@ func TestRunConfigWizardCLIBlankEditKeepsMinimalKeySet(t *testing.T) {
 			cfgFile := createTempFile(t, tc.content)
 			var err error
 			captureStdout(t, func() {
-				reader := bufio.NewReader(strings.NewReader("2\nn\nn\nn\nn\nn\nn\n\n03:15\n"))
+				reader := bufio.NewReader(strings.NewReader("2\nn\nn\nn\nn\nn\nn\n\n\n03:15\n"))
 				_, err = runConfigWizardCLI(context.Background(), reader, cfgFile, cfgFile+".tmp", "/opt/proxsave", nil)
 			})
 			if err != nil {
@@ -1200,7 +1241,7 @@ func TestCollectInstallWizardDataCLIOnlyAnsweredTogglesAreNonNil(t *testing.T) {
 		var data *installer.InstallWizardData
 		var err error
 		captureStdout(t, func() {
-			reader := bufio.NewReader(strings.NewReader("n\nn\nn\nn\ny\n\nn\ncron\n03:15\n"))
+			reader := bufio.NewReader(strings.NewReader("n\nn\nn\nn\ny\n\nn\ncron\n\n03:15\n"))
 			data, err = collectInstallWizardDataCLI(context.Background(), reader, promptBase, false, nil)
 		})
 		if err != nil {
@@ -1227,7 +1268,7 @@ func TestCollectInstallWizardDataCLIOnlyAnsweredTogglesAreNonNil(t *testing.T) {
 		var data *installer.InstallWizardData
 		var err error
 		captureStdout(t, func() {
-			reader := bufio.NewReader(strings.NewReader("n\nn\ny\ny\nn\nn\ncron\n03:15\n"))
+			reader := bufio.NewReader(strings.NewReader("n\nn\ny\ny\nn\nn\ncron\n\n03:15\n"))
 			data, err = collectInstallWizardDataCLI(context.Background(), reader, promptBase, false, nil)
 		})
 		if err != nil {
@@ -1395,7 +1436,7 @@ func TestRunConfigWizardCLIRuntimeOnlyEditKeepsByteIdentity(t *testing.T) {
 			cfgFile := createTempFile(t, tc.content)
 			var err error
 			captureStdout(t, func() {
-				reader := bufio.NewReader(strings.NewReader("2\nn\nn\nn\nn\nn\nn\n\n03:15\n"))
+				reader := bufio.NewReader(strings.NewReader("2\nn\nn\nn\nn\nn\nn\n\n\n03:15\n"))
 				_, err = runConfigWizardCLI(context.Background(), reader, cfgFile, cfgFile+".tmp", "/opt/proxsave", nil)
 			})
 			if err != nil {
@@ -1446,5 +1487,61 @@ func TestPromptSanitizedNonEmptySanitizesTheDefault(t *testing.T) {
 	}
 	if strings.Contains(out, "\x00") {
 		t.Fatalf("control characters must not be echoed into the prompt; prompt was %q", out)
+	}
+}
+
+// The summary line printed after the disables names the variables in alphabetical order.
+func TestRunPostInstallAuditCLIListsTheDisabledVariablesInOrder(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "backup.env")
+	if err := os.WriteFile(configPath, []byte("BACKUP_CLUSTER_CONFIG=true\nBACKUP_ZFS_CONFIG=true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	execPath := filepath.Join(tmp, "proxsave")
+	script := strings.Join([]string{
+		"#!/bin/sh",
+		"echo 'WARNINGS/ERRORS DURING RUN (warnings=2 errors=0)'",
+		"echo '[2026-02-24 09:12:55] WARNING    ZFS pools: none found. If unused, set BACKUP_ZFS_CONFIG=false to disable.'",
+		"echo '[2026-02-24 09:12:55] WARNING    Corosync authkey: not configured. If unused, set BACKUP_CLUSTER_CONFIG=false to disable.'",
+		"exit 1",
+		"",
+	}, "\n")
+	if err := os.WriteFile(execPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake proxsave: %v", err)
+	}
+
+	reader := bufio.NewReader(strings.NewReader("y\ny\ny\ny\n"))
+	var err error
+	out := captureStdout(t, func() {
+		err = runPostInstallAuditCLI(context.Background(), reader, execPath, configPath, nil)
+	})
+	if err != nil {
+		t.Fatalf("runPostInstallAuditCLI: %v", err)
+	}
+	want := "disabled 2 component(s): BACKUP_CLUSTER_CONFIG, BACKUP_ZFS_CONFIG"
+	if !strings.Contains(out, want) {
+		t.Fatalf("summary does not list the variables in order; want %q in:\n%s", want, out)
+	}
+}
+
+// The CLI asks the HC initial account email after centralized, repeats on an empty or unusable
+// answer with the approved message, and keeps the stored value on Enter.
+func TestPromptHealthcheckInitialEmail(t *testing.T) {
+	var got string
+	out := captureStdout(t, func() {
+		v, err := promptHealthcheckInitialEmail(context.Background(), bufio.NewReader(strings.NewReader("\nnope\nops@example.org\n")), "")
+		if err != nil {
+			t.Fatalf("prompt: %v", err)
+		}
+		got = v
+	})
+	if got != "ops@example.org" ||
+		!strings.Contains(out, "HC initial account email []: Required with ProxSave HC Server\n") ||
+		!strings.Contains(out, "Not a usable email address\n") {
+		t.Fatalf("value %q, transcript:\n%s", got, out)
+	}
+	kept, err := promptHealthcheckInitialEmail(context.Background(), bufio.NewReader(strings.NewReader("\n")), "kept@example.org")
+	if err != nil || kept != "kept@example.org" {
+		t.Fatalf("Enter must keep the stored value: %q %v", kept, err)
 	}
 }

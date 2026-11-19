@@ -2,12 +2,17 @@ package orchestrator
 
 import (
 	"bufio"
+	"cmp"
+	"errors"
+	"io"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/notify"
 	"github.com/tis24dev/proxsave/internal/safefs"
+	"github.com/tis24dev/proxsave/internal/ui/theme"
 )
 
 // notifyErrorToken is the level token the notify-scoped logger writes for a
@@ -32,18 +37,14 @@ func ParseLogCounts(logPath string, categoryLimit int) (categories []notify.LogC
 	}
 	defer func() { _ = file.Close() }()
 
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
 	categoryMap := make(map[string]*notify.LogCategory)
 	errorCount = 0
 	warningCount = 0
 
-	for scanner.Scan() {
-		entryType, message := classifyLogLine(scanner.Text())
+	forEachLogLine(file, func(line string) {
+		entryType, message := classifyLogLine(line)
 		if entryType == "" || message == "" {
-			continue
+			return
 		}
 
 		switch entryType {
@@ -59,7 +60,7 @@ func ParseLogCounts(logPath string, categoryLimit int) (categories []notify.LogC
 
 		label, example := splitCategoryAndExample(message)
 		if label == "" {
-			continue
+			return
 		}
 
 		// A notify-error displays as ERROR even though it is counted separately.
@@ -82,7 +83,7 @@ func ParseLogCounts(logPath string, categoryLimit int) (categories []notify.LogC
 				Example: example,
 			}
 		}
-	}
+	})
 
 	if len(categoryMap) == 0 {
 		return nil, errorCount, warningCount, notifyCount
@@ -93,7 +94,7 @@ func ParseLogCounts(logPath string, categoryLimit int) (categories []notify.LogC
 		list = append(list, *cat)
 	}
 
-	// Sort by type (ERROR before WARNING), then by count (descending), then by label
+	// Sort by type (ERROR before WARNING), symbol, count (descending), then label
 	sortLogCategories(list)
 
 	if categoryLimit > 0 && len(list) > categoryLimit {
@@ -102,31 +103,64 @@ func ParseLogCounts(logPath string, categoryLimit int) (categories []notify.LogC
 	return list, errorCount, warningCount, notifyCount
 }
 
-// sortLogCategories sorts log categories by priority
+// sortLogCategories sorts log categories by priority: ERROR before WARNING; within a
+// type the labels that open with ✗ (theme.SymbolError), then those that open with ⚠
+// (theme.SymbolWarning, the ⚠️ form included), then all the others; then by count,
+// descending; then by label, ascending and CASE-INSENSITIVELY. A raw byte compare put
+// every lowercase-initial label below every uppercase one (39 production warnings begin
+// lowercase against 645 uppercase), and without the symbol rank a "✗ ... backup not
+// saved" sorted after every plain label, at the bottom of a long list.
 func sortLogCategories(list []notify.LogCategory) {
-	// Simple bubble sort - good enough for small lists (typically < 20 items)
-	n := len(list)
-	for i := 0; i < n-1; i++ {
-		for j := 0; j < n-i-1; j++ {
-			// Compare by type (ERROR before WARNING)
-			if list[j].Type != list[j+1].Type {
-				// "ERROR" < "WARNING" lexicographically, so swap if j is WARNING
-				if list[j].Type > list[j+1].Type { // "WARNING" > "ERROR", swap to put ERROR first
-					list[j], list[j+1] = list[j+1], list[j]
-				}
-				continue
-			}
-			// Same type, compare by count (descending)
-			if list[j].Count != list[j+1].Count {
-				if list[j].Count < list[j+1].Count {
-					list[j], list[j+1] = list[j+1], list[j]
-				}
-				continue
-			}
-			// Same count, compare by label (ascending)
-			if list[j].Label > list[j+1].Label {
-				list[j], list[j+1] = list[j+1], list[j]
-			}
+	slices.SortStableFunc(list, func(a, b notify.LogCategory) int {
+		return cmp.Or(
+			strings.Compare(a.Type, b.Type), // "ERROR" < "WARNING" lexicographically.
+			cmp.Compare(logCategorySymbolRank(a.Label), logCategorySymbolRank(b.Label)),
+			cmp.Compare(b.Count, a.Count),
+			strings.Compare(strings.ToLower(a.Label), strings.ToLower(b.Label)),
+			strings.Compare(a.Label, b.Label),
+		)
+	})
+}
+
+// logCategorySymbolRank is 0 for a label that opens with the error symbol, 1 for one
+// that opens with the warning symbol (with or without its variation selector), 2 for
+// any other.
+func logCategorySymbolRank(label string) int {
+	label = strings.TrimSpace(label)
+	switch {
+	case strings.HasPrefix(label, theme.SymbolError):
+		return 0
+	case strings.HasPrefix(label, theme.SymbolWarning):
+		return 1
+	default:
+		return 2
+	}
+}
+
+// logLineClassifyBytes is how much of one physical line ParseLogCounts classifies: the
+// level and the start of the message are all it needs (messages are cut to 300 bytes,
+// labels and examples to 120), and the rest of a longer line is skipped, not held.
+const logLineClassifyBytes = 64 * 1024
+
+// forEachLogLine calls fn with the first logLineClassifyBytes of every line of r, of any
+// length, without its line ending. The bufio.Scanner it replaces stopped at its 1 MiB
+// token limit without a word: the long line and every line after it went uncounted, so
+// an ERROR logged after it left the exit code and the healthchecks ping at success. A
+// read error that is not the end of the file ends the walk, as it did before: what was
+// read so far is counted.
+func forEachLogLine(r io.Reader, fn func(line string)) {
+	reader := bufio.NewReaderSize(r, logLineClassifyBytes)
+	for {
+		chunk, err := reader.ReadSlice('\n')
+		line := strings.TrimSuffix(strings.TrimSuffix(string(chunk), "\n"), "\r")
+		for errors.Is(err, bufio.ErrBufferFull) {
+			_, err = reader.ReadSlice('\n')
+		}
+		if len(chunk) > 0 {
+			fn(line)
+		}
+		if err != nil {
+			return
 		}
 	}
 }
@@ -153,8 +187,8 @@ func classifyLogLine(line string) (entryType, message string) {
 
 	// 2) Go logger format with timestamp prefix.
 	if strings.HasPrefix(line, "[") {
-		if closeIdx := strings.Index(line, "]"); closeIdx != -1 {
-			rest := strings.TrimSpace(line[closeIdx+1:])
+		if _, after, ok := strings.Cut(line, "]"); ok {
+			rest := strings.TrimSpace(after)
 			if rest == "" {
 				return "", ""
 			}
@@ -266,9 +300,7 @@ func sanitizeLogMessage(msg string) string {
 func splitCategoryAndExample(msg string) (label, example string) {
 	parts := strings.SplitN(msg, " - ", 2)
 	label = strings.TrimSpace(parts[0])
-	if label == "" {
-		label = msg
-	}
+	label = cmp.Or(label, msg)
 	label = truncateString(label, 120)
 
 	if len(parts) == 2 {

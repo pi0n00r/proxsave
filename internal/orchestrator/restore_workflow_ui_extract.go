@@ -45,16 +45,36 @@ func (w *restoreUIWorkflowRun) extractNormalCategories() error {
 		return nil
 	}
 
-	detailedLogPath, err := extractSelectiveArchive(w.ctx, w.prepared.ArchivePath, w.destRoot, categories, w.mode, w.logger)
+	writesCaches := restoreEntryMatchesCategories(zfsHostCachePaths[0], categories) ||
+		restoreEntryMatchesCategories(zfsHostCachePaths[1]+"/", categories)
+	if err := w.decideZFSHostFiles(restoreEntryMatchesCategories(hostidArchivePath, categories), writesCaches,
+		restoreEntryMatchesCategories(zfsARCConfArchivePath, categories)); err != nil {
+		return err
+	}
+	detailedLogPath, err := extractSelectiveArchiveWith(w.ctx, w.prepared.ArchivePath, w.destRoot, categories, w.mode, w.logger, selectiveExtraction{
+		skipFn:      w.skipSystemPathEntry,
+		onExtracted: w.recordBootRebuildInput,
+	})
 	if err != nil {
 		w.logger.Error("Restore failed: %v", err)
 		if w.safetyBackup != nil {
-			w.logger.Info("You can rollback using the safety backup at: %s", w.safetyBackup.BackupPath)
+			w.logger.Info("Safety backup - the files this restore overwrote are in %s", w.safetyBackup.BackupPath)
 		}
 		return err
 	}
 	w.detailedLogPath = detailedLogPath
 	return nil
+}
+
+// skipSystemPathEntry keeps from the live system what must never reach it: the old
+// host's boot files, and its /etc/hostid, pool cache files and zfs.conf when
+// decideZFSHostFiles said so.
+func (w *restoreUIWorkflowRun) skipSystemPathEntry(name string) bool {
+	clean := normalizeArchiveEntryPath(name)
+	return isBootNeverLivePath(clean) ||
+		(w.skipHostid && clean == hostidArchivePath) ||
+		(w.skipZFSCaches && isZFSHostCachePath(clean)) ||
+		(w.skipZFSConf && clean == zfsARCConfArchivePath)
 }
 
 func (w *restoreUIWorkflowRun) systemExtractionCategories() []Category {
@@ -148,7 +168,11 @@ func (w *restoreUIWorkflowRun) exportCategories() error {
 	if len(w.plan.ExportCategories) == 0 {
 		return nil
 	}
-	w.exportRoot = exportDestRoot(w.cfg.BaseDir)
+	// decideZFSHostFiles may already have exported a kept host file here: one
+	// directory per restore.
+	if w.exportRoot == "" {
+		w.exportRoot = exportDestRoot(w.cfg.BaseDir)
+	}
 	w.logger.Info("")
 	w.logger.Info("Exporting %d export-only category(ies) to: %s", len(w.plan.ExportCategories), w.exportRoot)
 	if err := restoreFS.MkdirAll(w.exportRoot, 0o700); err != nil {
@@ -232,7 +256,6 @@ func (w *restoreUIWorkflowRun) stageAndApplySensitiveCategories() error {
 		return err
 	}
 	if !success {
-		w.logger.Warning("Skipping apply due to staged extraction errors")
 		return nil
 	}
 	return w.applyStagedCategories()
@@ -243,23 +266,66 @@ func (w *restoreUIWorkflowRun) extractStagedCategories() (bool, error) {
 	w.logger.Info("")
 	w.logger.Info("Staging %d sensitive category(ies) to: %s", len(w.plan.StagedCategories), w.stageRoot)
 	if err := restoreFS.MkdirAll(w.stageRoot, 0o700); err != nil {
-		return false, fmt.Errorf("failed to create staging directory %s: %w", w.stageRoot, err)
+		err = fmt.Errorf("failed to create staging directory %s: %w", w.stageRoot, err)
+		w.discardIncompleteStage("")
+		return false, err
 	}
 
 	// failOnPartial=true: a staged extraction with any failed entry must NOT be
 	// applied to the live system; otherwise an incomplete tree of sensitive config
-	// (PVE/PBS/network/secrets) could be applied (BH-002). On error the apply is
-	// skipped (handleStageExtractError -> return false), so the system is left
-	// untouched rather than partially mutated.
+	// (PVE/PBS/network/secrets) could be applied (BH-002). The extraction carries on
+	// past a failed entry, so the stage then holds every other file: it is discarded
+	// here, before the batch and every later step that would read it.
 	stageLog, err := extractSelectiveArchiveStrict(w.ctx, w.prepared.ArchivePath, w.stageRoot, w.plan.StagedCategories, RestoreModeCustom, w.logger, true)
 	if err != nil {
-		if err := w.handleStageExtractError(err); err != nil {
-			return false, err
-		}
-		return false, nil
+		err = w.handleStageExtractError(err)
+		w.discardIncompleteStage(stageLog)
+		return false, err
 	}
 	w.stageLogPath = stageLog
 	return true, nil
+}
+
+// discardIncompleteStage handles a staged extraction that did not complete, on an
+// error and on an abort alike. Nothing staged may reach the live system then: not the
+// batch, and not the steps after it that read the stage on their own (network install
+// and apply, firewall, HA, the PBS notifications repair in the services cleanup, which
+// runs even on an abort). Those steps check stageIncomplete; the stage itself is
+// removed at once, since the files that did land hold secrets in the clear.
+func (w *restoreUIWorkflowRun) discardIncompleteStage(stageLog string) {
+	w.stageIncomplete = true
+	w.removeStage()
+	w.stageRoot = ""
+	ids := make([]string, 0, len(w.plan.StagedCategories))
+	for _, cat := range w.plan.StagedCategories {
+		ids = append(ids, cat.ID)
+	}
+	w.logger.Warning("Staged categories - not applied, the staged extraction did not complete: %s", strings.Join(ids, ", "))
+	if stageLog != "" {
+		w.logger.Info("Staging detailed log: %s", stageLog)
+	}
+}
+
+// skipForIncompleteStage reports whether a step that applies staged configuration
+// must not run because the staged extraction did not complete.
+func (w *restoreUIWorkflowRun) skipForIncompleteStage(step string) bool {
+	if !w.stageIncomplete {
+		return false
+	}
+	logging.DebugStep(w.logger, "restore", "%s skipped: the staged extraction did not complete", step)
+	return true
+}
+
+// removeStage deletes the staging tree once nothing reads it any more. It holds the
+// decrypted sensitive categories (/etc/shadow, /etc/pve/priv material) in the clear;
+// its detailed log is not inside it but in RestoreRunDir, and stays.
+func (w *restoreUIWorkflowRun) removeStage() {
+	if w.stageRoot == "" {
+		return
+	}
+	if err := restoreFS.RemoveAll(w.stageRoot); err != nil {
+		w.logger.Warning("Failed to remove staging directory %s: %v", w.stageRoot, err)
+	}
 }
 
 func (w *restoreUIWorkflowRun) handleStageExtractError(err error) error {
@@ -346,9 +412,24 @@ func (w *restoreUIWorkflowRun) runStageApplyStep(step restoreStageApplyStep) err
 	return nil
 }
 
+// stageApplyOutcomeLoggedError is a staged-apply step failure whose outcome lines
+// the step already wrote. The runner records the restore warning from it and keeps
+// the error at DEBUG, without a second visible line.
+type stageApplyOutcomeLoggedError struct {
+	err error
+}
+
+func (e *stageApplyOutcomeLoggedError) Error() string { return e.err.Error() }
+
+func (e *stageApplyOutcomeLoggedError) Unwrap() error { return e.err }
+
 func (w *restoreUIWorkflowRun) logStageApplyWarning(name string, err error) {
 	if errors.Is(err, ErrAccessControlApplyNotCommitted) {
 		w.logAccessControlNotCommitted(err)
+		return
+	}
+	if _, ok := errors.AsType[*stageApplyOutcomeLoggedError](err); ok {
+		w.logger.Debug("%s: outcome already reported: %v", name, err)
 		return
 	}
 	w.logger.Warning("%s: %v", name, err)

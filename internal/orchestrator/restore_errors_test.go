@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -18,7 +19,7 @@ import (
 	"github.com/tis24dev/proxsave/internal/logging"
 )
 
-func TestAnalyzeBackupCategories_OpenError(t *testing.T) {
+func TestAnalyzeRestoreArchive_OpenError(t *testing.T) {
 	orig := restoreFS
 	defer func() { restoreFS = orig }()
 	fakeFS := NewFakeFS()
@@ -26,7 +27,7 @@ func TestAnalyzeBackupCategories_OpenError(t *testing.T) {
 	restoreFS = fakeFS
 	logger := logging.New(logging.GetDefaultLogger().GetLevel(), false)
 
-	_, err := AnalyzeBackupCategories("/missing/archive.tar", logger)
+	_, _, err := AnalyzeRestoreArchive("/missing/archive.tar", logger)
 	if err == nil {
 		t.Fatalf("expected error when archive cannot be opened")
 	}
@@ -175,7 +176,7 @@ func TestStopPVEClusterServices_UsesNoBlock(t *testing.T) {
 
 	outputs := map[string][]byte{}
 	errors := map[string]error{}
-	for _, svc := range []string{"pve-cluster", "pvedaemon", "pveproxy", "pvestatd"} {
+	for _, svc := range []string{"pve-ha-lrm", "pve-ha-crm", "pve-cluster", "pvedaemon", "pveproxy", "pvestatd"} {
 		key := fmt.Sprintf("systemctl is-active %s", svc)
 		outputs[key] = []byte("inactive")
 		errors[key] = fmt.Errorf("inactive")
@@ -192,23 +193,22 @@ func TestStopPVEClusterServices_UsesNoBlock(t *testing.T) {
 	}
 
 	wantStops := []string{
+		"systemctl stop --no-block pve-ha-lrm",
+		"systemctl stop --no-block pve-ha-crm",
 		"systemctl stop --no-block pve-cluster",
 		"systemctl stop --no-block pvedaemon",
 		"systemctl stop --no-block pveproxy",
 		"systemctl stop --no-block pvestatd",
 	}
 	for _, cmd := range wantStops {
-		found := false
-		for _, call := range fake.Calls {
-			if call == cmd {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(fake.Calls, cmd)
 		if !found {
 			t.Fatalf("expected %s to be called, calls: %#v", cmd, fake.Calls)
 		}
 	}
+	// The HA services go first: pve-ha-lrm left running while pmxcfs is down lets
+	// its watchdog expire and fence the node.
+	assertCallsInOrder(t, fake.Calls, wantStops...)
 }
 
 func TestStartPBSServices_CommandTimeout(t *testing.T) {
@@ -257,13 +257,7 @@ func TestStopPBSServices_AggressiveRetry(t *testing.T) {
 		t.Fatalf("expected success with aggressive retry, got %v", err)
 	}
 
-	foundKill := false
-	for _, call := range fake.Calls {
-		if call == "systemctl kill --signal=SIGTERM --kill-who=all proxmox-backup-proxy" {
-			foundKill = true
-			break
-		}
-	}
+	foundKill := slices.Contains(fake.Calls, "systemctl kill --signal=SIGTERM --kill-who=all proxmox-backup-proxy")
 	if !foundKill {
 		t.Fatalf("expected systemctl kill --signal=SIGTERM --kill-who=all proxmox-backup-proxy to be invoked, calls: %#v", fake.Calls)
 	}
@@ -288,13 +282,7 @@ func TestStartPBSServices_AggressiveRetry(t *testing.T) {
 		t.Fatalf("expected success with aggressive restart, got %v", err)
 	}
 
-	foundRestart := false
-	for _, call := range fake.Calls {
-		if call == "systemctl restart proxmox-backup" {
-			foundRestart = true
-			break
-		}
-	}
+	foundRestart := slices.Contains(fake.Calls, "systemctl restart proxmox-backup")
 	if !foundRestart {
 		t.Fatalf("expected systemctl restart proxmox-backup to be invoked, calls: %#v", fake.Calls)
 	}
@@ -422,8 +410,7 @@ func TestEnsureWritablePath_Overwrite(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	reader := bufio.NewReader(strings.NewReader("1\n"))
 
 	got, err := ensureWritablePath(ctx, reader, existing, "test")
@@ -446,8 +433,7 @@ func TestEnsureWritablePath_EnterNewPath(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	reader := bufio.NewReader(strings.NewReader("2\n" + filepath.Join(tmp, "new.txt") + "\n"))
 
 	got, err := ensureWritablePath(ctx, reader, existing, "test")
@@ -471,8 +457,7 @@ func TestEnsureWritablePath_Abort(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	reader := bufio.NewReader(strings.NewReader("0\n"))
 
 	_, err := ensureWritablePath(ctx, reader, existing, "test")
@@ -532,7 +517,7 @@ func TestApplyStorageCfg_ReadFileError(t *testing.T) {
 	restoreFS = osFS{}
 
 	logger := logging.New(logging.GetDefaultLogger().GetLevel(), false)
-	_, _, err := applyStorageCfg(context.Background(), "/nonexistent/path/storage.cfg", logger)
+	_, _, _, err := applyStorageCfg(context.Background(), "/nonexistent/path/storage.cfg", logger)
 	if err == nil {
 		t.Fatalf("expected read error")
 	}
@@ -564,7 +549,7 @@ storage: backup
 	restoreCmd = &FakeCommandRunner{}
 
 	logger := logging.New(logging.GetDefaultLogger().GetLevel(), false)
-	applied, failed, err := applyStorageCfg(context.Background(), cfgPath, logger)
+	applied, _, failed, err := applyStorageCfg(context.Background(), cfgPath, logger)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -605,7 +590,7 @@ func TestApplyStorageCfg_PveshError(t *testing.T) {
 	restoreCmd = &alwaysFailCommandRunner{err: fmt.Errorf("pvesh failed")}
 
 	logger := logging.New(logging.GetDefaultLogger().GetLevel(), false)
-	applied, failed, err := applyStorageCfg(context.Background(), cfgPath, logger)
+	applied, _, failed, err := applyStorageCfg(context.Background(), cfgPath, logger)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1326,7 +1311,13 @@ func TestStopPVEClusterServices_ServiceStillActive(t *testing.T) {
 
 	fake := &FakeCommandRunner{
 		Outputs: map[string][]byte{
+			"systemctl is-active pve-ha-lrm":  []byte("inactive"),
+			"systemctl is-active pve-ha-crm":  []byte("inactive"),
 			"systemctl is-active pve-cluster": []byte("active"),
+		},
+		Errors: map[string]error{
+			"systemctl is-active pve-ha-lrm": fmt.Errorf("inactive"),
+			"systemctl is-active pve-ha-crm": fmt.Errorf("inactive"),
 		},
 	}
 	restoreCmd = fake
@@ -1335,6 +1326,9 @@ func TestStopPVEClusterServices_ServiceStillActive(t *testing.T) {
 	err := stopPVEClusterServices(context.Background(), logger)
 	if err == nil {
 		t.Fatalf("expected error when service stays active")
+	}
+	if !strings.Contains(err.Error(), "(pve-cluster)") {
+		t.Fatalf("expected the error to name pve-cluster, got %v", err)
 	}
 }
 
@@ -1363,28 +1357,6 @@ func TestDetectConfiguredZFSPools_GlobError(t *testing.T) {
 	// Should return empty slice on error
 	if len(pools) != 0 {
 		t.Fatalf("expected empty pools on glob error, got: %v", pools)
-	}
-}
-
-// --------------------------------------------------------------------------
-// combinePoolNames tests
-// --------------------------------------------------------------------------
-
-func TestCombinePoolNames_Deduplication(t *testing.T) {
-	pools := combinePoolNames(
-		[]string{"tank", "backup"},
-		[]string{"backup", "rpool"},
-	)
-
-	if len(pools) != 3 {
-		t.Fatalf("expected 3 unique pools, got: %v", pools)
-	}
-
-	expected := map[string]bool{"tank": true, "backup": true, "rpool": true}
-	for _, p := range pools {
-		if !expected[p] {
-			t.Fatalf("unexpected pool: %s", p)
-		}
 	}
 }
 
@@ -1560,13 +1532,7 @@ func TestUnmountEtcPVE_MountedAndUnmounts(t *testing.T) {
 	}
 
 	// Check that umount was called
-	found := false
-	for _, call := range fake.Calls {
-		if call == "umount /etc/pve" {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(fake.Calls, "umount /etc/pve")
 	if !found {
 		t.Fatalf("expected umount to be called, got: %v", fake.Calls)
 	}
@@ -1645,8 +1611,13 @@ func TestApplyVMConfigs_SuccessfulApply(t *testing.T) {
 	orig := restoreCmd
 	t.Cleanup(func() { restoreCmd = orig })
 
+	node := localNodeName()
 	fake := &FakeCommandRunner{
-		Outputs: map[string][]byte{},
+		Outputs: map[string][]byte{
+			pveGuestInventoryCommand: guestInventoryJSON(t,
+				pveGuestResource{VMID: 100, Node: node, Kind: "qemu", Status: "stopped"},
+			),
+		},
 	}
 	restoreCmd = fake
 
@@ -1675,19 +1646,30 @@ func TestApplyVMConfigs_SuccessfulApply(t *testing.T) {
 	}
 }
 
-func TestApplyVMConfigs_CreatesMissingGuestBeforeSet(t *testing.T) {
-	orig := restoreCmd
-	t.Cleanup(func() { restoreCmd = orig })
+func TestApplyVMConfigs_RegistersMissingGuestViaPmxcfs(t *testing.T) {
+	// The old contract created the guest via pvesh and then set its config; the
+	// create was a dead end for LXC (ostemplate) and needless for qemu, so a
+	// missing guest is now registered by writing its staged conf into pmxcfs
+	// (fable-check bugs 2-3; see pve_guest_apply_test.go for the full matrix).
+	orig, origLockedWriter := restoreCmd, pveGuestLockedWriter
+	t.Cleanup(func() {
+		restoreCmd, pveGuestLockedWriter = orig, origLockedWriter
+	})
 
 	node := localNodeName()
-	getCall := fmt.Sprintf("pvesh get /nodes/%s/qemu/100/config", node)
 	fake := &FakeCommandRunner{
-		Outputs: map[string][]byte{},
-		Errors: map[string]error{
-			getCall: fmt.Errorf("not found"),
+		Outputs: map[string][]byte{
+			pveGuestInventoryCommand: guestInventoryJSON(t),
 		},
 	}
 	restoreCmd = fake
+
+	pmxRoot := t.TempDir()
+	seamPmxcfs(t, pmxRoot, true, nil)
+	pveGuestLockedWriter = func(_ context.Context, logger *logging.Logger, currentNode string, vm vmEntry, _ guestApplyPrecondition, data []byte) error {
+		rel := filepath.Join("nodes", currentNode, guestConfDir(vm.Kind), vm.VMID+".conf")
+		return pmxcfsWriteFile(logger, rel, data)
+	}
 
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "100.conf")
@@ -1702,12 +1684,13 @@ func TestApplyVMConfigs_CreatesMissingGuestBeforeSet(t *testing.T) {
 	if applied != 1 || failed != 0 {
 		t.Fatalf("expected (1,0), got (%d,%d)", applied, failed)
 	}
-	calls := strings.Join(fake.CallsList(), "\n")
-	if !strings.Contains(calls, fmt.Sprintf("pvesh create /nodes/%s/qemu --vmid=100", node)) {
-		t.Fatalf("missing create call; calls=%s", calls)
+	got, err := os.ReadFile(filepath.Join(pmxRoot, "nodes", node, "qemu-server", "100.conf"))
+	if err != nil || string(got) != "name: test-vm" {
+		t.Fatalf("conf not registered in pmxcfs: %q err=%v", got, err)
 	}
-	if !strings.Contains(calls, fmt.Sprintf("pvesh set /nodes/%s/qemu/100/config --name=test-vm", node)) {
-		t.Fatalf("missing set call; calls=%s", calls)
+	calls := strings.Join(fake.CallsList(), "\n")
+	if strings.Contains(calls, "pvesh create /nodes/") {
+		t.Fatalf("pvesh create must be gone; calls=%s", calls)
 	}
 }
 
@@ -1851,7 +1834,7 @@ storage: backup
 	restoreCmd = fake
 
 	logger := logging.New(logging.GetDefaultLogger().GetLevel(), false)
-	applied, failed, err := applyStorageCfg(context.Background(), cfgPath, logger)
+	applied, _, failed, err := applyStorageCfg(context.Background(), cfgPath, logger)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

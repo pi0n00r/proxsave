@@ -19,15 +19,10 @@ Guide for contributing to Proxsave, including development setup, coding guidelin
 
 ## Overview
 
-Proxsave is built with modern Go practices, emphasizing:
-
-- **Performance**: Compiled binary, concurrent operations
-- **Reliability**: Comprehensive error handling, safe defaults
-- **Maintainability**: Clean architecture, modular design
-- **Testability**: Unit tests, integration tests, mocking
+This guide covers the implementation and contributor workflow. For the operator view of collection, archives and destinations, read [How a backup runs](BACKUP_GUIDE.md#how-a-backup-runs). For routine operations, use the [dashboard guide](DASHBOARD.md)
 
 **Technology stack**:
-- **Language**: Go 1.25+
+- **Language**: Go 1.26.11 or later (the floor `go.mod` sets and `goRuntimeMinVersion` enforces at startup)
 - **Dependencies**: See `go.mod` for complete list
 - **Build system**: Makefile + Go modules
 - **Compression**: gzip, bzip2, xz, lzma, zstd
@@ -41,7 +36,7 @@ Proxsave is built with modern Go practices, emphasizing:
 ### Prerequisites
 
 ```bash
-# Go 1.25 or later
+# Go 1.26.11 or later
 go version
 
 # Build tools
@@ -166,7 +161,6 @@ wrappers. It is built from explicit recipes and fine-grained bricks:
 
 - `newPVERecipe()`
 - `newPBSRecipe()`
-- `newDualRecipe()`
 - `newSystemRecipe()`
 
 Important invariants:
@@ -200,7 +194,7 @@ go build -ldflags="-s -w" -o build/proxsave ./cmd/proxsave
 
 # With version info
 VERSION=$(git describe --tags --always)
-go build -ldflags="-s -w -X main.version=${VERSION}" -o build/proxsave ./cmd/proxsave
+go build -ldflags="-s -w -X github.com/tis24dev/proxsave/internal/version.Version=${VERSION}" -o build/proxsave ./cmd/proxsave
 ```
 
 ### Run Without Building
@@ -375,8 +369,10 @@ go build -mod=vendor -o build/proxsave ./cmd/proxsave
 
 ### Lint and structural guards
 
-`make lint` runs `go vet ./...`, `golint` if installed, and two repo-specific
-guards that fail the build on an architectural regression:
+`make lint` runs `go vet ./...`, `golangci-lint run ./...` if golangci-lint is
+installed (any finding fails the target; use the version pinned in
+`.github/workflows/lint.yml`, since an older one misses findings the CI reports),
+and two repo-specific guards that fail the build on an architectural regression:
 
 - `check-no-tview`: fails if any `cmd`, `internal`, or `pkg` code imports the legacy
   `rivo/tview` or `gdamore/tcell` stack. The Charm rebuild removed them and they must

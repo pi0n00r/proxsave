@@ -2,6 +2,8 @@ package backup
 
 import (
 	"bufio"
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,8 +11,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/tis24dev/proxsave/internal/safefs"
@@ -110,10 +115,11 @@ func (c *Collector) populatePVEManifest() {
 	c.pveManifest = make(map[string]ManifestEntry)
 
 	type manifestLogOpts struct {
-		description   string
-		disableHint   string
-		log           bool
-		countNotFound bool
+		description     string
+		disableHint     string
+		log             bool
+		countNotFound   bool
+		notFoundMessage string
 		// suppressNotFoundLog suppresses any log output when a file is not found.
 		// This is useful for optional files that may not exist on a default installation.
 		suppressNotFoundLog bool
@@ -140,6 +146,10 @@ func (c *Collector) populatePVEManifest() {
 			c.logger.Info("  %s: skipped (excluded)", opts.description)
 		case StatusNotFound:
 			if opts.suppressNotFoundLog {
+				return
+			}
+			if opts.notFoundMessage != "" {
+				c.logger.Warning("%s", opts.notFoundMessage)
 				return
 			}
 			if strings.TrimSpace(opts.disableHint) != "" {
@@ -265,22 +275,24 @@ func (c *Collector) populatePVEManifest() {
 
 	// Cluster configuration.
 	record(c.effectiveCorosyncConfigPath(), c.config.BackupClusterConfig, manifestLogOpts{
-		description:   "Corosync configuration",
-		disableHint:   "BACKUP_CLUSTER_CONFIG",
-		log:           true,
-		countNotFound: true,
+		description:         "Corosync configuration",
+		disableHint:         "BACKUP_CLUSTER_CONFIG",
+		log:                 true,
+		countNotFound:       !c.standalonePVE,
+		suppressNotFoundLog: c.standalonePVE,
 	})
-	record(filepath.Join(c.effectivePVEClusterPath(), "config.db"), c.config.BackupClusterConfig, manifestLogOpts{
-		description:   "PVE cluster database",
-		disableHint:   "BACKUP_CLUSTER_CONFIG",
-		log:           true,
-		countNotFound: true,
+	record(filepath.Join(c.effectivePVEClusterPath(), "config.db"), true, manifestLogOpts{
+		description:     "PVE configuration database",
+		log:             true,
+		countNotFound:   true,
+		notFoundMessage: "PVE configuration database: file not found; database not backed up.",
 	})
 	record(c.systemPath("/etc/corosync/authkey"), c.config.BackupClusterConfig, manifestLogOpts{
-		description:   "Corosync authkey",
-		disableHint:   "BACKUP_CLUSTER_CONFIG",
-		log:           true,
-		countNotFound: true,
+		description:         "Corosync authkey",
+		disableHint:         "BACKUP_CLUSTER_CONFIG",
+		log:                 true,
+		countNotFound:       !c.standalonePVE,
+		suppressNotFoundLog: c.standalonePVE,
 	})
 
 	// VZDump configuration.
@@ -321,6 +333,17 @@ func (c *Collector) describePathForManifest(src, dest string, enabled bool) Mani
 			return ManifestEntry{Status: StatusNotFound}
 		}
 		return ManifestEntry{Status: StatusFailed, Error: err.Error()}
+	}
+	if filepath.Clean(src) == filepath.Join(c.effectivePVEClusterPath(), "config.db") {
+		// A recovery database must resolve to a regular file. Generic snapshot
+		// entries may be directories or symlinks, including in dry-run mode.
+		info, err = os.Stat(src)
+		if err != nil {
+			return ManifestEntry{Status: StatusFailed, Error: err.Error()}
+		}
+		if !info.Mode().IsRegular() {
+			return ManifestEntry{Status: StatusFailed, Error: syscall.EINVAL.Error()}
+		}
 	}
 
 	if c.dryRun {
@@ -379,63 +402,68 @@ func (c *Collector) collectPVEConfigSnapshot(ctx context.Context) error {
 
 func (c *Collector) collectPVEClusterSnapshot(ctx context.Context, clustered bool) error {
 	clusterPath := c.effectivePVEClusterPath()
+	configDB := filepath.Join(clusterPath, "config.db")
+	target := c.targetPathFor(configDB)
 
-	// /etc/pve is a pmxcfs mount backed by config.db: the cluster database still
-	// contains the PVE access-control secrets even though BACKUP_PVE_ACL=false
-	// excludes the flat priv files. Warn so the operator is not left with a false
-	// sense of exclusion; the only way to drop them entirely is to also disable
-	// cluster backup.
-	if c.config.BackupClusterConfig && !c.config.BackupPVEACL {
-		c.logger.Warning("PVE access control: BACKUP_PVE_ACL=false excludes /etc/pve/priv/{shadow,token,tfa}.cfg but the same secrets remain in the cluster database config.db. To exclude them entirely, set BACKUP_CLUSTER_CONFIG=false.")
+	// The core pmxcfs database contains credentials even when their flat files
+	// are excluded. Only an explicit database exclusion removes that copy.
+	if !c.config.BackupPVEACL && !c.shouldExclude(configDB) && !c.shouldExclude(target) {
+		c.logger.Warning("PVE access control: BACKUP_PVE_ACL=false does not exclude secrets stored in config.db. To exclude this database and its sidecars, add config.db* to BACKUP_EXCLUDE_PATTERNS.")
 	}
 
 	if c.config.BackupClusterConfig {
 		corosyncPath := c.effectiveCorosyncConfigPath()
-		if err := c.safeCopyFile(ctx,
-			corosyncPath,
-			c.targetPathFor(corosyncPath),
-			"Corosync configuration"); err != nil {
+		if err := c.safeCopyFile(ctx, corosyncPath, c.targetPathFor(corosyncPath), "Corosync configuration"); err != nil {
 			c.logger.Warning("Failed to copy corosync.conf: %v", err)
 		}
-
 		if clustered {
-			if err := c.safeCopyDir(ctx,
-				clusterPath,
-				c.targetPathFor(clusterPath),
-				"PVE cluster data"); err != nil {
+			// Never put the live database or WAL beside the independent snapshot.
+			// Capture the database once, after the ordinary directory snapshot.
+			var databaseFiles []string
+			for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+				databaseFiles = append(databaseFiles, configDB+suffix, target+suffix)
+			}
+			err := c.withTemporaryExcludes(databaseFiles, func() error {
+				return c.safeCopyDir(ctx, clusterPath, c.targetPathFor(clusterPath), "PVE cluster data")
+			})
+			if err != nil {
 				c.logger.Warning("Failed to copy cluster data: %v", err)
 			}
 		} else {
-			c.logger.Debug("PVE cluster not configured (single node) - skipping cluster data directory snapshot")
+			c.logger.Debug("Cluster not confirmed; skipping cluster data directory snapshot")
+		}
+		authkeySrc := c.systemPath("/etc/corosync/authkey")
+		if err := c.safeCopyFile(ctx, authkeySrc, c.targetPathFor(authkeySrc), "Corosync authkey"); err != nil {
+			c.logger.Warning("Failed to copy Corosync authkey: %v", err)
 		}
 	} else {
 		c.logger.Skip("PVE cluster backup disabled")
 		c.logger.Skip("Corosync configuration")
 	}
 
-	if c.config.BackupClusterConfig {
-		authkeySrc := c.systemPath("/etc/corosync/authkey")
-		if err := c.safeCopyFile(ctx,
-			authkeySrc,
-			c.targetPathFor(authkeySrc),
-			"Corosync authkey"); err != nil {
-			c.logger.Warning("Failed to copy Corosync authkey: %v", err)
-		}
-
-		configDB := filepath.Join(clusterPath, "config.db")
-		if info, err := os.Stat(configDB); err == nil && !info.IsDir() {
-			target := c.targetPathFor(configDB)
-			c.logger.Debug("Copying PVE cluster database %s to %s", configDB, target)
-			if err := c.safeCopyFile(ctx, configDB, target, "PVE cluster database"); err != nil {
-				c.logger.Warning("Failed to copy PVE cluster database %s: %v", configDB, err)
+	// config.db also backs standalone pmxcfs. BACKUP_CLUSTER_CONFIG controls
+	// only cluster artifacts; explicit file exclusions still govern the database.
+	if _, err := os.Stat(configDB); err == nil {
+		c.logger.Debug("Copying PVE configuration database %s to %s", configDB, target)
+		if err := c.snapshotSQLiteDB(ctx, configDB, target); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			c.logger.Warning("Failed to stat PVE cluster database %s: %v", configDB, err)
+			c.logger.Debug("%v", err)
+			c.logger.Info("PVE configuration database: falling back to a raw copy, which can tear mid-write and misses WAL data not yet checkpointed")
+			c.logger.Warning("PVE configuration database: sqlite snapshot failed")
+			// safeCopyFile intentionally accepts symlinks and dry-run paths.
+			// Neither may turn a known invalid database into a collected file.
+			if info, statErr := os.Stat(configDB); statErr == nil && !info.Mode().IsRegular() {
+				return nil
+			}
+			if err := c.safeCopyFile(ctx, configDB, target, "PVE configuration database"); err != nil {
+				c.logger.Warning("Failed to copy PVE configuration database %s: %v", configDB, err)
+			}
 		}
-	} else {
-		c.logger.Debug("Skipping PVE cluster database capture: BACKUP_CLUSTER_CONFIG=false")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		c.logger.Warning("Failed to stat PVE configuration database %s: %v", configDB, err)
 	}
-
 	return nil
 }
 
@@ -488,8 +516,36 @@ func (c *Collector) collectPVEVZDumpSnapshot(ctx context.Context) error {
 	return nil
 }
 
+// pveRuntimeCommandsApply reports whether the PVE runtime commands may run. Under
+// SYSTEM_ROOT_PREFIX they would run in this system, not in the host mounted under the
+// prefix: pvesh, pveum, pvecm, pvesm, pvenode and pveversion answer for this system's own
+// /etc/pve and daemons, crontab and systemctl for its own schedules (measured on a Debian 13
+// appliance: the container's timers and no root crontab, then exit 9 on the missing
+// pveversion). The host's PVE files are read from under the prefix instead, and its crontabs
+// and systemd units by the system recipe. The skip is logged once per run.
+func (c *Collector) pveRuntimeCommandsApply() bool {
+	if !c.hostRootPrefixActive() {
+		return true
+	}
+	if !c.pveRuntimeSkipLogged {
+		c.pveRuntimeSkipLogged = true
+		c.logger.Info("PVE runtime commands - skipped under SYSTEM_ROOT_PREFIX, they would describe this system, not the host")
+	}
+	return false
+}
+
 func (c *Collector) collectPVECoreRuntime(ctx context.Context, commandsDir string, info *pveRuntimeInfo) error {
-	if err := c.safeCmdOutput(ctx,
+	if !c.pveRuntimeCommandsApply() {
+		return nil
+	}
+	// pveversion is critical when it is installed. One that runs and fails is a broken PVE
+	// toolchain. A missing one is pve-manager purged while pve-cluster, qemu-server and
+	// pve-container stay (the ISO installer marks them manual), with /etc/pve still mounted
+	// and holding the guest configuration: measured on PVE 9.2.2, failing on it there ended
+	// the run at exit 9 with no archive, so it is skipped with a warning.
+	if _, lookErr := c.depLookPath("pveversion"); lookErr != nil {
+		c.logger.Warning("PVE version - skipped, pveversion is not installed")
+	} else if err := c.safeCmdOutput(ctx,
 		commandSpec("pveversion", "-v"),
 		filepath.Join(commandsDir, "pveversion.txt"),
 		"PVE version",
@@ -538,7 +594,7 @@ func (c *Collector) collectPVECoreRuntime(ctx context.Context, commandsDir strin
 }
 
 func (c *Collector) collectPVEACLRuntime(ctx context.Context, commandsDir string) error {
-	if !c.config.BackupPVEACL {
+	if !c.config.BackupPVEACL || !c.pveRuntimeCommandsApply() {
 		return nil
 	}
 
@@ -574,6 +630,9 @@ func (c *Collector) collectPVEACLRuntime(ctx context.Context, commandsDir string
 }
 
 func (c *Collector) collectPVEClusterRuntime(ctx context.Context, commandsDir string, clustered bool) error {
+	if !c.pveRuntimeCommandsApply() {
+		return nil
+	}
 	if clustered && c.config.BackupClusterConfig {
 		if err := c.safeCmdOutput(ctx,
 			commandSpec("pvecm", "status"),
@@ -624,6 +683,9 @@ func (c *Collector) collectPVEClusterRuntime(ctx context.Context, commandsDir st
 }
 
 func (c *Collector) collectPVEStorageRuntime(ctx context.Context, commandsDir string, info *pveRuntimeInfo) error {
+	if !c.pveRuntimeCommandsApply() {
+		return nil
+	}
 	hostname, _ := os.Hostname()
 	nodeName := shortHostname(hostname)
 	if nodeName == "" {
@@ -679,7 +741,7 @@ func (c *Collector) finalizePVERuntimeInfo(info *pveRuntimeInfo) {
 			info.Nodes = append(info.Nodes, "localhost")
 		}
 	} else {
-		sort.Strings(info.Nodes)
+		slices.Sort(info.Nodes)
 	}
 }
 
@@ -782,6 +844,9 @@ func (c *Collector) collectPVELXCConfigs(ctx context.Context) error {
 }
 
 func (c *Collector) collectPVEGuestInventory(ctx context.Context) error {
+	if !c.pveRuntimeCommandsApply() {
+		return nil
+	}
 	commandsDir, err := c.ensureCommandsDir("pve")
 	if err != nil {
 		return err
@@ -812,26 +877,12 @@ func (c *Collector) collectPVEGuestInventory(ctx context.Context) error {
 	return nil
 }
 
-// collectVMConfigs collects VM and Container configurations
-func (c *Collector) collectVMConfigs(ctx context.Context) error {
-	c.logger.Debug("Collecting VM and container configuration directories")
-	if err := c.collectPVEQEMUConfigs(ctx); err != nil {
-		return err
-	}
-	if err := c.collectPVELXCConfigs(ctx); err != nil {
-		return err
-	}
-	if err := c.collectPVEGuestInventory(ctx); err != nil {
-		return err
-	}
-
-	c.logger.Debug("VM/CT configuration collection finished")
-	return nil
-}
-
 func (c *Collector) collectPVEBackupJobDefinitions(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if !c.pveRuntimeCommandsApply() {
+		return nil
 	}
 	jobsDir := c.pveJobsDir()
 	if err := c.ensureDir(jobsDir); err != nil {
@@ -851,6 +902,9 @@ func (c *Collector) collectPVEBackupJobDefinitions(ctx context.Context) error {
 func (c *Collector) collectPVEBackupJobHistory(ctx context.Context, nodes []string) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if !c.pveRuntimeCommandsApply() {
+		return nil
 	}
 	jobsDir := c.pveJobsDir()
 	if err := c.ensureDir(jobsDir); err != nil {
@@ -900,6 +954,83 @@ func (c *Collector) effectivePVEConfigPath() string {
 	return c.systemPath("/etc/pve")
 }
 
+// snapshotSQLiteDB captures a live SQLite database consistently via sqlite3's
+// ".backup" dot-command (the online-backup API): it takes a shared lock, reads
+// base+WAL as one coherent snapshot, and writes a plain journal-less database
+// file - exactly what a verbatim restore wants. The 5s busy timeout rides out a
+// pmxcfs commit holding the write lock. Any failure is the caller's cue to fall
+// back to a raw copy, loudly.
+func (c *Collector) snapshotSQLiteDB(ctx context.Context, src, dest string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.shouldSkipCopy(src, dest) {
+		return nil
+	}
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		c.logger.Warning("PVE configuration database: not a regular file %s", src)
+		return &os.PathError{Op: "stat", Path: src, Err: syscall.EINVAL}
+	}
+	if c.dryRun {
+		c.logger.Debug("[DRY RUN] Would capture PVE configuration database via sqlite3 .backup: %s", dest)
+		c.incFilesProcessed()
+		return nil
+	}
+	if _, err := c.depLookPath("sqlite3"); err != nil {
+		return fmt.Errorf("sqlite3 not available: %w", err)
+	}
+	if strings.ContainsAny(dest, `"`+"\n") {
+		return fmt.Errorf("destination %q not representable in a sqlite3 dot-command", dest)
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o750); err != nil {
+		return fmt.Errorf("create snapshot dir: %w", err)
+	}
+	// Publish only a successfully completed snapshot. A failed SQLite process
+	// may leave a partial database; it must not survive a failed raw fallback
+	// and then be mistaken for a collected artifact by the manifest.
+	snapshot, err := os.CreateTemp(filepath.Dir(dest), ".config.db-snapshot-*")
+	if err != nil {
+		return err
+	}
+	snapshotPath := snapshot.Name()
+	defer func() {
+		for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+			_ = os.Remove(snapshotPath + suffix)
+		}
+	}()
+	if err := snapshot.Close(); err != nil {
+		return err
+	}
+	out, err := c.depRunCommand(ctx, "sqlite3", "-readonly", "-cmd", ".timeout 5000", src, fmt.Sprintf(".backup %q", snapshotPath))
+	if err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return fmt.Errorf("%s: %w", msg, err)
+		}
+		return err
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if err := os.Remove(dest + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			c.logger.Warning("PVE configuration database: cannot remove %s", filepath.Base(dest+suffix))
+			c.logger.Debug("    Path: %s", dest+suffix)
+			c.logger.Debug("    Error: %s", safefs.SystemErrorText(err))
+			return err
+		}
+	}
+	if err := os.Rename(snapshotPath, dest); err != nil {
+		return err
+	}
+	c.incFilesProcessed()
+	if info, statErr := os.Stat(dest); statErr == nil {
+		c.addBytesCollected(info.Size())
+	}
+	c.logger.Debug("Successfully captured PVE configuration database via sqlite3 .backup: %s", dest)
+	return nil
+}
+
 func (c *Collector) effectivePVEClusterPath() string {
 	if path := strings.TrimSpace(c.config.PVEClusterPath); path != "" {
 		return c.systemPath(path)
@@ -907,8 +1038,36 @@ func (c *Collector) effectivePVEClusterPath() string {
 	return c.systemPath("/var/lib/pve-cluster")
 }
 
+// targetPathFor is where a PVE source lands in the archive: its canonical host path,
+// whatever PVE_CONFIG_PATH, PVE_CLUSTER_PATH, COROSYNC_CONFIG_PATH, VZDUMP_CONFIG_PATH,
+// CEPH_CONFIG_PATH or SYSTEM_ROOT_PREFIX pointed the read at, so the restore categories
+// (./etc/pve/, ./var/lib/pve-cluster/, ...) find it. It used to copy the source path as it
+// was: under SYSTEM_ROOT_PREFIX=/host, /etc/pve landed in the archive as ./host/etc/pve and
+// no restore category matched it.
 func (c *Collector) targetPathFor(src string) string {
 	clean := filepath.Clean(src)
+	switch clean {
+	case filepath.Clean(c.effectiveCorosyncConfigPath()):
+		return filepath.Join(c.tempDir, "etc/pve/corosync.conf")
+	case filepath.Clean(c.effectiveVzdumpConfigPath()):
+		return filepath.Join(c.tempDir, "etc/vzdump.conf")
+	}
+	if rel, ok := pathRelWithin(c.effectivePVEConfigPath(), clean); ok {
+		return filepath.Join(c.tempDir, "etc/pve", rel)
+	}
+	if rel, ok := pathRelWithin(c.effectivePVEClusterPath(), clean); ok {
+		return filepath.Join(c.tempDir, "var/lib/pve-cluster", rel)
+	}
+	for _, cephRoot := range c.cephConfigPaths() {
+		if rel, ok := pathRelWithin(cephRoot, clean); ok {
+			return filepath.Join(c.tempDir, "etc/ceph", rel)
+		}
+	}
+	if c.hostRootPrefixActive() {
+		if rel, ok := pathRelWithin(c.config.SystemRootPrefix, clean); ok {
+			clean = filepath.Join(string(os.PathSeparator), rel)
+		}
+	}
 	if filepath.IsAbs(clean) {
 		clean = strings.TrimPrefix(clean, string(os.PathSeparator))
 	}
@@ -917,6 +1076,19 @@ func (c *Collector) targetPathFor(src string) string {
 		clean = "pve"
 	}
 	return filepath.Join(c.tempDir, clean)
+}
+
+// pathRelWithin returns path relative to root when path is root or lies under it.
+func pathRelWithin(root, path string) (string, bool) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return rel, true
 }
 
 func (c *Collector) pveInfoDir() string {
@@ -954,6 +1126,9 @@ func (c *Collector) collectPVEScheduleCrontab(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if !c.pveRuntimeCommandsApply() {
+		return nil
+	}
 	schedulesDir := c.pveSchedulesDir()
 	if err := c.ensureDir(schedulesDir); err != nil {
 		return fmt.Errorf("failed to create schedules directory: %w", err)
@@ -972,6 +1147,9 @@ func (c *Collector) collectPVEScheduleCrontab(ctx context.Context) error {
 func (c *Collector) collectPVEScheduleTimers(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if !c.pveRuntimeCommandsApply() {
+		return nil
 	}
 	schedulesDir := c.pveSchedulesDir()
 	if err := c.ensureDir(schedulesDir); err != nil {
@@ -1015,6 +1193,9 @@ func (c *Collector) collectPVEReplicationDefinitions(ctx context.Context) error 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if !c.pveRuntimeCommandsApply() {
+		return nil
+	}
 	repDir := c.pveReplicationDir()
 	if err := c.ensureDir(repDir); err != nil {
 		return fmt.Errorf("failed to create replication directory: %w", err)
@@ -1033,6 +1214,9 @@ func (c *Collector) collectPVEReplicationDefinitions(ctx context.Context) error 
 func (c *Collector) collectPVEReplicationStatus(ctx context.Context, nodes []string) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if !c.pveRuntimeCommandsApply() {
+		return nil
 	}
 	repDir := c.pveReplicationDir()
 	if err := c.ensureDir(repDir); err != nil {
@@ -1181,11 +1365,13 @@ func (c *Collector) preparePVEStorageScan(ctx context.Context, storage pveStorag
 	}
 
 	c.logger.Info("Probing datastore %s (path=%s)%s", storage.Name, storage.Path, c.formatPVEStorageRuntime(storage))
-	stat, err := safefs.Stat(ctx, storage.Path, ioTimeout)
+	stat, err := safefs.Stat(ctx, c.systemPath(storage.Path), ioTimeout)
 	if err != nil {
 		if errors.Is(err, safefs.ErrTimeout) {
 			c.logger.Warning("PVE datastore %s skipped: filesystem probe timed out for %s (%v). Not scanning for vzdump backup files.", storage.Name, storage.Path, err)
 			c.logPVEStorageSkipDetails(storage, "filesystem_probe_timeout", err)
+		} else if c.hostRootPrefixActive() {
+			c.logPVEStorageNotVisible(storage, err)
 		} else {
 			c.logger.Warning("PVE datastore %s skipped: path %s not accessible (%v). Not scanning for vzdump backup files.", storage.Name, storage.Path, err)
 			c.logPVEStorageSkipDetails(storage, "path_not_accessible", err)
@@ -1195,6 +1381,10 @@ func (c *Collector) preparePVEStorageScan(ctx context.Context, storage pveStorag
 	if !stat.IsDir() {
 		c.logger.Warning("PVE datastore %s skipped: path %s is not a directory. Not scanning for vzdump backup files.", storage.Name, storage.Path)
 		c.logPVEStorageSkipDetails(storage, "path_not_directory", nil)
+		return nil, nil
+	}
+	if c.pveStorageMountNotCarried(storage, stat) {
+		c.logPVEStorageNotVisible(storage, nil)
 		return nil, nil
 	}
 
@@ -1207,6 +1397,35 @@ func (c *Collector) preparePVEStorageScan(ctx context.Context, storage pveStorag
 		Storage: storage,
 		MetaDir: metaDir,
 	}, nil
+}
+
+// pveMountStorageTypes are the storage types whose path is always a mount point the PVE
+// host mounts itself (under /mnt/pve).
+var pveMountStorageTypes = map[string]bool{"nfs": true, "cifs": true, "cephfs": true, "glusterfs": true}
+
+// pveStorageMountNotCarried reports a network storage seen under SYSTEM_ROOT_PREFIX as the
+// bare mount point it leaves on the host root: the bind of the host root does not carry the
+// separate mount, so the directory sits on the prefix root's own filesystem and reads empty.
+// A storage "dir" on a separate host disk looks the same and cannot be told apart here.
+func (c *Collector) pveStorageMountNotCarried(storage pveStorageEntry, info os.FileInfo) bool {
+	if !c.hostRootPrefixActive() || !pveMountStorageTypes[strings.ToLower(strings.TrimSpace(storage.Type))] {
+		return false
+	}
+	rootInfo, err := os.Stat(c.config.SystemRootPrefix)
+	if err != nil {
+		return false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	rootSt, rootOK := rootInfo.Sys().(*syscall.Stat_t)
+	return ok && rootOK && st.Dev == rootSt.Dev
+}
+
+// logPVEStorageNotVisible reports a storage the host has but this system cannot see under
+// SYSTEM_ROOT_PREFIX. It is not a fault of the storage, so it is not a warning: an appliance
+// with a network storage would otherwise end every run with one.
+func (c *Collector) logPVEStorageNotVisible(storage pveStorageEntry, err error) {
+	c.logger.Info("PVE datastore %s skipped: path %s not visible under SYSTEM_ROOT_PREFIX (a separate mount is not carried into this system). Not scanning for vzdump backup files.", storage.Name, storage.Path)
+	c.logPVEStorageSkipDetails(storage, "path_not_visible_under_prefix", err)
 }
 
 func (c *Collector) collectPVEStorageMetadataJSONStep(ctx context.Context, result *pveStorageScanResult, ioTimeout time.Duration) error {
@@ -1233,7 +1452,7 @@ func (c *Collector) collectPVEStorageMetadataJSONStep(ctx context.Context, resul
 		ScannedAt: time.Now(),
 	}
 
-	dirSamples, dirSampleErr := c.sampleDirectoriesBounded(ctx, storage.Path, 2, 20, ioTimeout)
+	dirSamples, dirSampleErr := c.sampleDirectoriesBounded(ctx, c.systemPath(storage.Path), 2, 20, ioTimeout)
 	if errors.Is(dirSampleErr, safefs.ErrTimeout) {
 		c.logger.Warning("Skipping datastore %s (path=%s)%s: directory sampling timed out (%v)", storage.Name, storage.Path, formatRuntime, dirSampleErr)
 		result.SkipRemaining = true
@@ -1251,7 +1470,7 @@ func (c *Collector) collectPVEStorageMetadataJSONStep(ctx context.Context, resul
 		meta.SampleDirectories = dirSamples
 	}
 
-	diskUsageText, diskUsageErr := c.describeDiskUsage(ctx, storage.Path, ioTimeout)
+	diskUsageText, diskUsageErr := c.describeDiskUsage(ctx, c.systemPath(storage.Path), ioTimeout)
 	if errors.Is(diskUsageErr, safefs.ErrTimeout) {
 		c.logger.Warning("Skipping datastore %s (path=%s)%s: disk usage probe timed out (%v)", storage.Name, storage.Path, formatRuntime, diskUsageErr)
 		result.SkipRemaining = true
@@ -1276,7 +1495,7 @@ func (c *Collector) collectPVEStorageMetadataJSONStep(ctx context.Context, resul
 	}
 	excludePatterns := c.config.PxarFileExcludePatterns
 
-	fileSummaries, sampleFileErr := c.sampleFilesBounded(ctx, storage.Path, includePatterns, excludePatterns, 3, 100, ioTimeout)
+	fileSummaries, sampleFileErr := c.sampleFilesBounded(ctx, c.systemPath(storage.Path), includePatterns, excludePatterns, 3, 100, ioTimeout)
 	if errors.Is(sampleFileErr, safefs.ErrTimeout) {
 		c.logger.Warning("Skipping datastore %s (path=%s)%s: file sampling timed out (%v)", storage.Name, storage.Path, formatRuntime, sampleFileErr)
 		result.SkipRemaining = true
@@ -1312,7 +1531,8 @@ func (c *Collector) collectPVEStorageMetadataTextStep(ctx context.Context, resul
 	storage := result.Storage
 	formatRuntime := c.formatPVEStorageRuntime(storage)
 
-	fileSampleLines, fileSampleErr := c.sampleMetadataFileStats(ctx, storage.Path, 3, 10, ioTimeout)
+	readPath := c.systemPath(storage.Path)
+	fileSampleLines, fileSampleErr := c.sampleMetadataFileStats(ctx, readPath, 3, 10, ioTimeout)
 	if errors.Is(fileSampleErr, safefs.ErrTimeout) {
 		c.logger.Warning("Skipping datastore %s (path=%s)%s: metadata sampling timed out (%v)", storage.Name, storage.Path, formatRuntime, fileSampleErr)
 		result.SkipRemaining = true
@@ -1323,6 +1543,13 @@ func (c *Collector) collectPVEStorageMetadataTextStep(ctx context.Context, resul
 	}
 	if fileSampleErr != nil {
 		c.logger.Debug("General file sampling for %s failed: %v", storage.Name, fileSampleErr)
+	}
+	if readPath != storage.Path {
+		// The sample lines name files by their full path: report the host's, not the prefix's.
+		hostRoot := filepath.Clean(storage.Path)
+		for i, line := range fileSampleLines {
+			fileSampleLines[i] = strings.Replace(line, " "+readPath, " "+hostRoot, 1)
+		}
 	}
 	result.FileSampleLines = fileSampleLines
 	result.FileSampleErr = fileSampleErr
@@ -1431,7 +1658,8 @@ func (c *Collector) collectDetailedPVEBackups(ctx context.Context, storage pveSt
 	type dirItem struct {
 		path string
 	}
-	stack := []dirItem{{path: storage.Path}}
+	readPath := c.systemPath(storage.Path)
+	stack := []dirItem{{path: readPath}}
 
 	for len(stack) > 0 {
 		if err := ctx.Err(); err != nil {
@@ -1502,7 +1730,15 @@ func (c *Collector) collectDetailedPVEBackups(ctx context.Context, storage pveSt
 					c.logger.Debug("Failed to copy small backup %s: %v", fullPath, err)
 				}
 			}
-			if includeDir != "" && strings.Contains(fullPath, includePattern) {
+			// The include pattern matches the host's path, not the prefix's. filepath.Rel
+			// and Join clean both sides, so a storage.cfg path written with a trailing
+			// slash ("path /var/lib/vz/") cannot put "//" in the middle and break a
+			// pattern such as "vz/dump".
+			hostPath := fullPath
+			if rel, err := filepath.Rel(readPath, fullPath); err == nil {
+				hostPath = filepath.Join(storage.Path, rel)
+			}
+			if includeDir != "" && strings.Contains(hostPath, includePattern) {
 				if err := c.copyBackupSample(ctx, fullPath, includeDir, fmt.Sprintf("selected PVE backup %s", name)); err != nil {
 					c.logger.Debug("Failed to copy pattern backup %s: %v", fullPath, err)
 				}
@@ -1539,6 +1775,7 @@ func (c *Collector) newPatternWriters(storage pveStorageEntry, analysisDir strin
 			c.logger.Warning("Failed to prepare writer for pattern %s: %v", pattern, err)
 			continue
 		}
+		pw.readRoot = c.systemPath(storage.Path)
 		writers = append(writers, pw)
 	}
 	return writers
@@ -1548,12 +1785,15 @@ type patternWriter struct {
 	pattern     string
 	storageName string
 	storagePath string
-	filePath    string
-	file        *os.File
-	writer      *bufio.Writer
-	count       int64
-	totalSize   int64
-	errorCount  int64
+	// readRoot is where storagePath is read from, under SYSTEM_ROOT_PREFIX; empty means
+	// storagePath itself.
+	readRoot   string
+	filePath   string
+	file       *os.File
+	writer     *bufio.Writer
+	count      int64
+	totalSize  int64
+	errorCount int64
 }
 
 func newPatternWriter(storageName, storagePath, analysisDir, pattern string, dryRun bool) (*patternWriter, error) {
@@ -1606,7 +1846,11 @@ func (pw *patternWriter) Write(path string, info os.FileInfo) error {
 		return nil
 	}
 
-	rel, err := filepath.Rel(pw.storagePath, path)
+	root := pw.storagePath
+	if pw.readRoot != "" {
+		root = pw.readRoot
+	}
+	rel, err := filepath.Rel(root, path)
 	if err != nil || strings.HasPrefix(rel, "..") {
 		rel = path
 	}
@@ -2019,6 +2263,9 @@ func (c *Collector) aggregateReplicationStatus(ctx context.Context, replicationD
 }
 
 func (c *Collector) writePVEVersionInfo(ctx context.Context, baseInfoDir string) error {
+	if !c.pveRuntimeCommandsApply() {
+		return nil
+	}
 	versionFile := filepath.Join(baseInfoDir, "pve_version.txt")
 	if err := c.safeCmdOutput(ctx, commandSpec("pveversion"), versionFile, "PVE version info", false); err != nil {
 		return err
@@ -2067,8 +2314,8 @@ func (c *Collector) augmentStoragesWithConfig(storages []pveStorageEntry) []pveS
 	for _, entry := range merged {
 		result = append(result, entry)
 	}
-	sort.Slice(result, func(i, j int) bool {
-		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
+	slices.SortFunc(result, func(a, b pveStorageEntry) int {
+		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
 	})
 	return result
 }
@@ -2306,84 +2553,243 @@ func (c *Collector) writeDatastoreMetadataText(
 	return c.writeReportFile(filepath.Join(metaDir, "metadata.txt"), []byte(builder.String()))
 }
 
-func relativeDepth(root, path string) int {
-	if root == path {
-		return 0
-	}
-	rel, err := filepath.Rel(root, path)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return 0
-	}
-	if rel == "." {
-		return 0
-	}
-	rel = filepath.ToSlash(rel)
-	return strings.Count(rel, "/") + 1
+// pveClusterDetectionError keeps an observable fact separate from its system
+// cause and state details. The validation brick chooses their visible levels;
+// callers still retain the original cause through errors.Is/errors.As.
+type pveClusterDetectionError struct {
+	reason string
+	cause  error
+	detail string
 }
 
-// isClusteredPVE checks if this is a clustered PVE system using multiple heuristics
-func (c *Collector) isClusteredPVE(ctx context.Context) (bool, error) {
+func (e *pveClusterDetectionError) Error() string {
+	if e.cause != nil {
+		return e.reason + ": " + e.cause.Error()
+	}
+	return e.reason
+}
+
+func (e *pveClusterDetectionError) Unwrap() error { return e.cause }
+
+// isClusteredPVE returns true for a configured cluster, false with no error only
+// for a consistently observed standalone node, and an error for unknown state.
+// Topology only affects cluster diagnostics; it never gates the core database.
+func (c *Collector) isClusteredPVE(ctx context.Context) (clustered bool, resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-
-	corosyncPath := c.effectiveCorosyncConfigPath()
-	corosyncExists := false
-	if corosyncPath != "" {
-		if _, err := c.depStat(corosyncPath); err == nil {
-			corosyncExists = true
+	defer func() {
+		if resultErr != nil {
+			resultErr = fmt.Errorf("PVE cluster state is unknown: %w", resultErr)
 		}
-	}
-	c.logger.Debug("Cluster detection: corosyncPath=%q exists=%v", corosyncPath, corosyncExists)
+	}()
 
-	if c.hasCorosyncClusterConfig() {
-		c.logger.Debug("Detected cluster via corosync configuration")
-		return true, nil
+	inspect := func(path string) (os.FileInfo, error) {
+		info, err := c.depStat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			// A dangling Corosync symlink is residual cluster evidence, not
+			// known absence. Preserve it rather than following it to ENOENT.
+			return os.Lstat(path)
+		}
+		return info, err
 	}
-
-	nodeCount, nodeErr := c.pveNodesDirCount()
-	if nodeErr != nil {
-		c.logger.Debug("Cluster detection: nodes directory count unavailable: %v", nodeErr)
-	} else {
-		c.logger.Debug("Cluster detection: nodes directory count=%d", nodeCount)
-		if nodeCount > 1 {
-			if corosyncExists {
-				c.logger.Debug("Detected cluster via nodes directory count (corosync config present)")
-				return true, nil
+	configPaths := []string{c.effectiveCorosyncConfigPath(), c.systemPath("/etc/corosync/corosync.conf")}
+	for _, path := range configPaths {
+		if info, err := inspect(path); err == nil {
+			if !info.Mode().IsRegular() {
+				return false, &pveClusterDetectionError{reason: "cannot inspect " + path, cause: syscall.EINVAL}
 			}
-			c.logger.Debug("Cluster detection: nodes directory suggests cluster, but corosync config missing; deferring to service/pvecm checks")
-		}
-	}
-
-	corosyncActive := c.isServiceActive(ctx, "corosync.service")
-	c.logger.Debug("Cluster detection: corosync.service active=%v", corosyncActive)
-	if corosyncActive {
-		if corosyncExists {
-			c.logger.Debug("Detected cluster via corosync.service state (corosync config present)")
+			// Even an incomplete configuration is cluster evidence. Never hide
+			// missing cluster artifacts merely because parsing would fail.
 			return true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, &pveClusterDetectionError{reason: "cannot inspect " + path, cause: err}
 		}
-		c.logger.Debug("Cluster detection: corosync.service active but corosync config missing; deferring to pvecm check")
+	}
+	if c.hostRootPrefixActive() {
+		// systemctl/pvecm address this namespace; a prefixed filesystem may
+		// describe another host. Combining those observations is unsupported.
+		return false, errors.ErrUnsupported
 	}
 
-	// Fallback to pvecm status
 	if _, err := c.depLookPath("pvecm"); err == nil {
 		output, err := c.depRunCommand(ctx, "pvecm", "status")
-		if err != nil {
-			outText := strings.TrimSpace(string(output))
-			if isPvecmMissingCorosyncConfig(outText) {
-				c.logger.Debug("Cluster detection: pvecm status indicates no corosync configuration; treating as standalone. Output: %s", summarizeCommandOutputText(outText))
-				return false, nil
-			}
-			return false, fmt.Errorf("pvecm status failed: %w", err)
-		}
-		clustered := strings.Contains(string(output), "Cluster information")
-		c.logger.Debug("pvecm status detected clustered=%v", clustered)
-		if clustered {
+		if err == nil && strings.Contains(string(output), "Cluster information") {
 			return true, nil
 		}
+		if err != nil && !isPvecmMissingCorosyncConfig(string(output)) {
+			return false, &pveClusterDetectionError{reason: "pvecm status failed", cause: err}
+		}
+		if err == nil {
+			return false, &pveClusterDetectionError{reason: "pvecm status returned unrecognized output"}
+		}
+	} else {
+		return false, &pveClusterDetectionError{reason: "cannot inspect pvecm", cause: err}
 	}
 
-	c.logger.Debug("Cluster heuristics indicate standalone PVE node")
+	authkey := c.systemPath("/etc/corosync/authkey")
+	if _, err := inspect(authkey); err == nil {
+		return false, &pveClusterDetectionError{reason: "authkey found without Corosync configuration"}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, &pveClusterDetectionError{reason: "cannot inspect " + authkey, cause: err}
+	}
+	if _, err := c.depLookPath("systemctl"); err != nil {
+		return false, &pveClusterDetectionError{reason: "systemctl unavailable", cause: err}
+	}
+	type serviceState struct{ active, sub, pid string }
+	service := func(name string) (serviceState, error) {
+		out, err := c.depRunCommand(ctx, "systemctl", "show", name, "--property=ActiveState,SubState,MainPID", "--no-pager")
+		if err != nil {
+			return serviceState{}, &pveClusterDetectionError{reason: "cannot query " + name, cause: err}
+		}
+		values := make(map[string]string)
+		for line := range strings.SplitSeq(string(out), "\n") {
+			if key, value, ok := strings.Cut(line, "="); ok {
+				values[key] = value
+			}
+		}
+		state := serviceState{values["ActiveState"], values["SubState"], values["MainPID"]}
+		valid := state.active == "inactive" && state.sub == "dead" && state.pid == "0"
+		if name == "pve-cluster.service" {
+			pid, err := strconv.ParseUint(state.pid, 10, 32)
+			valid = err == nil && pid > 0 && state.active == "active" && state.sub == "running"
+		}
+		if !valid {
+			return state, &pveClusterDetectionError{reason: "unexpected state for " + name, detail: fmt.Sprintf("State: %s/%s; PID: %s", state.active, state.sub, state.pid)}
+		}
+		return state, nil
+	}
+	corosync, err := service("corosync.service")
+	if err != nil {
+		return false, err
+	}
+	pmxcfs, err := service("pve-cluster.service")
+	if err != nil {
+		return false, err
+	}
+
+	readFile := os.ReadFile
+	if c.deps.ReadFile != nil {
+		readFile = c.deps.ReadFile
+	}
+	mountEvidence := func() (string, error) {
+		data, err := readFile("/proc/self/mountinfo")
+		if err != nil {
+			return "", &pveClusterDetectionError{reason: "cannot read pmxcfs mount information", cause: err}
+		}
+		unescape := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
+		for line := range strings.SplitSeq(string(data), "\n") {
+			left, right, ok := strings.Cut(line, " - ")
+			fields, fs := strings.Fields(left), strings.Fields(right)
+			if !ok || len(fields) < 6 || len(fs) < 3 {
+				continue
+			}
+			if unescape.Replace(fields[4]) != c.effectivePVEConfigPath() {
+				continue
+			}
+			if (fs[0] == "fuse" || fs[0] == "fuse.pmxcfs") && (fs[1] == "/dev/fuse" || fs[1] == "pmxcfs") && strings.Contains(","+fields[5]+",", ",rw,") {
+				return line, nil
+			}
+		}
+		return "", &pveClusterDetectionError{reason: "PVE configuration path is not mounted as pmxcfs"}
+	}
+	mount, err := mountEvidence()
+	if err != nil {
+		return false, err
+	}
+	cmdlinePath := filepath.Join("/proc", pmxcfs.pid, "cmdline")
+	cmdline, err := readFile(cmdlinePath)
+	if err != nil {
+		return false, &pveClusterDetectionError{reason: "cannot inspect pmxcfs process", cause: err}
+	}
+	args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+	if len(args) == 0 || filepath.Base(args[0]) != "pmxcfs" {
+		return false, &pveClusterDetectionError{reason: "pmxcfs process is not running in normal mode"}
+	}
+	for _, arg := range args[1:] {
+		// Normal service mode has no arguments. Permit foreground/debug only;
+		// forced-local (-l), combined flags and unknown modes remain uncertain.
+		if arg != "-f" && arg != "-d" && arg != "--foreground" && arg != "--debug" {
+			return false, &pveClusterDetectionError{reason: "pmxcfs process is not running in normal mode"}
+		}
+	}
+	membersPath := filepath.Join(c.effectivePVEConfigPath(), ".members")
+	membersData, err := readFile(membersPath)
+	if err != nil {
+		return false, &pveClusterDetectionError{reason: "cannot read pmxcfs membership", cause: err}
+	}
+	var members struct {
+		Nodename string          `json:"nodename"`
+		Version  *uint64         `json:"version"`
+		Cluster  json.RawMessage `json:"cluster"`
+		Nodelist json.RawMessage `json:"nodelist"`
+	}
+	if err := json.Unmarshal(membersData, &members); err != nil || strings.TrimSpace(members.Nodename) == "" || members.Version == nil {
+		return false, &pveClusterDetectionError{reason: "invalid pmxcfs membership data"}
+	}
+	if len(members.Cluster) > 0 || len(members.Nodelist) > 0 {
+		return false, &pveClusterDetectionError{reason: "pmxcfs membership contains cluster evidence"}
+	}
+	nodesDir := filepath.Join(c.effectivePVEConfigPath(), "nodes")
+	entries, err := os.ReadDir(nodesDir)
+	if err != nil {
+		return false, &pveClusterDetectionError{reason: "cannot inspect " + nodesDir, cause: err}
+	}
+	nodes := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			nodes++
+			if entry.Name() != members.Nodename {
+				return false, &pveClusterDetectionError{reason: "PVE node directories contain conflicting cluster evidence"}
+			}
+		}
+	}
+	if nodes != 1 {
+		return false, &pveClusterDetectionError{reason: "PVE node directories contain conflicting cluster evidence"}
+	}
+
+	// Recheck mutable observations before suppressing any diagnostics. This is
+	// evidence about the current configuration, never proof of its history.
+	for _, path := range append(configPaths, authkey) {
+		if _, err := inspect(path); err == nil {
+			return false, &pveClusterDetectionError{reason: "Corosync configuration changed"}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, &pveClusterDetectionError{reason: "cannot inspect " + path, cause: err}
+		}
+	}
+	again, err := readFile(membersPath)
+	if err != nil {
+		return false, &pveClusterDetectionError{reason: "cannot read pmxcfs membership", cause: err}
+	}
+	if !bytes.Equal(again, membersData) {
+		return false, &pveClusterDetectionError{reason: "pmxcfs membership changed during detection"}
+	}
+	for name, before := range map[string]serviceState{"corosync.service": corosync, "pve-cluster.service": pmxcfs} {
+		after, err := service(name)
+		if err != nil {
+			return false, err
+		}
+		if after != before {
+			return false, &pveClusterDetectionError{reason: "PVE service state changed during detection"}
+		}
+	}
+	again, err = readFile(cmdlinePath)
+	if err != nil {
+		return false, &pveClusterDetectionError{reason: "cannot inspect pmxcfs process", cause: err}
+	}
+	if !bytes.Equal(again, cmdline) {
+		return false, &pveClusterDetectionError{reason: "pmxcfs process is not running in normal mode"}
+	}
+	mountAgain, err := mountEvidence()
+	if err != nil {
+		return false, err
+	}
+	if mountAgain != mount {
+		return false, &pveClusterDetectionError{reason: "PVE configuration path is not mounted as pmxcfs"}
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	return false, nil
 }
 
@@ -2392,21 +2798,6 @@ func shortHostname(host string) string {
 		return host[:idx]
 	}
 	return host
-}
-
-func (c *Collector) hasCorosyncClusterConfig() bool {
-	corosyncPath := c.effectiveCorosyncConfigPath()
-	data, err := os.ReadFile(corosyncPath)
-	if err != nil {
-		return false
-	}
-	content := strings.ToLower(string(data))
-	for _, key := range []string{"cluster_name", "nodelist", "ring0_addr"} {
-		if strings.Contains(content, key) {
-			return true
-		}
-	}
-	return false
 }
 
 func (c *Collector) effectiveCorosyncConfigPath() string {
@@ -2432,26 +2823,6 @@ func (c *Collector) effectiveVzdumpConfigPath() string {
 		return c.systemPath(vzdumpPath)
 	}
 	return filepath.Join(c.effectivePVEConfigPath(), vzdumpPath)
-}
-
-func (c *Collector) hasMultiplePVENodes() bool {
-	count, err := c.pveNodesDirCount()
-	return err == nil && count > 1
-}
-
-func (c *Collector) pveNodesDirCount() (int, error) {
-	nodesDir := filepath.Join(c.effectivePVEConfigPath(), "nodes")
-	entries, err := os.ReadDir(nodesDir)
-	if err != nil {
-		return 0, err
-	}
-	count := 0
-	for _, entry := range entries {
-		if entry.IsDir() {
-			count++
-		}
-	}
-	return count, nil
 }
 
 func isPvecmMissingCorosyncConfig(output string) bool {
@@ -2508,10 +2879,8 @@ func (c *Collector) cephConfigPaths() []string {
 			abs = filepath.Clean(filepath.Join("/", path))
 		}
 		abs = c.systemPath(abs)
-		for _, existing := range paths {
-			if existing == abs {
-				return
-			}
+		if slices.Contains(paths, abs) {
+			return
 		}
 		paths = append(paths, abs)
 	}
@@ -2523,9 +2892,7 @@ func (c *Collector) cephConfigPaths() []string {
 	// effectivePVEConfigPath() is already prefixed and would double-prefix to
 	// PREFIX/PREFIX/etc/pve/ceph.
 	pveConfigRoot := strings.TrimSpace(c.config.PVEConfigPath)
-	if pveConfigRoot == "" {
-		pveConfigRoot = "/etc/pve"
-	}
+	pveConfigRoot = cmp.Or(pveConfigRoot, "/etc/pve")
 	add(filepath.Join(pveConfigRoot, "ceph"))
 	add("/etc/ceph")
 	return paths
@@ -2559,9 +2926,7 @@ func (c *Collector) cephHasClusterConfig(path string) bool {
 // verbatim so a restore onto a real host recreates the link correctly (issue #255).
 func (c *Collector) readSystemFileFollowingSymlinks(path string) ([]byte, error) {
 	root := strings.TrimSpace(c.config.SystemRootPrefix)
-	if root == "" {
-		root = string(filepath.Separator)
-	}
+	root = cmp.Or(root, string(filepath.Separator))
 	cleanRoot := filepath.Clean(root)
 	rel := path
 	switch {

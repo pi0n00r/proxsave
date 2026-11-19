@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           # No later step uses the git remote, so don't leave the GITHUB_TOKEN in .git/config.
           persist-credentials: false
@@ -29,7 +29,7 @@ jobs:
           cache: false
 
       - name: Install go-licenses
-        run: go install github.com/google/go-licenses@v1.6.0
+        run: go install github.com/google/go-licenses/v2@v2.0.1
 
       # Authoritative license gate. go-licenses reads the actual LICENSE files
       # from the module cache and classifies each linked dependency, so vanity
@@ -39,6 +39,7 @@ jobs:
       # dependency carries a license outside the allow-list.
       - name: Check dependency licenses
         run: |
-          export PATH="$(go env GOPATH)/bin:$PATH"
+          PATH="$(go env GOPATH)/bin:$PATH"
+          export PATH
           go-licenses check ./... \
             --allowed_licenses=MIT,Apache-2.0,BSD-2-Clause,BSD-3-Clause,ISC

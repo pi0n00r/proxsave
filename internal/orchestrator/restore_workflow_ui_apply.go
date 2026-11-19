@@ -9,6 +9,14 @@ import (
 	"github.com/tis24dev/proxsave/internal/logging"
 )
 
+// The post-restore steps reach these staged-config consumers through variables so
+// tests can see what each one is handed without running it against the live system.
+var (
+	installNetworkConfigFromStageFunc   = maybeInstallNetworkConfigFromStage
+	applyNetworkConfigWithUIFunc        = maybeApplyNetworkConfigWithUI
+	verifyAndRepairPBSNotificationsFunc = maybeVerifyAndRepairPBSNotificationsAfterRestore
+)
+
 func (w *restoreUIWorkflowRun) applyAccessControlFromStage() error {
 	return maybeApplyAccessControlWithUI(w.ctx, w.ui, w.logger, w.plan, w.safetyBackup, w.accessControlRollbackBackup, w.stageRoot, w.cfg.DryRun)
 }
@@ -30,15 +38,21 @@ func (w *restoreUIWorkflowRun) verifyPBSNotificationsAfterRestore() {
 	if !w.plan.SystemType.SupportsPBS() || !w.plan.HasCategoryID("pbs_notifications") || w.pbsServicesStopped {
 		return
 	}
-	if err := maybeVerifyAndRepairPBSNotificationsAfterRestore(w.ctx, w.logger, w.plan, w.stageRoot, w.cfg.DryRun); err != nil {
+	if w.skipForIncompleteStage("PBS notifications verification/repair") {
+		return
+	}
+	if err := verifyAndRepairPBSNotificationsFunc(w.ctx, w.logger, w.plan, w.stageRoot, w.cfg.DryRun); err != nil {
 		w.restoreHadWarnings = true
 		w.logger.Warning("PBS notifications verification/repair: %v", err)
 	}
 }
 
 func (w *restoreUIWorkflowRun) installNetworkConfigFromStage() error {
+	if w.skipForIncompleteStage("Network staged install") {
+		return nil
+	}
 	w.stageRootForNetworkApply = w.stageRoot
-	installed, err := maybeInstallNetworkConfigFromStage(w.ctx, w.logger, w.plan, w.stageRoot, w.prepared.ArchivePath, w.networkRollbackBackup, w.cfg.DryRun)
+	installed, err := installNetworkConfigFromStageFunc(w.ctx, w.logger, w.plan, w.stageRoot, w.prepared.ArchivePath, w.networkRollbackBackup, w.cfg.DryRun)
 	if err != nil {
 		if restoreAbortOrInput(err) {
 			return err
@@ -65,7 +79,7 @@ func (w *restoreUIWorkflowRun) recreateStorageDirectories() {
 	if err := RecreateDirectoriesFromConfig(w.systemType, w.logger); err != nil {
 		w.restoreHadWarnings = true
 		w.logger.Warning("Failed to recreate directory structures: %v", err)
-		w.logger.Warning("You may need to manually create storage/datastore directories")
+		w.logger.Warning("Storage and datastore directories - not recreated; a storage or datastore whose directory is missing stays unavailable")
 	}
 }
 
@@ -88,8 +102,13 @@ func (w *restoreUIWorkflowRun) repairDNSAfterRestore() error {
 }
 
 func (w *restoreUIWorkflowRun) applyNetworkConfig() error {
+	// Without a stage this step would offer the network files already in /etc, which
+	// the restore never wrote, as "a restored network configuration".
+	if w.skipForIncompleteStage("Network apply") {
+		return nil
+	}
 	w.logger.Info("")
-	err := maybeApplyNetworkConfigWithUI(w.ctx, w.ui, w.logger, networkConfigUIApplyRequest{
+	err := applyNetworkConfigWithUIFunc(w.ctx, w.ui, w.logger, networkConfigUIApplyRequest{
 		plan:                  w.plan,
 		safetyBackup:          w.safetyBackup,
 		networkRollbackBackup: w.networkRollbackBackup,
@@ -146,7 +165,7 @@ func (w *restoreUIWorkflowRun) logNetworkRollbackState(armed bool, observedIP, o
 		w.logger.Warning("Network apply not committed; rollback has executed (or marker cleared).")
 	}
 	if reconnectHost != "" && reconnectHost != "unknown" && originalIP != "unknown" {
-		w.logger.Warning("IP now (after apply): %s. Expected after rollback: %s. Reconnect using: %s", observedIP, originalIP, reconnectHost)
+		w.logger.Warning("IP now (after apply): %s. Expected after rollback: %s, reachable as %s", observedIP, originalIP, reconnectHost)
 	} else if originalIP != "unknown" {
 		w.logger.Warning("IP now (after apply): %s. Expected after rollback: %s", observedIP, originalIP)
 	} else {
@@ -155,6 +174,9 @@ func (w *restoreUIWorkflowRun) logNetworkRollbackState(armed bool, observedIP, o
 }
 
 func (w *restoreUIWorkflowRun) applyFirewallConfig() error {
+	if w.skipForIncompleteStage("PVE firewall apply") {
+		return nil
+	}
 	w.logger.Info("")
 	err := maybeApplyPVEFirewallWithUI(w.ctx, w.ui, w.logger, w.plan, w.safetyBackup, w.firewallRollbackBackup, w.stageRoot, w.cfg.DryRun)
 	if err == nil {
@@ -187,6 +209,9 @@ func firewallRollbackSummary(err error) (bool, time.Time, string) {
 }
 
 func (w *restoreUIWorkflowRun) applyHAConfig() error {
+	if w.skipForIncompleteStage("PVE HA apply") {
+		return nil
+	}
 	w.logger.Info("")
 	err := maybeApplyPVEHAWithUI(w.ctx, w.ui, w.logger, w.plan, w.safetyBackup, w.haRollbackBackup, w.stageRoot, w.cfg.DryRun)
 	if err == nil {
@@ -234,13 +259,22 @@ func (w *restoreUIWorkflowRun) logGenericRollbackNotCommitted(label string, arme
 
 func (w *restoreUIWorkflowRun) logRestoreCompletion() {
 	w.logger.Info("")
-	if w.restoreHadWarnings {
-		w.logger.Warning("Restore completed with warnings.")
-	} else {
-		w.logger.Info("Restore completed successfully.")
-	}
+	logRestoreVerdict(w.logger, w.restoreHadWarnings)
 	w.logger.Info("Temporary decrypted bundle removed.")
 	w.logRestoreArtifacts()
+}
+
+// logRestoreVerdict writes the restore's closing line. It counts every warning the
+// logger took, the same count the CLI wrapper's "Restore workflow completed ..." line
+// and the footer read: with the flag alone, a warning logged outside the flagged
+// steps (a sudoers file failing visudo, a firewall restart failing) left this line
+// saying "completed successfully" right above the wrapper's "completed with warnings".
+func logRestoreVerdict(logger *logging.Logger, flagged bool) {
+	if flagged || logger.HasWarnings() {
+		logger.Warning("Restore completed with warnings.")
+		return
+	}
+	logger.Info("Restore completed successfully.")
 }
 
 func (w *restoreUIWorkflowRun) logRestoreArtifacts() {
@@ -253,21 +287,18 @@ func (w *restoreUIWorkflowRun) logRestoreArtifacts() {
 	if w.exportLogPath != "" {
 		w.logger.Info("Export detailed log: %s", w.exportLogPath)
 	}
-	if w.stageRoot != "" {
-		w.logger.Info("Staging directory: %s", w.stageRoot)
-	}
 	if w.stageLogPath != "" {
 		w.logger.Info("Staging detailed log: %s", w.stageLogPath)
 	}
 	if w.safetyBackup != nil {
 		w.logger.Info("Safety backup preserved at: %s", w.safetyBackup.BackupPath)
-		w.logger.Info("Remove it manually if restore was successful: rm %s", w.safetyBackup.BackupPath)
+		w.logger.Info("Safety backup - kept until removed, ProxSave never deletes it")
 	}
 }
 
 func (w *restoreUIWorkflowRun) logServiceRestartAdvice() {
 	w.logger.Info("")
-	w.logger.Info("IMPORTANT: You may need to restart services for changes to take effect.")
+	w.logger.Info("Services - some restored files take effect only when the services that read them restart")
 	switch w.systemType {
 	case SystemTypeDual:
 		w.logPVERestartAdvice()
@@ -281,18 +312,26 @@ func (w *restoreUIWorkflowRun) logServiceRestartAdvice() {
 
 func (w *restoreUIWorkflowRun) logPVERestartAdvice() {
 	if w.needsClusterRestore && w.clusterServicesStopped {
-		w.logger.Info("  PVE services were stopped/restarted during restore; verify status with: pvecm status")
+		if w.clusterServicesNotRunning != nil {
+			w.logger.Warning("  PVE services - stopped for this restore and not running: %s", w.clusterServicesNotRunning.notRunning())
+			return
+		}
+		w.logger.Info("  PVE services - stopped and started again during this restore")
 		return
 	}
-	w.logger.Info("  PVE services: systemctl restart pve-cluster pvedaemon pveproxy")
+	w.logger.Info("  PVE services - not restarted by this restore: pve-cluster, pvedaemon, pveproxy")
 }
 
 func (w *restoreUIWorkflowRun) logPBSRestartAdvice() {
 	if w.pbsServicesStopped {
-		w.logger.Info("  PBS services were stopped/restarted during restore; verify status with: systemctl status proxmox-backup proxmox-backup-proxy")
+		if w.pbsServicesNotRunning != nil {
+			w.logger.Warning("  PBS services - stopped for this restore and not running: %s", w.pbsServicesNotRunning.notRunning())
+			return
+		}
+		w.logger.Info("  PBS services - stopped and started again during this restore")
 		return
 	}
-	w.logger.Info("  PBS services: systemctl restart proxmox-backup-proxy proxmox-backup")
+	w.logger.Info("  PBS services - not restarted by this restore: proxmox-backup-proxy, proxmox-backup")
 }
 
 func (w *restoreUIWorkflowRun) checkZFSPoolsAfterRestore() {

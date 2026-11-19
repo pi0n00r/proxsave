@@ -107,14 +107,6 @@ func RunDecryptWorkflow(ctx context.Context, cfg *config.Config, logger *logging
 	return RunDecryptWorkflowWithDeps(ctx, &deps, version)
 }
 
-func selectDecryptCandidate(ctx context.Context, reader *bufio.Reader, cfg *config.Config, logger *logging.Logger, requireEncrypted bool) (candidate *backupCandidate, err error) {
-	done := logging.DebugStart(logger, "select backup candidate", "requireEncrypted=%v", requireEncrypted)
-	defer func() { done(err) }()
-
-	ui := newCLIWorkflowUI(reader, logger)
-	return selectBackupCandidateWithUI(ctx, ui, cfg, logger, "Decrypt", requireEncrypted)
-}
-
 func promptPathSelection(ctx context.Context, reader *bufio.Reader, options []decryptPathOption) (decryptPathOption, error) {
 	for {
 		fmt.Println("\nSelect the backup source:")
@@ -285,11 +277,40 @@ func inspectRcloneMetadataManifest(ctx context.Context, remoteMetadataPath, remo
 	if err != nil {
 		return nil, fmt.Errorf("prepare rclone metadata cat: %w", err)
 	}
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("rclone cat %s failed: %w (output: %s)", remoteMetadataPath, err, strings.TrimSpace(string(output)))
+	safeexec.ApplyWaitDelay(cmd)
+	// Stdout and stderr are kept apart, the way readRcloneManifestStreaming already
+	// does a few lines above. This function parses the bytes, and rclone writes its
+	// NOTICE and WARNING lines to stderr while the file content goes to stdout;
+	// merged, those lines land in front of the JSON and json.Unmarshal fails on a
+	// byte rclone never meant as data.
+	//
+	// This one is a repair on the invariant, not on a reproduction. Measured on a
+	// live node (2026-09-05): `rclone cat` on a real JSON file wrote 0 bytes to
+	// stderr with a config present, under a broken locale included; with the config
+	// MISSING it wrote 102 bytes ("NOTICE: Config file ... not found - using
+	// defaults") and the merged bytes stopped parsing. A missing config also makes a
+	// `remote:path` read fail outright, so that exact route exits at the error above
+	// instead. Other rclone NOTICEs on a successful cat (deprecations, token
+	// refreshes on cloud backends) were not measured.
+	//
+	// The damage if it is ever reached is the worst of the family, which is why it is
+	// repaired anyway: a failed parse does not fail the call, it falls through to the
+	// legacy KEY=VALUE branch below and yields a manifest carrying only ArchivePath,
+	// with no checksum. The legacy branch itself stays: it is a real older format,
+	// and what changes is only that valid JSON no longer reaches it.
+	var stdout, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Run(); err != nil {
+		// The reason is on stderr; the error path is a transcript, so both streams are
+		// reported here.
+		return nil, fmt.Errorf("rclone cat %s failed: %w (output: %s)", remoteMetadataPath, err,
+			strings.TrimSpace(stderrBuf.String()+"\n"+stdout.String()))
 	}
-	data := bytes.TrimSpace(output)
+	if noise := strings.TrimSpace(stderrBuf.String()); noise != "" {
+		logDebug(logger, "rclone cat %s wrote to stderr while succeeding: %s", remoteMetadataPath, noise)
+	}
+	data := bytes.TrimSpace(stdout.Bytes())
 	if len(data) == 0 {
 		return nil, fmt.Errorf("metadata file is empty")
 	}
@@ -307,7 +328,7 @@ func inspectRcloneMetadataManifest(ctx context.Context, remoteMetadataPath, remo
 	legacy := &backup.Manifest{
 		ArchivePath: remoteArchivePath,
 	}
-	for _, rawLine := range strings.Split(string(data), "\n") {
+	for rawLine := range strings.SplitSeq(string(data), "\n") {
 		line := strings.TrimSpace(rawLine)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -413,25 +434,6 @@ func promptCandidateSelection(ctx context.Context, reader *bufio.Reader, candida
 	}
 }
 
-func promptDestinationDir(ctx context.Context, reader *bufio.Reader, cfg *config.Config) (string, error) {
-	defaultDir := "./decrypt"
-	if cfg != nil {
-		if base := strings.TrimSpace(cfg.BaseDir); base != "" {
-			defaultDir = filepath.Join(base, "decrypt")
-		}
-	}
-	fmt.Printf("\nEnter destination directory for decrypted bundle [press Enter to use %s]: ", defaultDir)
-	inputLine, err := input.ReadLineWithIdle(ctx, reader, cliIdleTimeout)
-	if err != nil {
-		return "", err
-	}
-	trimmed := strings.TrimSpace(inputLine)
-	if trimmed == "" {
-		trimmed = defaultDir
-	}
-	return filepath.Clean(trimmed), nil
-}
-
 // downloadRcloneBackup downloads a backup bundle from an rclone remote to a local temp file
 func downloadRcloneBackup(ctx context.Context, remotePath string, logger *logging.Logger) (tmpPath string, cleanup func(), err error) {
 	done := logging.DebugStart(logger, "download rclone backup", "remote=%s", remotePath)
@@ -489,27 +491,6 @@ func fsIoTimeoutFromConfig(cfg *config.Config) time.Duration {
 	return time.Duration(cfg.FsIoTimeoutSeconds) * time.Second
 }
 
-func preparePlainBundle(ctx context.Context, reader *bufio.Reader, cand *backupCandidate, version string, logger *logging.Logger, timeout time.Duration) (bundle *preparedBundle, err error) {
-	ui := newCLIWorkflowUI(reader, logger)
-	return preparePlainBundleWithUI(ctx, cand, version, logger, ui, timeout)
-}
-
-func prepareDecryptedBackup(ctx context.Context, reader *bufio.Reader, cfg *config.Config, logger *logging.Logger, version string, requireEncrypted bool) (candidate *backupCandidate, prepared *preparedBundle, err error) {
-	done := logging.DebugStart(logger, "prepare decrypted backup", "requireEncrypted=%v", requireEncrypted)
-	defer func() { done(err) }()
-	candidate, err = selectDecryptCandidate(ctx, reader, cfg, logger, requireEncrypted)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	prepared, err = preparePlainBundle(ctx, reader, candidate, version, logger, fsIoTimeoutFromConfig(cfg))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return candidate, prepared, nil
-}
-
 // sanitizeBundleEntryName ensures the tar entry name cannot escape the working directory.
 func sanitizeBundleEntryName(name string) (string, error) {
 	trimmed := strings.TrimSpace(name)
@@ -532,10 +513,6 @@ func sanitizeBundleEntryName(name string) (string, error) {
 		return "", fmt.Errorf("invalid base name in archive entry %q", name)
 	}
 	return base, nil
-}
-
-func extractBundleToWorkdir(bundlePath, workDir string) (staged stagedFiles, err error) {
-	return extractBundleToWorkdirWithLogger(bundlePath, workDir, nil)
 }
 
 func extractBundleToWorkdirWithLogger(bundlePath, workDir string, logger *logging.Logger) (staged stagedFiles, err error) {
@@ -575,6 +552,13 @@ func extractBundleToWorkdirWithLogger(bundlePath, workDir string, logger *loggin
 		if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 			return stagedFiles{}, fmt.Errorf("archive entry escapes workdir: %q", hdr.Name)
 		}
+		// Redundant prefix containment check: sanitizeBundleEntryName already
+		// reduces the entry to a base name and the filepath.Rel test above
+		// rejects escapes, but a prefix test is the form static analysers
+		// (CodeQL go/zipslip) recognise as a traversal barrier.
+		if !strings.HasPrefix(target, restoreRootPrefix(filepath.Clean(workDir))) {
+			return stagedFiles{}, fmt.Errorf("archive entry escapes workdir: %q", hdr.Name)
+		}
 		out, err := restoreFS.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
 		if err != nil {
 			return stagedFiles{}, fmt.Errorf("extract %s: %w", hdr.Name, err)
@@ -610,12 +594,6 @@ func extractBundleToWorkdirWithLogger(bundlePath, workDir string, logger *loggin
 	}
 	logging.DebugStep(logger, "extract bundle", "entries_extracted=%d", extracted)
 	return staged, nil
-}
-
-func copyRawArtifactsToWorkdir(ctx context.Context, cand *backupCandidate, workDir string) (staged stagedFiles, err error) {
-	// timeout 0 = unbounded (legacy); the bounded production path passes the
-	// configured FS_IO_TIMEOUT via copyRawArtifactsToWorkdirWithLogger.
-	return copyRawArtifactsToWorkdirWithLogger(ctx, cand, workDir, nil, 0)
 }
 
 func baseNameFromRemoteRef(ref string) string {
@@ -723,16 +701,6 @@ func copyRawArtifactsToWorkdirWithLogger(ctx context.Context, cand *backupCandid
 	}, nil
 }
 
-func decryptArchiveWithPrompts(ctx context.Context, reader *bufio.Reader, encryptedPath, outputPath string, logger *logging.Logger) error {
-	ui := newCLIWorkflowUI(reader, logger)
-	displayName := filepath.Base(encryptedPath)
-	return decryptArchiveWithSecretPrompt(ctx, encryptedPath, outputPath, displayName, ui.PromptDecryptSecret, nil)
-}
-
-func parseIdentityInput(input string) ([]age.Identity, error) {
-	return parseIdentityInputWithSalts(input, nil)
-}
-
 // parseIdentityInputWithSalts parses a private key directly, or treats the input
 // as a passphrase and derives the candidate identities. extraSalts carries the
 // per-installation salt read from the archive manifest so passphrase decryption
@@ -802,22 +770,6 @@ func formatTargets(manifest *backup.Manifest) string {
 	return "unknown target"
 }
 
-func formatTargetSummary(manifest *backup.Manifest) string {
-	targets := formatTargets(manifest)
-	version := strings.TrimSpace(manifest.ProxmoxVersion)
-	if version == "" {
-		version = "unknown"
-	}
-	if !strings.HasPrefix(strings.ToLower(version), "v") {
-		version = "v" + version
-	}
-	summary := fmt.Sprintf("%s %s", targets, version)
-	if cluster := formatClusterMode(manifest.ClusterMode); cluster != "" {
-		summary = fmt.Sprintf("%s (%s)", summary, cluster)
-	}
-	return summary
-}
-
 func statusFromManifest(manifest *backup.Manifest) string {
 	mode := strings.TrimSpace(manifest.EncryptionMode)
 	if strings.EqualFold(mode, "age") {
@@ -834,11 +786,6 @@ func moveFileSafe(src, dst string) error {
 		return err
 	}
 	return restoreFS.Remove(src)
-}
-
-func ensureWritablePath(ctx context.Context, reader *bufio.Reader, path, description string) (string, error) {
-	ui := newCLIWorkflowUI(reader, nil)
-	return ensureWritablePathWithUI(ctx, ui, path, description)
 }
 
 func formatClusterMode(value string) string {

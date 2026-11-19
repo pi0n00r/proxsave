@@ -5,7 +5,7 @@ import (
 	"bufio"
 	"context"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/tis24dev/proxsave/internal/logging"
@@ -95,17 +95,8 @@ func logNoImportableZFSPools(ctx context.Context, logger *logging.Logger, config
 }
 
 func logManualZFSImportInstructions(logger *logging.Logger, importablePools []string) {
-	logger.Info("⚠ IMPORTANT: ZFS pools may need manual import after restore!")
-	logger.Info("  Before rebooting, run these commands:")
-	logger.Info("  1. Check available pools:  zpool import")
-	for _, pool := range importablePools {
-		logger.Info("  2. Import pool manually:   zpool import %s", pool)
-	}
-	logger.Info("  3. Verify pool status:     zpool status")
-	logger.Info("")
-	logger.Info("  If pools fail to import, check:")
-	logger.Info("  - journalctl -u zfs-import@<pool-name>.service or import@<pool-name>.service")
-	logger.Info("  - zpool import -d /dev/disk/by-id")
+	logger.Info("ZFS pools - importable, not imported: %s", strings.Join(importablePools, ", "))
+	logger.Info("ZFS pools - a pool that is not imported stays unavailable after the reboot, with the storages and datastores on it")
 	logger.Info("")
 }
 
@@ -160,7 +151,7 @@ func sortedPoolNames(pools map[string]struct{}) []string {
 	for pool := range pools {
 		poolNames = append(poolNames, pool)
 	}
-	sort.Strings(poolNames)
+	slices.Sort(poolNames)
 	return poolNames
 }
 
@@ -199,25 +190,4 @@ func parseZpoolImportOutput(output string) []string {
 		}
 	}
 	return pools
-}
-
-func combinePoolNames(a, b []string) []string {
-	merged := make(map[string]struct{})
-	for _, pool := range a {
-		merged[pool] = struct{}{}
-	}
-	for _, pool := range b {
-		merged[pool] = struct{}{}
-	}
-
-	if len(merged) == 0 {
-		return nil
-	}
-
-	names := make([]string, 0, len(merged))
-	for pool := range merged {
-		names = append(names, pool)
-	}
-	sort.Strings(names)
-	return names
 }

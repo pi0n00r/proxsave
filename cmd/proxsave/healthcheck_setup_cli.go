@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/tis24dev/proxsave/internal/installer"
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/orchestrator"
 )
@@ -15,6 +16,7 @@ var (
 	healthcheckSetupCheck          = orchestrator.CheckHealthcheckConnection
 	healthcheckSetupSelfCheck      = orchestrator.CheckHealthcheckSelfConnection
 	healthcheckSetupPromptYesNo    = promptYesNo
+	healthcheckSetupNotifyFilter   = orchestrator.CheckHealthcheckNotifyFilter
 )
 
 func logHealthcheckSetupBootstrapOutcome(bootstrap *logging.BootstrapLogger, state orchestrator.HealthcheckSetupBootstrap) {
@@ -26,7 +28,7 @@ func logHealthcheckSetupBootstrapOutcome(bootstrap *logging.BootstrapLogger, sta
 	case orchestrator.HealthcheckSetupEligibleSelf:
 		logBootstrapInfo(bootstrap, "Healthcheck setup: self mode (reachability check of your own alive URL)")
 	case orchestrator.HealthcheckSetupSkipSelfMode:
-		logBootstrapInfo(bootstrap, "Healthcheck setup: self mode but no alive URL configured yet (skipping)")
+		logBootstrapInfo(bootstrap, "Healthcheck setup: self mode but no alive check configured yet, neither a ping URL nor a check id (skipping)")
 	case orchestrator.HealthcheckSetupSkipIdentityUnavailable:
 		// A-aware: no ServerID vs missing relay secret read distinctly, and the
 		// missing-secret copy no longer says "pair Telegram" (the relay secret is now
@@ -40,7 +42,18 @@ func logHealthcheckSetupBootstrapOutcome(bootstrap *logging.BootstrapLogger, sta
 // (mirrors runTelegramSetupCLI): a short guide, the portal magic-link, and a
 // non-blocking connection check with retry/skip. Only renders when the daemon
 // engine with centralized monitoring was chosen and the identity/secret exist.
-func runHealthcheckSetupCLI(ctx context.Context, reader *bufio.Reader, baseDir, configPath string, bootstrap *logging.BootstrapLogger) error {
+func runHealthcheckSetupCLI(ctx context.Context, reader *bufio.Reader, baseDir, configPath string, bootstrap *logging.BootstrapLogger, options ...installer.HealthcheckSetupOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(options) > 0 && options[0].BeforeBootstrap != nil {
+		if err := options[0].BeforeBootstrap(ctx); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	state, err := healthcheckSetupBuildBootstrap(ctx, configPath, baseDir)
 	if err != nil {
 		logBootstrapWarning(bootstrap, "Healthcheck setup bootstrap failed (non-blocking): %v", err)
@@ -79,6 +92,7 @@ func runHealthcheckSetupCLI(ctx context.Context, reader *bufio.Reader, baseDir, 
 	for {
 		attempts++
 		var st orchestrator.HealthcheckSetupState
+		var nf orchestrator.HealthcheckNotifyFilter
 		if selfMode {
 			// Self mode: pure reachability of the user's own alive URL; no server
 			// fetch, no magic-link (LoginURL stays empty so the box is skipped).
@@ -87,6 +101,8 @@ func runHealthcheckSetupCLI(ctx context.Context, reader *bufio.Reader, baseDir, 
 		} else {
 			res := healthcheckSetupCheck(ctx, state.ServerAPIHost, state.ServerID, baseDir, state.HealthcheckHeartbeatInterval)
 			st = orchestrator.ClassifyHealthcheckSetupResult(res)
+			// The run's own NOTIFY_ON decision, on the daemon diagnosis this check just made.
+			nf = healthcheckSetupNotifyFilter(ctx, configPath, baseDir, state.ServerAPIHost, state.ServerID, res.Daemon)
 		}
 
 		// Show the portal whenever the server told us something about it - even if the
@@ -96,6 +112,7 @@ func runHealthcheckSetupCLI(ctx context.Context, reader *bufio.Reader, baseDir, 
 		printHealthcheckPortal(st)
 
 		printHealthcheckSetupStatus(st)
+		printHealthcheckNotifyBlock(selfMode, nf)
 
 		if st.Verified {
 			logBootstrapInfo(bootstrap, "Healthcheck setup: connection verified (attempts=%d, state=%s)", attempts, st.Keyword)
@@ -133,6 +150,14 @@ func runHealthcheckSetupCLI(ctx context.Context, reader *bufio.Reader, baseDir, 
 func printHealthcheckPortal(st orchestrator.HealthcheckSetupState) {
 	if link := strings.TrimSpace(st.LoginURL); link != "" {
 		fmt.Println()
+		if st.LoginIsPortalPage {
+			// The operator owns the project (issue 347): the sign-in page, not a single-use link.
+			fmt.Println("Your monitoring portal:")
+			fmt.Printf("  %s\n", link)
+			fmt.Println(orchestrator.HealthcheckPortalPageSignIn(st.LoginPasswordSet))
+			fmt.Println()
+			return
+		}
 		fmt.Println("Your monitoring portal (single-use link, valid ~1h):")
 		fmt.Printf("  %s\n", link)
 		fmt.Println("Open it to set a password and configure alert channels (email, etc.).")
@@ -169,4 +194,18 @@ func printHealthcheckSetupStatus(st orchestrator.HealthcheckSetupState) {
 	if st.Message != "" {
 		fmt.Printf("  %s\n", st.Message)
 	}
+}
+
+// printHealthcheckNotifyBlock prints the Notifications block under the Status, in the CLI's own
+// layout (title, then the values indented), with the dashboard's text. Nothing when backup.env
+// could not be read.
+func printHealthcheckNotifyBlock(selfMode bool, nf orchestrator.HealthcheckNotifyFilter) {
+	setting, current, ok := orchestrator.HealthcheckNotifyLines(selfMode, nf)
+	if !ok {
+		return
+	}
+	fmt.Println()
+	fmt.Println("Notifications:")
+	fmt.Printf("  Setting: %s\n", setting)
+	fmt.Printf("  Current: %s\n", current)
 }

@@ -8,9 +8,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tis24dev/proxsave/internal/logging"
 )
 
 type runOnlyRunner struct{}
@@ -22,11 +25,16 @@ func (runOnlyRunner) Run(ctx context.Context, name string, args ...string) ([]by
 type zfsContextTestKey struct{}
 
 type recordingRunner struct {
-	calls []string
+	calls           []string
+	inventoryOutput []byte
 }
 
 func (r *recordingRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	r.calls = append(r.calls, commandKey(name, args))
+	key := commandKey(name, args)
+	r.calls = append(r.calls, key)
+	if key == pveGuestInventoryCommand && r.inventoryOutput != nil {
+		return r.inventoryOutput, nil
+	}
 	return []byte("ok"), nil
 }
 
@@ -180,13 +188,7 @@ func TestCheckZFSPoolsAfterRestore_ConfiguredPools_NoImportables(t *testing.T) {
 	}
 
 	for _, want := range []string{"which zpool", "zpool import", "zpool status tank", "zpool status backup_ext"} {
-		found := false
-		for _, call := range fake.Calls {
-			if call == want {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(fake.Calls, want)
 		if !found {
 			t.Fatalf("expected call %q, got calls=%#v", want, fake.Calls)
 		}
@@ -221,13 +223,7 @@ func TestCheckZFSPoolsAfterRestore_ReportsImportablePools(t *testing.T) {
 	}
 
 	for _, want := range []string{"which zpool", "zpool import"} {
-		found := false
-		for _, call := range fake.Calls {
-			if call == want {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(fake.Calls, want)
 		if !found {
 			t.Fatalf("expected call %q, got calls=%#v", want, fake.Calls)
 		}
@@ -249,7 +245,7 @@ func TestApplyStorageCfg_NoBlocksReturnsNil(t *testing.T) {
 		t.Fatalf("write storage.cfg: %v", err)
 	}
 
-	applied, failed, err := applyStorageCfg(context.Background(), cfgPath, newTestLogger())
+	applied, _, failed, err := applyStorageCfg(context.Background(), cfgPath, newTestLogger())
 	if err != nil {
 		t.Fatalf("applyStorageCfg error: %v", err)
 	}
@@ -274,7 +270,10 @@ func TestRunSafeClusterApply_AppliesVMStorageAndDatacenterConfigs(t *testing.T) 
 	}
 	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	runner := &recordingRunner{}
+	runner := &recordingRunner{inventoryOutput: guestInventoryJSON(t,
+		pveGuestResource{VMID: 100, Node: localNodeName(), Kind: "qemu", Status: "stopped"},
+		pveGuestResource{VMID: 101, Node: localNodeName(), Kind: "lxc", Status: "stopped"},
+	)}
 	restoreCmd = runner
 
 	exportRoot := t.TempDir()
@@ -318,9 +317,18 @@ func TestRunSafeClusterApply_AppliesVMStorageAndDatacenterConfigs(t *testing.T) 
 		t.Fatalf("write datacenter.cfg: %v", err)
 	}
 
+	// datacenter.cfg is no longer a pvesh call (the live node has no 'set'
+	// handler on /cluster/config): it is a pmxcfs write, asserted on the file.
+	pmxRoot := t.TempDir()
+	seamPmxcfs(t, pmxRoot, true, nil)
+
 	reader := bufio.NewReader(strings.NewReader("yes\nyes\nyes\n"))
 	if err := runSafeClusterApply(context.Background(), reader, exportRoot, newTestLogger()); err != nil {
 		t.Fatalf("runSafeClusterApply error: %v", err)
+	}
+
+	if got, err := os.ReadFile(filepath.Join(pmxRoot, "datacenter.cfg")); err != nil || string(got) != "keyboard: it\n" {
+		t.Fatalf("datacenter.cfg not written into pmxcfs: %q err=%v", got, err)
 	}
 
 	wantPrefixes := []string{
@@ -328,7 +336,6 @@ func TestRunSafeClusterApply_AppliesVMStorageAndDatacenterConfigs(t *testing.T) 
 		"pvesh set /nodes/" + node + "/lxc/101/config --hostname=ct101",
 		"pvesh create /storage --storage=local --type=dir --path=/var/lib/vz",
 		"pvesh create /storage --storage=backup_ext --type=nfs --server=10.0.0.1",
-		"pvesh set /cluster/config -conf ",
 	}
 	for _, prefix := range wantPrefixes {
 		found := false
@@ -378,13 +385,8 @@ func TestRunSafeClusterApply_AppliesPoolsFromUserCfg(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(userCfgPath), 0o755); err != nil {
 		t.Fatalf("mkdir user.cfg dir: %v", err)
 	}
-	userCfg := strings.Join([]string{
-		"pool: dev",
-		"    comment Dev pool",
-		"    vms 100,101",
-		"    storage local,backup_ext",
-		"",
-	}, "\n")
+	// The format PVE writes (measured on PVE 9.1.9): pool:<id>:<comment>:<vms>:<storage>:
+	userCfg := "user:root@pam:1:0::::::\n\npool:dev:Dev pool:100,101:local,backup_ext:\n"
 	if err := os.WriteFile(userCfgPath, []byte(userCfg), 0o640); err != nil {
 		t.Fatalf("write user.cfg: %v", err)
 	}
@@ -441,7 +443,7 @@ func TestRunSafeClusterApply_AppliesResourceMappingsFromProxsaveInfo(t *testing.
 		t.Fatalf("mkdir mapping dir: %v", err)
 	}
 	if err := os.WriteFile(mappingPath, []byte(strings.TrimSpace(`[
-  {"id":"device1","comment":"GPU","map":[{"node":"pve01","path":"0000:01:00.0"}]}
+  {"id":"device1","description":"GPU","map":[{"node":"pve01","path":"0000:01:00.0"}]}
 ]`)), 0o640); err != nil {
 		t.Fatalf("write mapping_pci.json: %v", err)
 	}
@@ -451,7 +453,7 @@ func TestRunSafeClusterApply_AppliesResourceMappingsFromProxsaveInfo(t *testing.
 		t.Fatalf("runSafeClusterApply error: %v", err)
 	}
 
-	wantPrefix := "pvesh create /cluster/mapping/pci --id device1 --comment GPU --map node=pve01,path=0000:01:00.0"
+	wantPrefix := "pvesh create /cluster/mapping/pci --id device1 --description GPU --map node=pve01,path=0000:01:00.0"
 	found := false
 	for _, call := range runner.calls {
 		if strings.HasPrefix(call, wantPrefix) {
@@ -480,7 +482,9 @@ func TestRunSafeClusterApply_UsesSingleExportedNodeWhenHostnameMismatch(t *testi
 	}
 	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	runner := &recordingRunner{}
+	runner := &recordingRunner{inventoryOutput: guestInventoryJSON(t,
+		pveGuestResource{VMID: 100, Node: localNodeName(), Kind: "qemu", Status: "stopped"},
+	)}
 	restoreCmd = runner
 
 	exportRoot := t.TempDir()
@@ -533,7 +537,9 @@ func TestRunSafeClusterApply_PromptsForSourceNodeWhenMultipleExportNodes(t *test
 	}
 	t.Setenv("PATH", pathDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	runner := &recordingRunner{}
+	runner := &recordingRunner{inventoryOutput: guestInventoryJSON(t,
+		pveGuestResource{VMID: 101, Node: localNodeName(), Kind: "qemu", Status: "stopped"},
+	)}
 	restoreCmd = runner
 
 	exportRoot := t.TempDir()
@@ -641,7 +647,7 @@ func TestRunRestoreCommandStream_FallsBackToExecCommand(t *testing.T) {
 }
 
 func TestRunRestoreWorkflow_ReturnsErrorWhenConfigMissing(t *testing.T) {
-	err := RunRestoreWorkflow(context.Background(), nil, newTestLogger(), "")
+	err := RunRestoreWorkflow(context.Background(), nil, newTestLogger(), "", "")
 	if err == nil || !strings.Contains(err.Error(), "configuration not available") {
 		t.Fatalf("expected config missing error, got %v", err)
 	}
@@ -691,4 +697,14 @@ func writeTarFile(path string, files map[string]string) (err error) {
 		}
 	}
 	return nil
+}
+
+// runSafeClusterApply applies selected cluster configs via pvesh without touching config.db.
+// It operates on files extracted to exportRoot (e.g. exportDestRoot).
+func runSafeClusterApply(ctx context.Context, reader *bufio.Reader, exportRoot string, logger *logging.Logger) (err error) {
+	if logger == nil {
+		logger = logging.GetDefaultLogger()
+	}
+	ui := newCLIWorkflowUI(reader, logger)
+	return runSafeClusterApplyWithUI(ctx, ui, exportRoot, logger, nil)
 }

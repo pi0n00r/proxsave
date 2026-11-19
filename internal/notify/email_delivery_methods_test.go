@@ -3,6 +3,7 @@ package notify
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -495,7 +496,7 @@ func TestEmailNotifierBuildEmailMessage_AttachesLogWhenConfigured(t *testing.T) 
 	data := createTestNotificationData()
 	data.LogFilePath = logPath
 
-	emailMessage, toHeader := notifier.buildEmailMessage("admin@example.com", "subject", "<b>html</b>", "text", data)
+	emailMessage, toHeader, _ := notifier.buildEmailMessage("admin@example.com", "subject", "<b>html</b>", "text", data)
 	if toHeader != "admin@example.com" {
 		t.Fatalf("toHeader=%q want %q", toHeader, "admin@example.com")
 	}
@@ -527,7 +528,7 @@ func TestEmailNotifierBuildEmailMessage_FallsBackWhenLogUnreadable(t *testing.T)
 	data := createTestNotificationData()
 	data.LogFilePath = filepath.Join(t.TempDir(), "missing.log")
 
-	emailMessage, _ := notifier.buildEmailMessage("admin@example.com", "subject", "<b>html</b>", "text", data)
+	emailMessage, _, _ := notifier.buildEmailMessage("admin@example.com", "subject", "<b>html</b>", "text", data)
 	if !strings.Contains(emailMessage, "Content-Type: multipart/alternative") {
 		t.Fatalf("expected multipart/alternative fallback, got:\n%s", emailMessage)
 	}
@@ -546,7 +547,7 @@ func TestEmailNotifierBuildEmailMessage_EncodesUTF8BodiesAsSevenBitSafe(t *testi
 		t.Fatalf("NewEmailNotifier() error = %v", err)
 	}
 
-	emailMessage, _ := notifier.buildEmailMessage(
+	emailMessage, _, _ := notifier.buildEmailMessage(
 		"admin@example.com",
 		"✅ PVE Backup à",
 		"<p>Backup complete ✅ with warnings: è full</p>",
@@ -583,7 +584,7 @@ func TestEmailNotifierBuildEmailMessageSanitizesAddressHeaders(t *testing.T) {
 		t.Fatalf("NewEmailNotifier() error = %v", err)
 	}
 
-	emailMessage, toHeader := notifier.buildEmailMessage(
+	emailMessage, toHeader, _ := notifier.buildEmailMessage(
 		"admin@example.com\r\nCc: injected@example.com",
 		"subject",
 		"<b>html</b>",
@@ -690,4 +691,113 @@ func TestEmailNotifierCheckRelayHostConfigured_Variants(t *testing.T) {
 			t.Fatalf("checkRelayHostConfigured()=(%v,%q) want (true,%q)", ok, host, "smtp.example.com:587")
 		}
 	})
+}
+
+// A From address that sanitizes to nothing falls back to the default sender.
+func TestEmailNotifierBuildEmailMessageDefaultsABlankFromHeader(t *testing.T) {
+	logger := logging.New(types.LogLevelDebug, false)
+	logger.SetOutput(io.Discard)
+
+	notifier, err := NewEmailNotifier(EmailConfig{
+		Enabled:        true,
+		DeliveryMethod: EmailDeliveryPMF,
+		From:           "\r\n",
+	}, types.ProxmoxBS, logger)
+	if err != nil {
+		t.Fatalf("NewEmailNotifier() error = %v", err)
+	}
+
+	emailMessage, _, _ := notifier.buildEmailMessage("admin@example.com", "subject", "<b>html</b>", "text", createTestNotificationData())
+	if want := "\nFrom: no-reply@proxmox.tis24.it\n"; !strings.Contains(emailMessage, want) {
+		t.Fatalf("email message missing %q:\n%s", want, emailMessage)
+	}
+}
+
+// A PMF hand-off with no recipient names Proxmox Notifications as the router.
+func TestEmailNotifierSendPMFLogsAMissingRecipient(t *testing.T) {
+	var log bytes.Buffer
+	logger := logging.New(types.LogLevelDebug, false)
+	logger.SetOutput(&log)
+
+	capturePath := filepath.Join(t.TempDir(), "pmf_capture.txt")
+	t.Setenv("PMF_CAPTURE_PATH", capturePath)
+	pmfScriptPath := writeCaptureScript(t, "proxmox-mail-forward", "PMF_CAPTURE_PATH")
+	t.Setenv("PATH", filepath.Dir(pmfScriptPath)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	origCandidates := pmfLookPathCandidates
+	pmfLookPathCandidates = []string{"proxmox-mail-forward"}
+	t.Cleanup(func() { pmfLookPathCandidates = origCandidates })
+
+	// An unknown Proxmox type makes recipient auto-detection fail without probing the host.
+	notifier, err := NewEmailNotifier(EmailConfig{
+		Enabled:        true,
+		DeliveryMethod: EmailDeliveryPMF,
+		From:           "no-reply@proxmox.example.com",
+	}, types.ProxmoxUnknown, logger)
+	if err != nil {
+		t.Fatalf("NewEmailNotifier() error = %v", err)
+	}
+
+	result, err := notifier.Send(context.Background(), createTestNotificationData())
+	if err != nil || !result.Success {
+		t.Fatalf("Send() = %+v, %v; want success", result, err)
+	}
+	if want := "for (recipient not set - routed by Proxmox Notifications)"; !strings.Contains(log.String(), want) {
+		t.Fatalf("log missing %q:\n%s", want, log.String())
+	}
+}
+
+// The log attached to the mail is read through safefs (an *os.Root on its directory):
+// a regular log is attached with its content, and a path that is not a regular file
+// (a directory, a missing file) fails as os.ReadFile did, the mail falling back to
+// multipart/alternative with the read failure in the WARNING.
+func TestEmailNotifierBuildEmailMessage_LogAttachmentReadThroughSafefs(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "backup.log")
+	if err := os.WriteFile(logPath, []byte("log contents"), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	subdir := filepath.Join(dir, "a-directory.log")
+	if err := os.Mkdir(subdir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, tc := range []struct {
+		name, path string
+		attached   bool
+	}{
+		{"regular", logPath, true},
+		{"directory", subdir, false},
+		{"missing", filepath.Join(dir, "missing.log"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf strings.Builder
+			logger := logging.New(types.LogLevelDebug, false)
+			logger.SetOutput(&buf)
+			notifier, err := NewEmailNotifier(EmailConfig{
+				Enabled:        true,
+				DeliveryMethod: EmailDeliverySendmail,
+				From:           "no-reply@proxmox.example.com",
+				AttachLogFile:  true,
+			}, types.ProxmoxBS, logger)
+			if err != nil {
+				t.Fatalf("NewEmailNotifier() error = %v", err)
+			}
+			data := createTestNotificationData()
+			data.LogFilePath = tc.path
+
+			msg, _, _ := notifier.buildEmailMessage("admin@example.com", "subject", "<b>html</b>", "text", data)
+			if tc.attached {
+				encoded := base64.StdEncoding.EncodeToString([]byte("log contents"))
+				if !strings.Contains(msg, "Content-Disposition: attachment") || !strings.Contains(msg, encoded) {
+					t.Fatalf("expected the log attached with its content, got:\n%s", msg)
+				}
+				return
+			}
+			if strings.Contains(msg, "Content-Type: multipart/mixed") || !strings.Contains(msg, "Content-Type: multipart/alternative") {
+				t.Fatalf("expected multipart/alternative fallback, got:\n%s", msg)
+			}
+			if !strings.Contains(buf.String(), "Failed to read log file for email attachment ("+tc.path+")") {
+				t.Fatalf("missing the read failure warning in:\n%s", buf.String())
+			}
+		})
+	}
 }

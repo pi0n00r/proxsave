@@ -13,7 +13,7 @@ type networkFeatureDisablement struct {
 	apply   func(*config.Config, networkWarningFunc)
 }
 
-type networkWarningFunc func(string, ...interface{})
+type networkWarningFunc func(string, ...any)
 
 // featuresNeedNetwork returns whether current configuration requires outbound network, and human reasons.
 func featuresNeedNetwork(cfg *config.Config) (bool, []string) {
@@ -59,7 +59,7 @@ func disableNetworkFeaturesForRun(cfg *config.Config, bootstrap *logging.Bootstr
 }
 
 func networkWarning(bootstrap *logging.BootstrapLogger) networkWarningFunc {
-	return func(format string, args ...interface{}) {
+	return func(format string, args ...any) {
 		if bootstrap != nil {
 			bootstrap.Warning(format, args...)
 			return
@@ -93,6 +93,7 @@ func webhookNetworkEnabled(cfg *config.Config) bool { return cfg.WebhookEnabled 
 func disableCloudNetworkFeature(cfg *config.Config, warn networkWarningFunc) {
 	warn("WARNING: Disabling cloud storage (rclone) due to missing network connectivity")
 	cfg.CloudEnabled = false
+	cfg.CloudStartupFailed = true
 	cfg.CloudLogPath = ""
 }
 

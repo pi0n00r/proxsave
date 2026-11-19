@@ -50,7 +50,7 @@ func (f *safeClusterApplyUIFlow) run() error {
 	}
 	f.detectCurrentNode()
 	f.logger.Info("")
-	f.logger.Info("SAFE cluster restore: applying configs via pvesh (node=%s)", f.currentNode)
+	f.logger.Info("SAFE cluster restore: applying configs (node=%s)", f.currentNode)
 	f.applyResourceMappings()
 	if err := f.preparePools(); err != nil {
 		return err
@@ -296,12 +296,12 @@ func (f *safeClusterApplyUIFlow) maybeApplyStorageCfg() error {
 	}
 	logging.DebugStep(f.logger, "safe cluster apply (ui)", "User choice: apply_storage=%v", applyStorage)
 	if applyStorage {
-		applied, failed, applyErr := applyStorageCfg(f.ctx, storageCfg, f.logger)
-		logging.DebugStep(f.logger, "safe cluster apply (ui)", "Storage apply result: ok=%d failed=%d err=%v", applied, failed, applyErr)
+		applied, unknown, failed, applyErr := applyStorageCfg(f.ctx, storageCfg, f.logger)
+		logging.DebugStep(f.logger, "safe cluster apply (ui)", "Storage apply result: ok=%d unknown=%d failed=%d err=%v", applied, unknown, failed, applyErr)
 		if applyErr != nil {
 			f.logger.Warning("Storage apply encountered errors: %v", applyErr)
 		}
-		f.logger.Info("Storage apply completed: ok=%d failed=%d", applied, failed)
+		f.logger.Info("Storage apply completed: ok=%d unknown=%d failed=%d", applied, unknown, failed)
 	} else {
 		f.logger.Info("Skipping storage.cfg apply")
 	}
@@ -331,11 +331,19 @@ func (f *safeClusterApplyUIFlow) confirmAndApplyDatacenterCfg(dcCfg string, size
 		f.logger.Info("Skipping datacenter.cfg apply")
 		return nil
 	}
-	logging.DebugStep(f.logger, "safe cluster apply (ui)", "Apply datacenter.cfg via pvesh")
-	if err := runPvesh(f.ctx, f.logger, []string{"set", "/cluster/config", "-conf", dcCfg}); err != nil {
+	// Not pvesh: the live node has no 'set' handler on /cluster/config (probed
+	// 2026-09-02, PVE 9.1.9), so the old call never applied anything. The file
+	// write IS the cluster-wide apply - /etc/pve is pmxcfs.
+	logging.DebugStep(f.logger, "safe cluster apply (ui)", "Write datacenter.cfg into pmxcfs")
+	data, err := restoreFS.ReadFile(dcCfg)
+	if err != nil {
+		f.logger.Warning("Failed to read exported datacenter.cfg: %v", err)
+		return nil
+	}
+	if err := pmxcfsWriteFile(f.logger, "datacenter.cfg", data); err != nil {
 		f.logger.Warning("Failed to apply datacenter.cfg: %v", err)
 	} else {
-		f.logger.Info("datacenter.cfg applied successfully")
+		f.logger.Info("datacenter.cfg written to pmxcfs (cluster-wide)")
 	}
 	return nil
 }

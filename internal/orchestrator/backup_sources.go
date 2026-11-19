@@ -3,13 +3,14 @@ package orchestrator
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/tis24dev/proxsave/internal/config"
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/safeexec"
+	"github.com/tis24dev/proxsave/internal/storage"
 )
 
 // decryptPathOption describes a logical backup source (local, secondary, cloud)
@@ -121,14 +123,40 @@ func discoverRcloneBackups(ctx context.Context, cfg *config.Config, remotePath s
 	if err != nil {
 		return nil, err
 	}
+	safeexec.ApplyWaitDelay(cmd)
+	// Stdout and stderr are kept apart. Every non-empty line of this output becomes
+	// a remote FILENAME below, so anything rclone writes to stderr is ingested as
+	// data. Measured on a live node (2026-09-05): `rclone lsf` on a directory with
+	// three entries exits 0, writes them to stdout and a NOTICE line to stderr when
+	// the config file is absent; the merged bytes give the loop a fourth "file"
+	// named after the NOTICE.
+	//
+	// That exact route is NOT reachable here and the fix is on the invariant, not on
+	// a reproduction: fullPath above always carries a colon, so a missing config
+	// means an unknown remote and the command fails into the branch below instead.
+	// What is left is every other NOTICE rclone prints on a successful lsf, token
+	// refreshes and deprecations on cloud backends among them, and those were not
+	// measured. The suffix filter further down discards a bogus entry rather than
+	// treating it as a backup, so the cost when it does happen is an inflated
+	// nonCandidateEntries count, not a phantom archive.
+	//
+	// Both error branches keep reporting the MERGED text: there it is a transcript
+	// for a human, and rclone puts the reason for a failure on stderr.
+	var stdout, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderrBuf
 	lsfStart := time.Now()
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+	if runErr := cmd.Run(); runErr != nil {
+		merged := strings.TrimSpace(stderrBuf.String() + "\n" + stdout.String())
 		if errors.Is(lsfCtx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("timed out while listing rclone remote %s (timeout=%s). Increase RCLONE_TIMEOUT_CONNECTION if needed: %w (output: %s)", fullPath, timeout, err, strings.TrimSpace(string(output)))
+			return nil, fmt.Errorf("timed out while listing rclone remote %s (timeout=%s). Increase RCLONE_TIMEOUT_CONNECTION if needed: %w (output: %s)", fullPath, timeout, runErr, merged)
 		}
-		return nil, fmt.Errorf("failed to list rclone remote %s: %w (output: %s)", fullPath, err, string(output))
+		return nil, fmt.Errorf("failed to list rclone remote %s: %w (output: %s)", fullPath, runErr, merged)
 	}
+	if noise := strings.TrimSpace(stderrBuf.String()); noise != "" {
+		logDebug(logger, "Cloud (rclone): lsf %s wrote to stderr while succeeding: %s", fullPath, noise)
+	}
+	output := stdout.Bytes()
 	logging.DebugStep(logger, "discover rclone backups", "rclone lsf output bytes=%d elapsed=%s", len(output), time.Since(lsfStart))
 
 	candidates = make([]*backupCandidate, 0)
@@ -344,19 +372,20 @@ func discoverRcloneBackups(ctx context.Context, cfg *config.Config, remotePath s
 		}
 	}
 
-	sort.SliceStable(candidates, func(i, j int) bool {
-		a := candidates[i]
-		b := candidates[j]
+	slices.SortStableFunc(candidates, func(a, b *backupCandidate) int {
 		if a == nil || a.Manifest == nil {
-			return false
+			if b == nil || b.Manifest == nil {
+				return 0
+			}
+			return 1
 		}
 		if b == nil || b.Manifest == nil {
-			return true
+			return -1
 		}
-		if !a.Manifest.CreatedAt.Equal(b.Manifest.CreatedAt) {
-			return a.Manifest.CreatedAt.After(b.Manifest.CreatedAt)
-		}
-		return a.DisplayBase < b.DisplayBase
+		return cmp.Or(
+			b.Manifest.CreatedAt.Compare(a.Manifest.CreatedAt),
+			strings.Compare(a.DisplayBase, b.DisplayBase),
+		)
 	})
 
 	logging.DebugStep(
@@ -500,8 +529,8 @@ func discoverBackupCandidates(logger *logging.Logger, root string) (candidates [
 		}
 	}
 
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].Manifest.CreatedAt.After(candidates[j].Manifest.CreatedAt)
+	slices.SortStableFunc(candidates, func(a, b *backupCandidate) int {
+		return b.Manifest.CreatedAt.Compare(a.Manifest.CreatedAt)
 	})
 
 	logging.DebugStep(
@@ -666,14 +695,10 @@ func buildCloudRemotePath(cloudRemote, cloudRemotePath string) string {
 		return ""
 	}
 
-	// If CLOUD_REMOTE is an absolute filesystem path (mount point),
-	// treat it as a local directory and combine using filepath.Join.
-	if filepath.IsAbs(base) && !strings.Contains(base, ":") {
-		prefix := strings.Trim(strings.TrimSpace(cloudRemotePath), "/")
-		if prefix == "" {
-			return filepath.Clean(base)
-		}
-		return filepath.Join(base, prefix)
+	// If CLOUD_REMOTE is an absolute filesystem path (mount point), treat it as a
+	// local directory, with the rule the cloud backend uses (storage.LocalCloudRemoteDir).
+	if dir, ok := storage.LocalCloudRemoteDir(base, cloudRemotePath); ok {
+		return dir
 	}
 
 	parts := strings.SplitN(base, ":", 2)
@@ -692,14 +717,14 @@ func buildCloudRemotePath(cloudRemote, cloudRemotePath string) string {
 	return fmt.Sprintf("%s:%s", remoteName, fullPath)
 }
 
-func logDebug(logger *logging.Logger, format string, args ...interface{}) {
+func logDebug(logger *logging.Logger, format string, args ...any) {
 	if logger == nil {
 		return
 	}
 	logger.Debug(format, args...)
 }
 
-func logWarning(logger *logging.Logger, format string, args ...interface{}) {
+func logWarning(logger *logging.Logger, format string, args ...any) {
 	if logger == nil {
 		return
 	}

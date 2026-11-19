@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tis24dev/proxsave/internal/cron"
 )
 
 func TestParseSchedulerHealthcheckDefaults(t *testing.T) {
@@ -21,9 +23,6 @@ func TestParseSchedulerHealthcheckDefaults(t *testing.T) {
 	}
 	if c.MaxRunDuration != 1*time.Hour {
 		t.Errorf("MaxRunDuration = %s, want 1h", c.MaxRunDuration)
-	}
-	if c.DaemonOptOut {
-		t.Errorf("DaemonOptOut = true, want false")
 	}
 	if c.HealthcheckEnabled {
 		t.Errorf("HealthcheckEnabled = true, want false")
@@ -47,7 +46,6 @@ func TestParseSchedulerHealthcheckValues(t *testing.T) {
 		"SCHEDULER_MODE":                 "daemon",
 		"SCHEDULER_TIME":                 "03:30",
 		"MAX_RUN_DURATION":               "2h",
-		"DAEMON_OPT_OUT":                 "true",
 		"HEALTHCHECK_ENABLED":            "true",
 		"HEALTHCHECK_MODE":               "self",
 		"HEALTHCHECK_HEARTBEAT_INTERVAL": "30s",
@@ -70,9 +68,6 @@ func TestParseSchedulerHealthcheckValues(t *testing.T) {
 	}
 	if c.MaxRunDuration != 2*time.Hour {
 		t.Errorf("MaxRunDuration = %s, want 2h", c.MaxRunDuration)
-	}
-	if !c.DaemonOptOut {
-		t.Errorf("DaemonOptOut = false, want true")
 	}
 	if !c.HealthcheckEnabled {
 		t.Errorf("HealthcheckEnabled = false, want true")
@@ -131,6 +126,103 @@ func TestHealthcheckNotifyConfigParse(t *testing.T) {
 	}
 }
 
+func TestParseSchedulerCadence(t *testing.T) {
+	c := &Config{raw: map[string]string{}}
+	c.parseSchedulerSettings()
+	if c.SchedulerFrequency != "daily" || c.SchedulerWeekday != "mon" || c.SchedulerMonthDay != "1" {
+		t.Fatalf("defaults = %q %q %q; want daily mon 1", c.SchedulerFrequency, c.SchedulerWeekday, c.SchedulerMonthDay)
+	}
+	cad, err := c.SchedulerCadence()
+	if err != nil || cad != (cron.Cadence{Frequency: cron.FrequencyDaily, Weekday: time.Monday, MonthDay: 1, Time: "02:00"}) {
+		t.Fatalf("SchedulerCadence() = %+v, %v; want daily at 02:00", cad, err)
+	}
+
+	c = &Config{raw: map[string]string{
+		"SCHEDULER_FREQUENCY": " Weekly ",
+		"SCHEDULER_WEEKDAY":   "fri",
+		"SCHEDULER_MONTHDAY":  "15",
+		"SCHEDULER_TIME":      "3:30",
+	}}
+	c.parseSchedulerSettings()
+	cad, err = c.SchedulerCadence()
+	if err != nil || cad != (cron.Cadence{Frequency: cron.FrequencyWeekly, Weekday: time.Friday, MonthDay: 15, Time: "03:30"}) {
+		t.Fatalf("SchedulerCadence() = %+v, %v; want weekly on fri at 03:30", cad, err)
+	}
+
+	c = &Config{raw: map[string]string{"SCHEDULER_FREQUENCY": "monthly", "SCHEDULER_MONTHDAY": "31"}}
+	c.parseSchedulerSettings()
+	if _, err := c.SchedulerCadence(); err == nil {
+		t.Fatal("SchedulerCadence accepted SCHEDULER_MONTHDAY=31")
+	}
+}
+
+// An upgrade replaces an inline comment an earlier template wrote, and only that: the value is
+// the operator's, and a comment the operator edited is theirs too.
+func TestUpgradeRefreshesRetiredTemplateComment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "backup.env")
+	old := "SCHEDULER_MODE=cron\n" +
+		`SCHEDULER_TIME=03:30           # daily HH:MM ("Run at") used by daemon mode; cron mode uses the crontab` + "\n" +
+		"MAX_RUN_DURATION=1h\n"
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpgradeConfigFileWithBaseDir(path, dir); err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	want := `SCHEDULER_TIME=03:30           # HH:MM ("Run at")`
+	if !strings.Contains(got, want+"\n") {
+		t.Fatalf("retired comment not refreshed; want line %q in:\n%s", want, got)
+	}
+	if strings.Count(got, "SCHEDULER_TIME=") != 1 {
+		t.Fatalf("SCHEDULER_TIME duplicated:\n%s", got)
+	}
+
+	// An operator's own comment stays.
+	own := "SCHEDULER_MODE=cron\nSCHEDULER_TIME=03:30 # my backup window\nMAX_RUN_DURATION=1h\n"
+	if err := os.WriteFile(path, []byte(own), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpgradeConfigFileWithBaseDir(path, dir); err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	data, _ = os.ReadFile(path)
+	if !strings.Contains(string(data), "SCHEDULER_TIME=03:30 # my backup window\n") {
+		t.Fatalf("operator comment changed:\n%s", data)
+	}
+}
+
+// A file whose only difference from the template is a retired comment is still rewritten.
+func TestUpgradeRefreshesRetiredCommentWithNothingMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "backup.env")
+	tmpl := DefaultEnvTemplate()
+	retired := strings.Replace(tmpl, `SCHEDULER_TIME=02:00           # HH:MM ("Run at")`,
+		`SCHEDULER_TIME=02:00           # daily HH:MM ("Run at") used by daemon mode; cron mode uses the crontab`, 1)
+	if retired == tmpl {
+		t.Fatal("template line for SCHEDULER_TIME not found")
+	}
+	if err := os.WriteFile(path, []byte(retired), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := UpgradeConfigFileWithBaseDir(path, dir)
+	if err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	if !res.Changed {
+		t.Fatal("upgrade reported no change for a retired comment")
+	}
+	data, _ := os.ReadFile(path)
+	if string(data) != tmpl {
+		t.Fatal("file not equal to the template after refreshing the comment")
+	}
+}
+
 func TestSchedulerHealthcheckNormalizeFallback(t *testing.T) {
 	c := &Config{raw: map[string]string{
 		"SCHEDULER_MODE":   "garbage",
@@ -156,8 +248,9 @@ func TestSchedulerHealthcheckNormalizeFallback(t *testing.T) {
 func TestRealTemplateContainsNewKeys(t *testing.T) {
 	tmpl := DefaultEnvTemplate()
 	for _, key := range []string{
-		"SCHEDULER_MODE=", "SCHEDULER_TIME=", "MAX_RUN_DURATION=", "DAEMON_OPT_OUT=",
-		"HEALTHCHECK_ENABLED=", "HEALTHCHECK_MODE=", "HEALTHCHECK_HEARTBEAT_INTERVAL=",
+		"SCHEDULER_MODE=", "SCHEDULER_FREQUENCY=", "SCHEDULER_WEEKDAY=", "SCHEDULER_MONTHDAY=",
+		"SCHEDULER_TIME=", "MAX_RUN_DURATION=",
+		"HEALTHCHECK_ENABLED=", "HEALTHCHECK_MODE=", "HEALTHCHECK_ACCOUNT_INITIAL_EMAIL=", "HEALTHCHECK_HEARTBEAT_INTERVAL=",
 		"HEALTHCHECK_SEND_LOG=", "HEALTHCHECK_ALIVE_URL=", "HEALTHCHECK_BACKUP_URL=",
 		"HEALTHCHECK_PING_ENDPOINT=", "HEALTHCHECK_PING_KEY=", "HEALTHCHECK_ALIVE_ID=",
 		"HEALTHCHECK_BACKUP_ID=",
@@ -166,6 +259,7 @@ func TestRealTemplateContainsNewKeys(t *testing.T) {
 		"HEALTHCHECK_NOTIFY_TELEGRAM_URL=", "HEALTHCHECK_NOTIFY_TELEGRAM_ID=",
 		"HEALTHCHECK_NOTIFY_GOTIFY_URL=", "HEALTHCHECK_NOTIFY_GOTIFY_ID=",
 		"HEALTHCHECK_NOTIFY_WEBHOOK_URL=", "HEALTHCHECK_NOTIFY_WEBHOOK_ID=",
+		"PERSONAL_SCRIPT_PRE_RUN=", "PERSONAL_SCRIPT_POST_RUN=",
 	} {
 		if !strings.Contains(tmpl, key) {
 			t.Errorf("embedded template is missing new key %q", key)
@@ -178,16 +272,17 @@ LOG_PATH=/default/log
 SCHEDULER_MODE=cron
 SCHEDULER_TIME=02:00
 MAX_RUN_DURATION=6h
-DAEMON_OPT_OUT=false
 HEALTHCHECK_ENABLED=false
 HEALTHCHECK_MODE=centralized
 HEALTHCHECK_ALIVE_URL=
 `
 
-// TestUpgradePreservesDaemonOptOut is the retrofit-safety guarantee: a user who
-// ran --daemon-remove (DAEMON_OPT_OUT=true) must keep that value across every
-// future --upgrade, so the daemon is never silently reinstalled.
-func TestUpgradePreservesDaemonOptOut(t *testing.T) {
+// DAEMON_OPT_OUT is retired. It existed so --daemon-remove could contradict the SCHEDULER_MODE
+// it had just written, because the retrofit read cron as "migrate me"; the retrofit now decides
+// on whether SCHEDULER_MODE was already in the file, so the mode alone carries the choice.
+// The merge prunes the key like every other deprecated one rather than preserving it, so an
+// upgraded backup.env does not keep a setting nothing reads.
+func TestUpgradeRetiresDaemonOptOut(t *testing.T) {
 	withTemplate(t, schedMergeTemplate, func() {
 		tmpDir := t.TempDir()
 		configPath := filepath.Join(tmpDir, "backup.env")
@@ -203,19 +298,21 @@ func TestUpgradePreservesDaemonOptOut(t *testing.T) {
 		if !result.Changed {
 			t.Fatalf("expected Changed=true (new keys missing)")
 		}
-		// DAEMON_OPT_OUT was already present -> must NOT be counted as missing.
-		for _, k := range result.MissingKeys {
-			if k == "DAEMON_OPT_OUT" {
-				t.Fatalf("DAEMON_OPT_OUT wrongly treated as missing (would reset to false)")
-			}
-		}
 		data, err := os.ReadFile(configPath)
 		if err != nil {
 			t.Fatalf("read merged config: %v", err)
 		}
 		content := string(data)
-		if !strings.Contains(content, "DAEMON_OPT_OUT=true") {
-			t.Fatalf("merge clobbered the user's DAEMON_OPT_OUT=true:\n%s", content)
+		if strings.Contains(content, "DAEMON_OPT_OUT") {
+			t.Fatalf("the retired key must be pruned from the file:\n%s", content)
+		}
+		// Pruning is reported, like every other deprecated key, so the removal is not silent.
+		if !strings.Contains(strings.Join(result.Warnings, " "), "DAEMON_OPT_OUT") {
+			t.Fatalf("the removal must be reported in the warnings, got %v", result.Warnings)
+		}
+		// The operator's own settings are untouched by the prune.
+		if !strings.Contains(content, "BACKUP_PATH=/legacy") {
+			t.Fatalf("the prune ate an unrelated key:\n%s", content)
 		}
 		for _, k := range []string{"SCHEDULER_MODE=", "SCHEDULER_TIME=", "HEALTHCHECK_ENABLED="} {
 			if !strings.Contains(content, k) {
@@ -237,7 +334,6 @@ func assertSafeDaemonDefaults(t *testing.T, raw map[string]string) {
 	want := []struct{ key, val string }{
 		{"SCHEDULER_MODE", "cron"},       // upgraded host stays on cron
 		{"HEALTHCHECK_ENABLED", "false"}, // no pinging until explicitly enabled
-		{"DAEMON_OPT_OUT", "false"},      // a fresh upgrade is not a --daemon-remove tombstone
 		{"HEALTHCHECK_MODE", "centralized"},
 		{"HEALTHCHECK_PING_ENDPOINT", "https://hc-ping.com"},
 		// Empty by default: a non-empty default would make a host ping a stale or
@@ -281,8 +377,8 @@ func assertSafeDaemonDefaults(t *testing.T, raw map[string]string) {
 // PRESENCE, so a value typo (HEALTHCHECK_ENABLED=true, SCHEDULER_MODE=daemon, or a
 // non-empty ping URL) would land verbatim in every merged config undetected. This
 // asserts the raw INJECTED values and that they parse to safe semantics. (Scope is
-// the merge; the separate, DAEMON_OPT_OUT-gated retrofit auto-migration that a full
-// --upgrade may then run is not exercised here.)
+// the merge; the separate retrofit auto-migration that a full --upgrade may then run, gated on
+// whether this merge had to ADD SCHEDULER_MODE, is not exercised here.)
 func TestUpgradeRealTemplateKeepsExistingInstallSafe(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "backup.env")
@@ -309,12 +405,48 @@ func TestUpgradeRealTemplateKeepsExistingInstallSafe(t *testing.T) {
 	c := &Config{raw: raw}
 	c.parseSchedulerSettings()
 	c.parseHealthcheckSettings()
-	if c.SchedulerMode != "cron" || c.HealthcheckEnabled || c.DaemonOptOut {
-		t.Errorf("merged config parses to an unsafe daemon state: mode=%q enabled=%v optout=%v",
-			c.SchedulerMode, c.HealthcheckEnabled, c.DaemonOptOut)
+	if c.SchedulerMode != "cron" || c.HealthcheckEnabled {
+		t.Errorf("merged config parses to an unsafe daemon state: mode=%q enabled=%v",
+			c.SchedulerMode, c.HealthcheckEnabled)
 	}
 	// The user's own value survives the real-template merge (not clobbered).
 	if raw["BACKUP_PATH"] != "/data/backup" {
 		t.Errorf("merge clobbered the user's BACKUP_PATH: %q", raw["BACKUP_PATH"])
+	}
+}
+
+// The ping URL comments that called the centralized value a server-filled cache are refreshed,
+// the operator's self-mode URL kept.
+func TestUpgradeRefreshesRetiredPingURLComments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "backup.env")
+	tmpl := DefaultEnvTemplate()
+	retired := strings.Replace(tmpl,
+		`HEALTHCHECK_ALIVE_URL=              # self: the FULL service-alive ping URL you paste (e.g. https://hc-ping.com/<uuid>); centralized: fallback when ProxSave HC Server is unreachable`,
+		`HEALTHCHECK_ALIVE_URL=https://hc-ping.com/alive # centralized: cache auto-filled from the server (do not edit by hand). self: the FULL service-alive ping URL you paste (e.g. https://hc-ping.com/<uuid>)`, 1)
+	retired = strings.Replace(retired,
+		`HEALTHCHECK_BACKUP_URL=             # self: the FULL backup-outcome ping URL you paste; centralized: fallback when ProxSave HC Server is unreachable`,
+		`HEALTHCHECK_BACKUP_URL=             # centralized: cache auto-filled from the server (do not edit by hand). self: the FULL backup-outcome ping URL you paste`, 1)
+	if strings.Count(retired, "cache auto-filled from the server") != 2 {
+		t.Fatal("template lines for the ping URLs not found")
+	}
+	if err := os.WriteFile(path, []byte(retired), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpgradeConfigFileWithBaseDir(path, dir); err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	data, _ := os.ReadFile(path)
+	got := string(data)
+	for _, want := range []string{
+		`HEALTHCHECK_ALIVE_URL=https://hc-ping.com/alive # self: the FULL service-alive ping URL you paste (e.g. https://hc-ping.com/<uuid>); centralized: fallback when ProxSave HC Server is unreachable`,
+		`HEALTHCHECK_BACKUP_URL=             # self: the FULL backup-outcome ping URL you paste; centralized: fallback when ProxSave HC Server is unreachable`,
+	} {
+		if !strings.Contains(got, want+"\n") {
+			t.Fatalf("retired comment not refreshed; want line %q", want)
+		}
+	}
+	if strings.Contains(got, "cache auto-filled") {
+		t.Fatal("a retired ping URL comment survived the upgrade")
 	}
 }

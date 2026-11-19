@@ -1,1060 +1,225 @@
-# Practical Examples
+# Practical examples
 
-Real-world configuration examples for Proxsave covering common deployment scenarios.
+These scenarios combine the task guides into a host configuration backup policy. Start with [your first backup](BACKUP_GUIDE.md#run-and-verify-your-first-backup) if you have not yet verified a run
 
-## Table of Contents
+Open the dashboard with `proxsave` on an interactive terminal. Use **Maintenance > Install > Edit install** for settings exposed by its form; edit other settings in the active configuration file according to the [configuration reference](CONFIGURATION.md). The values below are examples, not installation defaults
 
-- [Overview](#overview)
-- [Example 1: Basic Local Backup](#example-1-basic-local-backup)
-- [Example 2: Local + Secondary Storage](#example-2-local--secondary-storage)
-- [Example 3: Cloud Backup with Google Drive](#example-3-cloud-backup-with-google-drive)
-- [Example 4: Encrypted Backup with AGE](#example-4-encrypted-backup-with-age)
-- [Example 5: Backblaze B2 with Bandwidth Limiting](#example-5-backblaze-b2-with-bandwidth-limiting)
-- [Example 6: MinIO Self-Hosted with High Performance](#example-6-minio-self-hosted-with-high-performance)
-- [Example 7: Multi-Notification Setup](#example-7-multi-notification-setup)
-- [Example 8: Complete Production Setup](#example-8-complete-production-setup)
-- [Example 9: Test in a Chroot/Fixture](#example-9-test-in-a-chrootfixture)
-- [Example 10: Dual PVE+PBS Host](#example-10-dual-pvepbs-host)
-- [Example 11: Resident daemon and healthchecks monitoring](#example-11-resident-daemon-and-healthchecks-monitoring)
-- [Related Documentation](#related-documentation)
+## Start with the dashboard
 
----
+Choose **Backup** to run the configured backup, **Tools > Restore** to recover settings, and **Daemon > Status** to inspect scheduling. Review [the dashboard guide](DASHBOARD.md) for the actual menu and terminal requirements. Automation and alternate configuration files are covered separately in the [CLI reference](CLI_REFERENCE.md)
 
 ## Overview
 
-This guide provides complete, copy-paste ready configuration examples for common deployment scenarios. Each example includes:
-
-- **Scenario description**: What problem it solves
-- **Complete configuration**: Ready-to-use `backup.env` settings
-- **Step-by-step setup**: Commands to execute
-- **Cron scheduling**: Automation examples
-- **Expected results**: What to expect after setup
-
-**How to use these examples**:
-1. Choose the example closest to your use case
-2. Copy the configuration to `configs/backup.env`
-3. Adjust paths, credentials, and parameters for your environment
-4. Test with `--dry-run` before production use
-5. Schedule via cron or systemd
-
----
-
-## Example 1: Basic Local Backup
-
-**Scenario**: Single server, local backup only, simple retention.
-
-**Use case**:
-- Standalone Proxmox VE or PBS server
-- No cloud storage requirements
-- Simple daily backups
-- Fast local SSD/NVMe storage
-
-### Configuration
-
-```bash
-# configs/backup.env
-BACKUP_ENABLED=true
-BACKUP_PATH=/opt/proxsave/backup
-LOG_PATH=/opt/proxsave/log
-
-# Compression
-COMPRESSION_TYPE=xz
-COMPRESSION_LEVEL=6
-COMPRESSION_MODE=standard
-
-# Retention: Keep 15 backups
-MAX_LOCAL_BACKUPS=15
-
-# Run backup
-proxsave
-```
-
-### Setup Steps
-
-```bash
-# 1. Install
-proxsave --install
-# (use --new-install to wipe everything except build/, env/, and identity/ before installing)
-
-# 2. Edit configuration
-nano configs/backup.env
-# (paste configuration above)
-
-# 3. Test
-proxsave --dry-run
-
-# 4. Run first backup
-proxsave
-```
-
-### Cron Schedule
-
-```bash
-# Daily backup at 2 AM
-crontab -e
-
-0 2 * * * /opt/proxsave/build/proxsave >> /var/log/pbs-backup.log 2>&1
-```
-
-### Expected Results
-
-```text
-Backup directory: /opt/proxsave/backup/
-- <hostname>-backup-20240115-020000.tar.xz.bundle.tar
-```
-
-If you disable bundling (`BUNDLE_ASSOCIATED_FILES=false`), proxsave keeps the raw archive plus sidecar files (`.sha256`, `.metadata`, `.manifest.json`).
-
-**Retention**: Automatically keeps latest 15 backups, deletes older ones.
-
-**Backup size**: Typically 500MB-2GB depending on system configuration.
-
----
-
-## Example 2: Local + Secondary Storage
-
-**Scenario**: Local SSD + secondary NAS, different retention.
-
-**Use case**:
-- Local SSD for fast backup creation
-- NAS/network storage for longer retention
-- Different retention policies per tier
-- Cost optimization (expensive SSD, cheap NAS)
-
-### Configuration
-
-```bash
-# configs/backup.env
-BACKUP_ENABLED=true
-BACKUP_PATH=/opt/proxsave/backup
-LOG_PATH=/opt/proxsave/log
-
-# Secondary storage (NAS)
-SECONDARY_ENABLED=true
-SECONDARY_PATH=/mnt/nas/pbs-backup
-SECONDARY_LOG_PATH=/mnt/nas/pbs-log
-
-# Retention
-MAX_LOCAL_BACKUPS=7        # 1 week local (SSD expensive)
-MAX_SECONDARY_BACKUPS=30   # 1 month secondary (NAS cheap)
-
-# Run backup
-proxsave
-```
-
-### Setup Steps
-
-```bash
-# 1. Mount NAS (example with NFS)
-sudo mkdir -p /mnt/nas
-sudo mount -t nfs 192.168.1.100:/backup /mnt/nas
-
-# Make mount persistent
-echo "192.168.1.100:/backup /mnt/nas nfs defaults 0 0" | sudo tee -a /etc/fstab
-
-# 2. Create backup directories
-mkdir -p /mnt/nas/pbs-backup /mnt/nas/pbs-log
-chmod 700 /mnt/nas/pbs-backup /mnt/nas/pbs-log
-
-# 3. Test write access
-touch /mnt/nas/pbs-backup/test.txt && rm /mnt/nas/pbs-backup/test.txt
-
-# 4. Configure and run
-proxsave --install
-# (use --new-install if you want to reset the install dir first, keeping build/, env/, and identity/)
-# (paste configuration above)
-proxsave --dry-run
-proxsave
-```
-
-### Expected Results
-
-```text
-Local (SSD):
-/opt/proxsave/backup/
-- 7 backups retained (latest week)
-
-Secondary (NAS):
-/mnt/nas/pbs-backup/
-- 30 backups retained (latest month)
-```
-
-**Cost benefit**: Keep only 1 week locally (saves SSD space), 1 month on cheap NAS storage.
-
----
-
-## Example 3: Cloud Backup with Google Drive
-
-**Scenario**: Small business, daily backups, GFS retention, Google Drive.
-
-**Use case**:
-- Small/medium business
-- 15GB free Google Drive tier
-- GFS retention for compliance
-- Daily automated backups
-
-### Setup Steps
-
-#### Step 1: Configure rclone
-
-```bash
-rclone config
-# n > gdrive > drive > [OAuth] > y > q
-rclone mkdir gdrive:pbs-backups
-rclone mkdir gdrive:pbs-logs
-```
-
-#### Step 2: Configure backup.env
-
-```bash
-# configs/backup.env
-
-# Cloud storage
-CLOUD_ENABLED=true
-CLOUD_REMOTE=gdrive
-CLOUD_REMOTE_PATH=/pbs-backups
-CLOUD_LOG_PATH=/pbs-logs
-CLOUD_UPLOAD_MODE=parallel
-CLOUD_PARALLEL_MAX_JOBS=3
-CLOUD_PARALLEL_VERIFICATION=true
-
-# Google Drive tuning
-RCLONE_TIMEOUT_CONNECTION=60
-RCLONE_TIMEOUT_OPERATION=600
-RCLONE_TRANSFERS=4
-RCLONE_RETRIES=3
-CLOUD_BATCH_SIZE=10
-CLOUD_BATCH_PAUSE=2
-
-# GFS retention (3-year coverage)
-RETENTION_POLICY=gfs
-RETENTION_DAILY=7
-RETENTION_WEEKLY=4
-RETENTION_MONTHLY=12
-RETENTION_YEARLY=3
-```
-
-#### Step 3: Test and Run
-
-```bash
-# Dry-run
-proxsave --dry-run
-
-# Real backup
-proxsave
-
-# Verify
-rclone ls gdrive:pbs-backups/
-rclone ls gdrive:/pbs-logs/
-```
-
-### Expected Results
-
-**GFS retention distribution**:
-- 7 daily backups (last week)
-- 4 weekly backups (last month)
-- 12 monthly backups (last year)
-- 3 yearly backups
-
-**Total**: ~26 backups across 3 years
-
-**Storage calculation** (example):
-- Backup size: 500 MB
-- Total: 26 × 500 MB = 13 GB (fits in 15GB free tier)
-
----
-
-## Example 4: Encrypted Backup with AGE
-
-**Scenario**: Sensitive data, encryption required, cloud storage.
-
-**Use case**:
-- Sensitive personal/business data
-- Compliance requirements (GDPR, HIPAA)
-- Cloud storage with zero-trust model
-- Secure key management
-
-### Setup Steps
-
-#### Step 1: Generate Encryption Key
-
-```bash
-proxsave --newkey
-
-# In the wizard (a Charm TUI by default; add --cli for text prompts):
-# - choose the passphrase option to derive a recipient from a passphrase
-# - enter a strong passphrase (min 12 chars, at least 3 character classes)
-# - confirm it; the AGE recipient is generated and saved (the passphrase is not stored)
-```
-
-#### Step 2: Configure backup.env
-
-```bash
-# configs/backup.env
-
-# Encryption
-ENCRYPT_ARCHIVE=true
-AGE_RECIPIENT_FILE=/opt/proxsave/identity/age/recipient.txt
-
-# Bundle (recommended with encryption)
-BUNDLE_ASSOCIATED_FILES=true
-
-# Cloud storage
-CLOUD_ENABLED=true
-CLOUD_REMOTE=gdrive
-CLOUD_REMOTE_PATH=/pbs-encrypted
-MAX_CLOUD_BACKUPS=30
-```
-
-#### Step 3: Run Backup
-
-```bash
-proxsave
-
-# Result (with bundling enabled): pve01-backup-20240115-020000.tar.xz.age.bundle.tar
-```
-
-#### Step 4: Decrypt (when needed)
-
-```bash
-proxsave --decrypt
-
-# In the wizard (a Charm TUI by default; add --cli for text prompts):
-# - select the backup to decrypt
-# - enter the AGE key or passphrase in the single secret field
-# - enter the destination directory (defaults to the decrypt/ folder under BASE_DIR)
-# The decrypted archive is written there as <name>.decrypted.bundle.tar
-```
-
-### Expected Results
-
-**Encrypted backup**:
-```text
-pve01-backup-20240115-020000.tar.xz.age.bundle.tar     # Encrypted bundle (archive + metadata + checksum)
-```
-
-**Security features**:
-- ✅ Streaming encryption (no plaintext on disk)
-- ✅ ChaCha20-Poly1305 AEAD
-- ✅ Passphrase-based or key-based
-- ✅ Compatible with standard AGE tools
-
----
-
-## Example 5: Backblaze B2 with Bandwidth Limiting
-
-**Scenario**: Remote archival, slow network, cost optimization.
-
-**Use case**:
-- Long-term archival (7-year retention)
-- Slow office network (don't saturate during work hours)
-- Cost-effective cloud storage
-- Nighttime backup window
-
-### Setup Steps
-
-#### Step 1: Configure Backblaze B2
-
-```bash
-# Create B2 account (10GB free)
-# Create bucket: pbs-backups (Private)
-# Create Application Key (copy Key ID and Application Key)
-
-rclone config
-# n > b2 > b2 > <Key-ID> > <App-Key> > n > n > y > q
-```
-
-#### Step 2: Configure backup.env
-
-```bash
-# configs/backup.env
-
-# Cloud storage
-CLOUD_ENABLED=true
-CLOUD_REMOTE=b2
-CLOUD_REMOTE_PATH=/pbs-backups
-CLOUD_LOG_PATH=/pbs-backups/logs
-CLOUD_UPLOAD_MODE=sequential
-
-# Slow network tuning
-RCLONE_TIMEOUT_CONNECTION=45
-RCLONE_TIMEOUT_OPERATION=1800     # 30 minutes
-RCLONE_BANDWIDTH_LIMIT=5M         # 5 MB/s (don't saturate office network)
-RCLONE_TRANSFERS=2
-RCLONE_RETRIES=5
-
-# Batch deletion (B2 rate limiting)
-CLOUD_BATCH_SIZE=20
-CLOUD_BATCH_PAUSE=2
-
-# GFS retention (long-term archival)
-RETENTION_POLICY=gfs
-RETENTION_DAILY=14
-RETENTION_WEEKLY=8
-RETENTION_MONTHLY=24
-RETENTION_YEARLY=5
-
-# Result: ~51 backups distributed over 5 years
-# Cost: 51 × 0.5GB = 25.5GB × $0.005 = $0.13/month
-```
-
-#### Step 3: Schedule Nightly Backup
-
-```bash
-# Cron: 2 AM daily
-crontab -e
-0 2 * * * /opt/proxsave/build/proxsave
-```
-
-**Why nightly?**: Slow upload doesn't impact office hours, B2 free egress 1GB/day.
-
-### Expected Results
-
-**Cost calculation** (example):
-- Backup size: 500 MB
-- GFS retention: 51 backups
-- Total storage: 25.5 GB
-- B2 cost: $0.005/GB/month = **$0.13/month**
-
-**Upload time** (example):
-- Backup size: 500 MB
-- Bandwidth: 5 MB/s
-- Upload time: ~100 seconds (1.5 minutes)
-
----
-
-## Example 6: MinIO Self-Hosted with High Performance
-
-**Scenario**: LAN-based MinIO server, fast storage, hourly backups.
-
-**Use case**:
-- Self-hosted S3-compatible storage (MinIO)
-- Local network (gigabit LAN)
-- Hourly backup frequency
-- High-performance requirements
-
-### Setup Steps
-
-#### Step 1: Configure MinIO
-
-```bash
-# Assuming MinIO running at https://minio.local:9000
-# Create bucket via MinIO Console or mc client
-mc mb minio-local/pbs-backups
-mc mb minio-local/pbs-logs
-
-rclone config
-# n > minio > s3 > Minio > minioadmin > minioadmin > (empty region) > https://minio.local:9000 > y > q
-```
-
-#### Step 2: Configure backup.env
-
-```bash
-# configs/backup.env
-
-# Cloud storage (MinIO LAN)
-CLOUD_ENABLED=true
-CLOUD_REMOTE=minio
-CLOUD_REMOTE_PATH=/pbs-backups/server1    # Organize by server
-CLOUD_LOG_PATH=/pbs-logs
-CLOUD_UPLOAD_MODE=parallel
-CLOUD_PARALLEL_MAX_JOBS=4
-CLOUD_WRITE_HEALTHCHECK=true       # Test write access
-
-# LAN performance tuning
-RCLONE_TIMEOUT_CONNECTION=10
-RCLONE_TIMEOUT_OPERATION=300
-RCLONE_BANDWIDTH_LIMIT=            # Unlimited (LAN)
-RCLONE_TRANSFERS=8                 # Highly parallel
-RCLONE_RETRIES=2
-
-# Batch deletion (no API limits)
-CLOUD_BATCH_SIZE=100
-CLOUD_BATCH_PAUSE=0
-
-# Simple retention (168 hours = 1 week)
-MAX_CLOUD_BACKUPS=168
-```
-
-#### Step 3: Hourly Backup
-
-```bash
-# Cron: every hour
-crontab -e
-0 * * * * /opt/proxsave/build/proxsave
-```
-
-### Expected Results
-
-**Performance**:
-- Backup creation: 2-3 minutes
-- Upload to MinIO (LAN): 10-30 seconds
-- Total time: ~3-4 minutes
-
-**Retention**:
-- 168 hourly backups (1 week)
-- Automatic hourly rotation
-
-**Advantages**:
-- ✅ Full control over data
-- ✅ No cloud costs
-- ✅ LAN speed (gigabit)
-- ✅ S3-compatible API
-
----
-
-## Example 7: Multi-Notification Setup
-
-**Scenario**: Telegram + Email + Webhook (Discord + Pushover) notifications.
-
-**Use case**:
-- Multiple notification channels
-- Team awareness
-- Critical alerts via multiple paths
-- Redundant notification delivery
-
-### Configuration
-
-```bash
-# configs/backup.env
-
-# Telegram
-TELEGRAM_ENABLED=true
-BOT_TELEGRAM_TYPE=personal
-TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
-TELEGRAM_CHAT_ID=987654321
-
-# Email
-EMAIL_ENABLED=true
-EMAIL_DELIVERY_METHOD=relay
-EMAIL_RECIPIENT=admin@example.com
-EMAIL_FROM=noreply@proxmox.example.com
-
-# Webhook (Discord + Pushover)
-WEBHOOK_ENABLED=true
-WEBHOOK_ENDPOINTS=discord_alerts,pushover
-WEBHOOK_DISCORD_ALERTS_URL=https://discord.com/api/webhooks/XXXX/YYYY
-WEBHOOK_DISCORD_ALERTS_FORMAT=discord
-WEBHOOK_DISCORD_ALERTS_METHOD=POST
-
-# Pushover (push notifications to phone/desktop). Token + user key go in the
-# JSON body, so AUTH_TYPE stays "none". PRIORITY accepts -2..1 (default 0).
-WEBHOOK_PUSHOVER_URL=https://api.pushover.net/1/messages.json
-WEBHOOK_PUSHOVER_FORMAT=pushover
-WEBHOOK_PUSHOVER_METHOD=POST
-WEBHOOK_PUSHOVER_AUTH_TYPE=none
-WEBHOOK_PUSHOVER_AUTH_TOKEN=<pushover-application-token>
-WEBHOOK_PUSHOVER_AUTH_USER=<pushover-user-or-group-key>
-WEBHOOK_PUSHOVER_PRIORITY=0
-
-# Run backup
-proxsave
-# Result: Notifications sent to Telegram, Email, Discord, and Pushover
-```
-
-### Setup Steps
-
-#### 1. Telegram Bot Setup
-
-```bash
-# Create bot via @BotFather on Telegram
-# Send message: /newbot
-# Get token: 123456789:ABC...
-
-# Get chat ID:
-# Send message to bot
-# Visit: https://api.telegram.org/bot<TOKEN>/getUpdates
-# Copy chat.id value
-```
-
-#### 2. Email Configuration
-
-```bash
-# Option A: Cloud relay (default, outbound HTTPS)
-# - Set EMAIL_DELIVERY_METHOD=relay and configure EMAIL_RECIPIENT (or leave empty for root@pam auto-detect)
-# - Relay blocks root@... recipients; use a real non-root mailbox for EMAIL_RECIPIENT
-# - No local SMTP/MTA setup required on the node
-# - Optional/default: set EMAIL_FALLBACK_SENDMAIL=true to fall back to local sendmail when the relay fails
-
-# Option B: Local sendmail (/usr/sbin/sendmail)
-# - Set EMAIL_DELIVERY_METHOD=sendmail
-# - Requires a working local MTA (e.g. postfix) on the node
-# - EMAIL_RECIPIENT is required (or auto-detected from Proxmox root@pam if configured)
-
-# Option C: Proxmox Notifications (manual)
-# - Set EMAIL_DELIVERY_METHOD=pmf
-# - Configure SMTP/Sendmail targets and matchers in Proxmox Notifications
-# - ProxSave does not need SMTP host/port/user/password
-# - EMAIL_RECIPIENT is optional (only used for the To: header)
-# - If PMF fails the relay is tried next regardless of EMAIL_FALLBACK_SENDMAIL, which only gates the final local-sendmail leg. Use EMAIL_DELIVERY_METHOD=sendmail to stay off the relay entirely
-# - Optional quick check (runs the forwarder directly; run as root):
-printf "To: root\nSubject: proxsave test\n\nHello from proxsave\n" | sudo /usr/libexec/proxmox-mail-forward
-```
-
-#### 3. Discord Webhook
-
-```bash
-# In Discord:
-# Server Settings > Integrations > Webhooks > New Webhook
-# Copy webhook URL
-```
-
-### Expected Results
-
-**On successful backup**:
-- ✅ Telegram message with summary
-- ✅ Email with detailed report
-- ✅ Discord embed with stats
-- ✅ Pushover push notification
-
-**On failure**:
-- ❌ Telegram alert with error
-- ❌ Email with failure details
-- ❌ Discord mention with logs
-- ❌ Pushover push notification
-
----
+| Scenario | Purpose |
+| --- | --- |
+| [Multiple destinations](#example-8-complete-production-setup) | Combine local/NAS/cloud copies, encryption and result monitoring |
+| [Alternate system root](#example-9-test-in-a-chrootfixture) | Collect a mounted test tree on an isolated disposable host |
+| [Host backup appliance](#ha-lxc-backup-appliance-host_backup_mode) | Collect a host filesystem mounted into an LXC |
+| [Dual-role host](#example-10-dual-pvepbs-host) | Protect a host with PVE and PBS installed together |
+| [Scheduled monitoring](#example-11-resident-daemon-and-healthchecks-monitoring) | Combine recurring backups with missing-run detection |
 
 ## Example 8: Complete Production Setup
 
-**Scenario**: Enterprise setup with all features enabled.
+This example combines multiple destinations, AGE encryption and retention. Adapt it to the host and test every destination; enabling more features does not by itself prove that a backup is recoverable
 
-**Use case**:
-- Production environment
-- Maximum reliability
-- All collectors enabled
-- Multi-tier storage
-- Encryption
-- Notifications
-- Metrics export
+### Prerequisites for the combined policy
 
-### Configuration
+- A working ProxSave installation and a verified initial backup
+- A secondary filesystem mounted at the intended NAS path before the run
+- An rclone remote configured for the account that runs ProxSave
+- AGE recovery material stored independently of this host
+- Enough destination capacity for the proposed retention policy
 
-```bash
-# configs/backup.env
+Configure the basic destination and encryption choices in **Maintenance > Install > Edit install**. Create or configure recipients through **Maintenance > New key**, following the [encryption guide](ENCRYPTION.md). Do not rotate keys without retaining the identities needed for existing archives
 
-# General
+The following configuration illustrates the additional policy values. Replace existing assignments in the active configuration; do not append a second set of competing keys or aliases
+
+```ini
 BACKUP_ENABLED=true
-USE_COLOR=true
-DEBUG_LEVEL=standard
-
-# Security
-SECURITY_CHECK_ENABLED=true
-AUTO_UPDATE_HASHES=true
-AUTO_FIX_PERMISSIONS=true
-CONTINUE_ON_SECURITY_ISSUES=false
-
-# Compression (balanced)
-COMPRESSION_TYPE=xz
-COMPRESSION_LEVEL=6
-COMPRESSION_MODE=standard
-COMPRESSION_THREADS=0
-
-# Primary storage
 BACKUP_PATH=/opt/proxsave/backup
 LOG_PATH=/opt/proxsave/log
 
-# Secondary storage (NAS)
 SECONDARY_ENABLED=true
-SECONDARY_PATH=/mnt/nas/pbs-backup
-SECONDARY_LOG_PATH=/mnt/nas/pbs-log
+SECONDARY_PATH=/mnt/nas/proxsave/backup
+SECONDARY_LOG_PATH=/mnt/nas/proxsave/log
 
-# Cloud storage (S3)
 CLOUD_ENABLED=true
 CLOUD_REMOTE=s3
-CLOUD_REMOTE_PATH=/company-backups/datacenter1/pbs1
-CLOUD_LOG_PATH=/company-backups/logs
-CLOUD_UPLOAD_MODE=parallel
-CLOUD_PARALLEL_MAX_JOBS=4
-RCLONE_TRANSFERS=8
-RCLONE_RETRIES=3
+CLOUD_REMOTE_PATH=/company-backups/host1
+CLOUD_LOG_PATH=/company-backups/logs/host1
 
-# GFS retention (7-year compliance)
+COMPRESSION_TYPE=xz
+COMPRESSION_LEVEL=6
+COMPRESSION_MODE=standard
+
 RETENTION_POLICY=gfs
 RETENTION_DAILY=7
 RETENTION_WEEKLY=8
-RETENTION_MONTHLY=24
-RETENTION_YEARLY=7
+RETENTION_MONTHLY=12
+RETENTION_YEARLY=3
 
-# Encryption
 ENCRYPT_ARCHIVE=true
 BUNDLE_ASSOCIATED_FILES=true
 AGE_RECIPIENT_FILE=/opt/proxsave/identity/age/recipient.txt
-
-# Notifications
-TELEGRAM_ENABLED=true
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
-EMAIL_ENABLED=true
-EMAIL_RECIPIENT=ops@example.com
-GOTIFY_ENABLED=true
-GOTIFY_SERVER_URL=https://gotify.example.com
-GOTIFY_TOKEN=...
-
-# Metrics
-METRICS_ENABLED=true
-METRICS_PATH=/var/lib/prometheus/node-exporter
-
-# Collectors (all enabled)
-BACKUP_CLUSTER_CONFIG=true
-BACKUP_PVE_FIREWALL=true
-BACKUP_DATASTORE_CONFIGS=true
-BACKUP_USER_CONFIGS=true
-BACKUP_NETWORK_CONFIGS=true
-BACKUP_APT_SOURCES=true
-BACKUP_CRON_JOBS=true
-BACKUP_SYSTEMD_SERVICES=true
-BACKUP_SSL_CERTS=true
-BACKUP_CRITICAL_FILES=true
-BACKUP_SSH_KEYS=true
-BACKUP_ZFS_CONFIG=true
-BACKUP_ROOT_HOME=true
-
-# Custom paths
-CUSTOM_BACKUP_PATHS="
-/root/.config/rclone/rclone.conf
-/opt/proxsave/configs/backup.env
-/etc/custom/app.conf
-"
-
-# Run backup
-proxsave
 ```
 
-### Cron Schedule
+The NAS path must be the intended mounted filesystem, not an empty directory left behind by a missing mount. The `s3` name is an already configured rclone remote. Follow [cloud setup](CLOUD_STORAGE.md) rather than treating the name as credentials
 
-```bash
-# Daily backup at 2 AM
-crontab -e
-0 2 * * * /opt/proxsave/build/proxsave >> /var/log/pbs-backup-cron.log 2>&1
-```
+The retention values describe a proposed policy, not a compliance guarantee. They cannot retain historical generations that have never been created. Review the [retention behavior](STORAGE.md#set-backup-retention), destination overrides and available capacity before reducing or replacing an existing policy
 
-### Expected Results
+If you use a personal Telegram bot, explicitly select `BOT_TELEGRAM_TYPE=personal` together with its token and chat ID. Use the [notification guide](NOTIFICATIONS.md) to configure and test each chosen channel. Keep secrets out of shared configuration examples
 
-**Storage distribution**:
-- ✅ Encrypted backup on local SSD
-- ✅ Copy to secondary NAS
-- ✅ Upload to S3 cloud
-- ✅ GFS retention (7-year compliance)
+For metrics, set `METRICS_ENABLED` and `METRICS_PATH` according to the [metrics reference](CONFIGURATION.md#metrics---prometheus). Writing metrics files does not configure a Prometheus scrape job or create a Grafana dashboard
 
-**Notifications**:
-- ✅ Telegram alert
-- ✅ Email report
-- ✅ Gotify push notification
+### Check the combined result
 
-**Metrics**:
-- ✅ Prometheus metrics exported
-- ✅ Grafana dashboard integration
+1. Open **Daemon > Status** and confirm which scheduler owns the installation
+2. Review **Diagnostic Checks > Post-install**, then the Telegram or Healthchecks checks for services you have configured
+3. Run **Backup** and examine the collection summary and the result of every enabled destination
+4. Confirm that copied archive sets can be accessed independently of this host, including any credentials needed to retrieve them
+5. Test decryption and a compatible recovery procedure on a disposable host before relying on this policy
 
-**Backup includes**:
-- PVE cluster config
-- PBS datastores
-- Network configs
-- SSL certificates
-- SSH keys
-- ZFS configuration
-- Custom application configs
-
----
-
-## Related Documentation
-
-### Configuration
-- **[Configuration Guide](CONFIGURATION.md)** - Complete variable reference
-- **[Cloud Storage Guide](CLOUD_STORAGE.md)** - rclone setup for all examples
-- **[Encryption Guide](ENCRYPTION.md)** - AGE encryption details
-
-### Operations
-- **[CLI Reference](CLI_REFERENCE.md)** - All command-line flags
-- **[Troubleshooting](TROUBLESHOOTING.md)** - Common issues and solutions
-
-### Reference
-- **[Restore Guide](RESTORE_GUIDE.md)** - Restore from any example backup
-
-### Main Documentation
-- **[README](../README.md)** - Project overview and quick start
-
----
-
-## Quick Comparison Matrix
-
-| Example | Local | NAS | Cloud | Encryption | GFS | Complexity |
-|---------|-------|-----|-------|------------|-----|------------|
-| **1. Basic Local** | ✅ | ❌ | ❌ | ❌ | ❌ | ⭐ Simple |
-| **2. Local + NAS** | ✅ | ✅ | ❌ | ❌ | ❌ | ⭐⭐ Easy |
-| **3. Google Drive** | ✅ | ❌ | ✅ | ❌ | ✅ | ⭐⭐ Easy |
-| **4. Encrypted** | ✅ | ❌ | ✅ | ✅ | ❌ | ⭐⭐⭐ Moderate |
-| **5. Backblaze B2** | ✅ | ❌ | ✅ | ❌ | ✅ | ⭐⭐⭐ Moderate |
-| **6. MinIO** | ✅ | ❌ | ✅ | ❌ | ❌ | ⭐⭐⭐ Moderate |
-| **7. Multi-Notify** | ✅ | ❌ | ❌ | ❌ | ❌ | ⭐⭐ Easy |
-| **8. Production** | ✅ | ✅ | ✅ | ✅ | ✅ | ⭐⭐⭐⭐ Advanced |
-
----
-
-## Customization Tips
-
-### Mix and Match
-
-All examples can be combined. For instance:
-
-**Example: Local + NAS + Encrypted + Google Drive + GFS**:
-```bash
-# From Example 2: Local + NAS
-SECONDARY_ENABLED=true
-SECONDARY_PATH=/mnt/nas/pbs-backup
-
-# From Example 4: Encryption
-ENCRYPT_ARCHIVE=true
-AGE_RECIPIENT_FILE=${BASE_DIR}/identity/age/recipient.txt
-
-# From Example 3: Google Drive + GFS
-CLOUD_ENABLED=true
-CLOUD_REMOTE=gdrive
-CLOUD_REMOTE_PATH=/pbs-backups
-RETENTION_POLICY=gfs
-RETENTION_DAILY=7
-RETENTION_WEEKLY=4
-RETENTION_MONTHLY=12
-RETENTION_YEARLY=3
-```
-
-### Performance Tuning
-
-Adjust compression for your use case:
-
-**Fast (low CPU)**:
-```bash
-COMPRESSION_TYPE=zstd
-COMPRESSION_LEVEL=3
-COMPRESSION_MODE=fast
-```
-
-**Balanced** (default):
-```bash
-COMPRESSION_TYPE=xz
-COMPRESSION_LEVEL=6
-COMPRESSION_MODE=standard
-```
-
-**Maximum compression** (high CPU):
-```bash
-COMPRESSION_TYPE=xz
-COMPRESSION_LEVEL=9
-COMPRESSION_MODE=slow
-```
-
-### Cost Optimization
-
-**Minimize cloud costs**:
-```bash
-# Use GFS for efficient long-term retention
-RETENTION_POLICY=gfs
-RETENTION_DAILY=7
-RETENTION_WEEKLY=4
-RETENTION_MONTHLY=6
-RETENTION_YEARLY=2
-
-# Aggressive compression
-COMPRESSION_TYPE=xz
-COMPRESSION_LEVEL=9
-
-# Disable log uploads
-CLOUD_LOG_PATH=
-
-# Result: ~19 backups instead of 365 (5% storage cost)
-```
-
----
+Native PBS can be added using [its dedicated procedure](STORAGE.md#create-native-pbs-backups). It stores a different format and has separate key and recovery requirements
 
 ## Example 9: Test in a Chroot/Fixture
 
-**Scenario**: Run collection against an alternate system root (chroot, mounted snapshot, test fixture) without touching the live filesystem.
+`SYSTEM_ROOT_PREFIX` redirects collection to another root. It does not sandbox ProxSave or redirect logs, runtime state, output paths or retention. Use a separate disposable test host or isolated test installation, not a production host with a different input path
 
-**Use case**:
-- CI/test backups in an isolated environment
-- Offline analysis of a mounted image/snapshot
-- Running inside a container that mounts a different root
+Prepare the alternate filesystem using the host's storage tools, then create a dedicated configuration from the installation's current configuration. Set the prefix in that file; it is not an environment override
 
-### Configuration
-
-```bash
-# configs/backup.env
-SYSTEM_ROOT_PREFIX=/mnt/snapshot-root   # points to the alternate root
+```ini
+SYSTEM_ROOT_PREFIX=/mnt/snapshot-root
 BACKUP_ENABLED=true
-# /etc, /var, /root, /home are resolved under the prefix
+BACKUP_PATH=/var/lib/proxsave-fixture/backup
+LOG_PATH=/var/lib/proxsave-fixture/log
+SECONDARY_ENABLED=false
+SECONDARY_PATH=
+SECONDARY_LOG_PATH=
+CLOUD_ENABLED=false
+PBS_TARGET_ENABLED=false
+TELEGRAM_ENABLED=false
+EMAIL_ENABLED=false
+GOTIFY_ENABLED=false
+WEBHOOK_ENABLED=false
+METRICS_ENABLED=false
+HEALTHCHECK_ENABLED=false
+AUTO_UPDATE_HASHES=false
+AUTO_FIX_PERMISSIONS=false
+SET_BACKUP_PERMISSIONS=false
 ```
 
-### Setup Steps
+Keep outputs outside the mounted input tree. Check aliases and supported environment overrides against the [configuration reference](CONFIGURATION.md), and remove custom scripts or other test settings that could affect live services
 
-`SYSTEM_ROOT_PREFIX` is **not** one of the keys ProxSave reads from the environment, so it has to go in a config file. Setting it on the command line is silently ignored and the run collects the live root instead, which is the one mistake here that produces a plausible-looking archive of the wrong system.
+Selecting this separate configuration is an advanced command-line task. Use the [alternate-configuration instructions](CLI_REFERENCE.md#separate-collection-profile-on-a-disposable-host) and inspect debug output to confirm that collection reads the intended root before executing a real backup. The dry run still writes diagnostic logs
 
-```bash
-# 1) Mount or prepare the alternate root
-mount /dev/vg0/snap /mnt/snapshot-root   # example
-
-# 2) Put the prefix in a dedicated config file
-cp /opt/proxsave/configs/backup.env /opt/proxsave/configs/snapshot.env
-sed -i 's|^SYSTEM_ROOT_PREFIX=.*|SYSTEM_ROOT_PREFIX=/mnt/snapshot-root|' /opt/proxsave/configs/snapshot.env
-
-# 3) Run a dry-run against it
-proxsave -c /opt/proxsave/configs/snapshot.env --dry-run
-
-# 4) Run the actual backup (optional)
-proxsave -c /opt/proxsave/configs/snapshot.env
-```
-
-Confirm the prefix took effect before running for real. On a Proxmox snapshot the run header names it (`Proxmox Type (prefix /mnt/snapshot-root): ...`); on a plain chroot or fixture that line is debug-only, so run the dry-run with `--log-level debug` and check the collected paths resolve under `/mnt/snapshot-root`. Collection lines at the default level name the category, not the path, so they cannot tell you which root was used.
-
-### Expected Results
-- Collected files reflect the contents of `/mnt/snapshot-root/etc`, `/var`, `/root`, `/home`, etc.
-- No writes to the node's live filesystem.
-
----
+Expected results are files from the mounted input and archives/logs under the test output paths. Temporary files and runtime state still belong to the executing installation. Restoring from such an archive is a separate operation with its own target and safety requirements
 
 ## HA-LXC Backup Appliance (`HOST_BACKUP_MODE`)
 
-**Scenario**: Run ProxSave inside a privileged LXC that backs up the Proxmox host, with the host filesystem bind-mounted read-only into the container (issue #255).
+This scenario runs ProxSave in a privileged LXC with the host filesystem exposed beneath `/host`. Configure the container mounts in Proxmox first: the intended host root and the PVE configuration mount must be visible at the correct prefixed paths and mounted read-only. This is external container administration, not a ProxSave dashboard operation
 
-**Use case**:
-- A dedicated, restartable backup appliance for a Proxmox VE or PBS host
-- Keeping ProxSave and its dependencies out of the host root
+Use these settings inside the container's ProxSave installation:
 
-### Setup Steps
-
-```bash
-# 1) On the Proxmox host, bind-mount the host root and pmxcfs read-only into the CT
-pct set <CTID> -mp0 /,mp=/host,ro=1
-pct set <CTID> -mp1 /etc/pve,mp=/host/etc/pve,ro=1
-
-# 2) In the container's configs/backup.env
+```ini
 SYSTEM_ROOT_PREFIX=/host
 HOST_BACKUP_MODE=true
 BACKUP_ENABLED=true
-
-# 3) Dry-run, then run
-proxsave --dry-run
-proxsave
 ```
 
-### Expected Results
-- Proxmox type is detected from the mounted host (`/host/etc/pve`, `/host/etc/proxmox-backup`), not the container.
-- Absolute symlinks such as `/etc/ceph/ceph.conf -> /etc/pve/ceph.conf` resolve under the prefix, so Ceph configuration is collected.
-- ZFS pool state is collected (shared kernel); namespace-scoped and cluster-daemon commands (udevadm, ethtool, pvesh, ceph) are skipped and their data comes from the host files.
-- Symlink targets are stored verbatim, so the archive restores onto a real host unchanged.
-- No writes to the host filesystem.
+Then open `proxsave` in the container's interactive terminal and choose **Backup**. Review the detected role and collection results before relying on the appliance
 
----
+With a prefix and host-backup mode, detection uses the mounted host filesystem. Commands whose namespace or daemon context would describe the container instead of the host are skipped, and some information comes from files. Not all host mounts or runtime information are necessarily visible in the container
+
+Keep archive destinations, logs and runtime files in deliberate container-accessible locations. Read-only input mounts protect those input paths; the prefix itself is not a general isolation boundary. Do not run Restore in the container expecting it to restore the mounted host automatically
 
 ## Example 10: Dual PVE+PBS Host
 
-**Scenario**: A single node runs both Proxmox VE and Proxmox Backup Server.
+ProxSave detects hosts where both products are installed and can collect their configurations together. The backup has one shared Linux payload and role-specific PVE/PBS content. Existing configuration directories alone are not a reliable substitute for installed-role detection
 
-**Use case**:
-- Lab or edge node with co-installed PVE + PBS
-- Single backup run should include both product roles
-- Restore must remain compatible with `dual`, `pve`, or `pbs` targets
+Use **Maintenance > Install > Edit install** for the exposed settings and review the collector keys in the configuration reference. This example enables representative role-specific collectors:
 
-### Configuration
-
-```bash
-# configs/backup.env
-BACKUP_ENABLED=true
-BACKUP_PATH=/opt/proxsave/backup
-LOG_PATH=/opt/proxsave/log
-
-# Common/system collection
-BACKUP_NETWORK_CONFIGS=true
-BACKUP_CRON_JOBS=true
-BACKUP_SYSTEMD_SERVICES=true
-BACKUP_ZFS_CONFIG=true
-
-# PVE collection
+```ini
 BACKUP_VM_CONFIGS=true
 BACKUP_CLUSTER_CONFIG=true
 BACKUP_PVE_JOBS=true
 BACKUP_PVE_REPLICATION=true
 BACKUP_PVE_FIREWALL=true
-
-# PBS collection
 BACKUP_DATASTORE_CONFIGS=true
 BACKUP_REMOTE_CONFIGS=true
 BACKUP_SYNC_JOBS=true
 BACKUP_VERIFICATION_JOBS=true
 BACKUP_PBS_NOTIFICATIONS=true
 BACKUP_PBS_NODE_CONFIG=true
-
-# Recommended for dual labs: keep diagnostics
-PXAR_SCAN_ENABLE=true
+BACKUP_NETWORK_CONFIGS=true
+BACKUP_CRON_JOBS=true
+BACKUP_SYSTEMD_SERVICES=true
+BACKUP_ZFS_CONFIG=true
 ```
 
-### Expected Behavior
+Run **Backup** and inspect both role summaries. If one role fails collection, the other may still be saved with the incomplete target recorded. Both role collectors failing is an error. Do not treat the presence of one archive as proof that both roles completed
 
-- ProxSave auto-detects the host as `dual`
-- One archive is produced for the run
-- Metadata persists:
-  - `BACKUP_TYPE=dual`
-  - `BACKUP_TARGETS=pve,pbs`
-- The backup contains:
-  - PVE categories
-  - PBS categories
-  - one shared `common/system` payload
+Metadata identifies a combined backup as `dual` with PVE and PBS targets. During restore, available categories depend on payload and target capabilities: a PVE-only target cannot apply PBS-only settings just because both roles were in the source archive
 
-### Restore Notes
-
-- Restore on a `dual` host: full `PVE + PBS + Common`
-- Restore on a `pve` host: `PVE + Common`
-- Restore on a `pbs` host: `PBS + Common`
-
-The restore workflow filters categories automatically when the current host does
-not support all backup targets.
-
----
+Optional datastore inventories remain metadata. Enabling `PXAR_SCAN_ENABLE` does not include PBS datastore contents in the configuration backup
 
 ## Example 11: Resident daemon and healthchecks monitoring
 
-**Scenario**: You want the backup scheduled and supervised by a resident service with a
-hang watchdog and an external dead-man switch, instead of a bare cron entry. Fresh
-installs default to this engine; use these commands to switch an existing install or to
-inspect it.
+Use this combination when you need scheduled execution and an alert if backups fail or stop arriving
 
-### Switch to the daemon
+1. Open **Daemon > Status** and inspect the configured scheduler and running binary
+2. If the host uses cron and you intend to switch, choose **Daemon > Install** and review the result. Follow the [daemon migration guidance](DAEMON.md) for existing wrapper scripts or other schedulers
+3. Configure the schedule through the installation form and the documented settings. Use **Daemon > Restart** when configuration or binary changes require it
+4. Configure monitoring using the [healthchecks guide](HEALTHCHECKS.md), then open **Diagnostic Checks > Healthchecks** to inspect it
+5. Run **Backup**, confirm the result reaches the monitor, and verify the intended alert delivery
 
-```bash
-# Install the systemd service, remove the cron entry, turn on centralized healthchecks
-proxsave --daemon-setup
+A received backup message and a working missing-run monitor are different checks. Avoid leaving an independent cron wrapper or external timer running alongside the daemon schedule
 
-# Check status (exit 0 only when running, beating, and binary-aligned)
-proxsave --daemon-status
-```
+## Example 1: Basic Local Backup
 
-`--daemon-setup` writes `SCHEDULER_MODE=daemon` and `HEALTHCHECK_ENABLED=true` and starts
-`proxsave-daemon.service`. The daemon runs the backup daily at `SCHEDULER_TIME`, under a
-`MAX_RUN_DURATION` watchdog, and reports four checks (alive, backup, updates, and one per
-notification channel) to an external healthchecks monitor.
+The complete procedure now lives in [Run and verify your first backup](BACKUP_GUIDE.md#run-and-verify-your-first-backup)
 
-### Inspect and revert
+## Example 2: Local + Secondary Storage
 
-```bash
-systemctl status proxsave-daemon.service      # is it running?
-journalctl -u proxsave-daemon.service -f      # follow its log
-proxsave --daemon-remove                       # revert to a cron entry
-```
+Use [backup destinations](STORAGE.md#choose-and-verify-backup-destinations) for local and pre-mounted secondary storage, including the checks needed before relying on a NAS copy
 
-See [DAEMON.md](DAEMON.md) for the daemon itself and [HEALTHCHECKS.md](HEALTHCHECKS.md)
-for the monitoring modes (centralized vs self), the monitoring portal, and the full
-configuration keys.
+## Example 3: Cloud Backup with Google Drive
 
----
+Use [cloud storage](CLOUD_STORAGE.md) to configure an rclone remote for the executing account, select its path and verify a copied archive set
+
+## Example 4: Encrypted Backup with AGE
+
+Use the [encryption guide](ENCRYPTION.md) to configure recipients, retain recovery material and test decryption
+
+## Example 5: Backblaze B2 with Bandwidth Limiting
+
+Provider setup and rclone tuning belong in [cloud storage](CLOUD_STORAGE.md). Review the provider's current limits separately; a concurrency setting does not imply multiple workers within one uploaded file
+
+## Example 6: MinIO Self-Hosted with High Performance
+
+Use [cloud storage](CLOUD_STORAGE.md) for an S3-compatible remote and tune it against observed transfer behavior. A self-hosted endpoint is not automatically faster, and one copy operation is not replication to several independent destinations
+
+## Example 7: Multi-Notification Setup
+
+Use the [notification guide](NOTIFICATIONS.md) for channels and delivery checks, and [healthchecks](HEALTHCHECKS.md) for missing-run monitoring
+
+## Quick Comparison Matrix
+
+| Choice | Read first |
+| --- | --- |
+| Local/NAS/cloud/PBS | [Storage](STORAGE.md#choose-and-verify-backup-destinations) |
+| Simple or GFS retention | [Retention](STORAGE.md#set-backup-retention) |
+| Archive encryption and recovery keys | [Encryption](ENCRYPTION.md) |
+| Scheduler and monitoring | [Daemon](DAEMON.md) and [healthchecks](HEALTHCHECKS.md) |
+| Recovery planning | [Restore](RESTORE_GUIDE.md#quick-start) |
+
+## Customization Tips
+
+Change one part of a working policy at a time, run a backup from the dashboard and inspect the result. Keep a known usable backup while testing. Performance and archive size depend on the files actually collected, compression, destination and host resources
+
+## Related Documentation
+
+Use the [documentation index](README.md) to find the canonical task guide or the [configuration reference](CONFIGURATION.md) for individual keys
 
 ## Next Steps
 
-1. **Choose an example** closest to your use case
-2. **Copy configuration** to `configs/backup.env`
-3. **Customize** paths, credentials, retention
-4. **Test** with `--dry-run` mode
-5. **Run** first backup manually
-6. **Verify** results in storage locations
-7. **Schedule** via cron or systemd
-8. **Monitor** logs and notifications
-
-**For detailed configuration options**, see: **[Configuration Guide](CONFIGURATION.md)**
+Verify a recovery on a disposable compatible system and keep the access credentials and recovery material available independently of the original host

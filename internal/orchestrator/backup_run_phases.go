@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tis24dev/proxsave/internal/backup"
+	"github.com/tis24dev/proxsave/internal/block"
 	"github.com/tis24dev/proxsave/internal/environment"
 	"github.com/tis24dev/proxsave/internal/types"
 )
@@ -97,24 +98,34 @@ func (o *Orchestrator) initBackupRun(run *backupRunContext) *BackupStats {
 		run.stats.NewVersionAvailable = o.versionUpdateAvailable
 		run.stats.CurrentVersion = o.updateCurrentVersion
 		run.stats.LatestVersion = o.updateLatestVersion
+		run.stats.UpdateNoticeLogged = o.updateNoticeLogged
 	}
 	return run.stats
 }
 
 func (o *Orchestrator) exportBackupMetrics(run *backupRunContext, runErr error) {
 	stats := run.stats
+	// On a successful, non-dry run the pre-notification issue snapshot was taken before
+	// notifications ran, so a notify/communication failure logged during dispatch is not
+	// yet counted. Re-parse the log so it surfaces as a warning (status 1) instead of
+	// vanishing to success (0). Idempotent: a clean run stays success.
+	//
+	// This runs BEFORE the metrics gate on purpose: it decides the PROCESS exit code
+	// (this whole function is a defer inside RunGoBackup, and the cmd layer exits with
+	// stats.ExitCode), and it sat behind the gate for two releases - the same notify
+	// failure exited 1 with METRICS_ENABLED=true and 0 on a default install. The
+	// contract (maintainer call, 2026-09-02): a notification failure is warning-weight
+	// ALWAYS, whatever the metrics setting - monitoring must learn notifications are
+	// broken exactly when email cannot say so. NOTIFICATIONS.md states the same.
+	if runErr == nil && !o.dryRun && stats != nil {
+		o.finalizeSuccessIssueStats(stats)
+	}
+
 	if !o.shouldExportBackupMetrics(stats) {
 		return
 	}
 
 	o.ensureBackupStatsTiming(stats)
-	// On a successful, non-dry run the pre-notification issue snapshot was taken before
-	// notifications ran, so a notify/communication failure logged during dispatch is not
-	// yet counted. Re-parse the log so it surfaces as a warning (status 1) instead of
-	// vanishing to success (0). Idempotent: a clean run stays success.
-	if runErr == nil && !o.dryRun {
-		o.finalizeSuccessIssueStats(stats)
-	}
 	stats.ExitCode = backupMetricsExitCode(stats, runErr)
 	o.exportPrometheusBackupMetrics(stats)
 }
@@ -144,7 +155,51 @@ func (o *Orchestrator) finalizeFailedBackupStats(run *backupRunContext, runErr e
 	stats.Failed = true
 	o.ensureBackupStatsTiming(stats)
 	o.parseFailedBackupLogCounts(stats)
+	// The ERROR line that reports this failure is written by the caller
+	// (handleBackupRunError, cmd/proxsave/backup_execution.go) only after RunGoBackup
+	// returns, so the log parsed above does not hold it yet and exportBackupMetrics
+	// would publish errors_total 0 next to status 2 (F5). Count it here. With a log
+	// file the notifications are not affected: snapshotPreNotificationIssues re-reads
+	// the log after that line is written and overwrites this count, so it is never
+	// counted twice. Without one nothing re-reads, and this count is what they show.
+	// A canceled run is reported with a WARNING, not an ERROR, so it adds nothing;
+	// the test is the caller's own (ctx.Err() == context.Canceled). Neither does a
+	// failure whose ERROR outcome the storage step already wrote ("✗ Local Storage:
+	// backup not accessible"): that line is in the log parsed above, and the caller
+	// writes its own report of it at DEBUG (OutcomeLogged).
+	switch {
+	case run.ctx != nil && run.ctx.Err() == context.Canceled:
+	case OutcomeLogged(runErr):
+		o.logger.Debug("Stopping error already reported by its outcome line; ErrorCount=%d", stats.ErrorCount)
+	default:
+		stats.ErrorCount++
+	}
 	stats.ExitCode = backupFailureExitCode(runErr)
+
+	// Every location this run did not describe still holds what it held at startup,
+	// and the notifications, the dashboard and the metrics read these fields next.
+	// This defer runs before exportBackupMetrics and before the caller dispatches the
+	// notifications (handleBackupRunError -> FinalizeAfterRun), so all of them see it.
+	for _, target := range o.storageTargets {
+		if filler, ok := target.(startupStatsFiller); ok {
+			filler.applyInitialStats(stats)
+		}
+	}
+	// The PBS block too: a run stopped before step [7] reports what its startup check
+	// read. A block that ran never gets here, step [7] does not fail the run.
+	if stats.PBSTarget != nil {
+		for _, b := range o.backupBlocks {
+			if filler, ok := b.(startupResultFiller); ok {
+				filler.ApplyStartupFigures(stats.PBSTarget)
+			}
+		}
+	}
+}
+
+// startupResultFiller is a destination block that can describe its destination as the
+// startup check found it (block.PBS).
+type startupResultFiller interface {
+	ApplyStartupFigures(r *block.Result)
 }
 
 func (o *Orchestrator) prepareBackupWorkspace(run *backupRunContext, workspace *backupWorkspace) error {
@@ -160,11 +215,8 @@ func (o *Orchestrator) prepareBackupWorkspace(run *backupRunContext, workspace *
 	}
 	workspace.tempDir = tempDir
 
-	if o.dryRun {
-		o.logger.Info("[DRY RUN] Temporary directory would be: %s", workspace.tempDir)
-	} else {
-		o.logger.Debug("Using temporary directory: %s", workspace.tempDir)
-	}
+	// Dry run creates the workspace too (collection stages into it), so it says what a real run says.
+	o.logger.Debug("Using temporary directory: %s", workspace.tempDir)
 	return nil
 }
 
@@ -231,6 +283,9 @@ func (o *Orchestrator) collectBackupData(run *backupRunContext, workspace *backu
 	collStats := collector.GetStats()
 	o.applyBackupCollectionStats(run.stats, collStats, collector)
 	o.writeBackupCollectionMetadata(workspace.tempDir, run.hostname, run.stats, collector)
+	if err := collector.StagingNoSpaceErr(); err != nil {
+		return &BackupError{Phase: "collection", Err: err, Code: types.ExitCollectionError}
+	}
 
 	// The collection manifest is written through the collector after the first
 	// snapshot, so re-snapshot afterwards: this counts the manifest like every other
@@ -245,7 +300,7 @@ func (o *Orchestrator) collectBackupData(run *backupRunContext, workspace *backu
 		return err
 	}
 
-	optResult, err := o.applyBackupOptimizations(run.ctx, workspace.tempDir)
+	optResult, err := o.applyBackupOptimizations(run.ctx, workspace.tempDir, run.collectorConfig.ExcludePatterns)
 	if err != nil {
 		return err
 	}
@@ -299,7 +354,12 @@ func (o *Orchestrator) createBackupArchive(run *backupRunContext, workspace *bac
 	o.logResolvedBackupCompression(run.stats)
 
 	partialPath := archivePath + ".partial"
-	if err := createBackupArchiveFile(run.ctx, archiver, workspace.tempDir, partialPath); err != nil {
+	createPath := partialPath
+	if o.dryRun {
+		// Nothing is written in dry run: name the archive a real run leaves, not the internal partial.
+		createPath = archivePath
+	}
+	if err := createBackupArchiveFile(run.ctx, archiver, workspace.tempDir, createPath); err != nil {
 		// A failed or cancelled CreateArchive can leave a truncated partial; remove
 		// it so nothing lingers on the backup path.
 		discardPartialArchive(workspace.fs, partialPath)
@@ -318,7 +378,7 @@ func (o *Orchestrator) createBackupArchive(run *backupRunContext, workspace *bac
 func (o *Orchestrator) verifyAndWriteBackupArtifacts(run *backupRunContext, workspace *backupWorkspace, artifacts *backupArtifacts) error {
 	stats := run.stats
 	if o.dryRun {
-		return o.skipDryRunArtifactVerification(stats, artifacts)
+		return o.skipDryRunArtifactVerification(stats)
 	}
 
 	fmt.Println()
@@ -327,18 +387,21 @@ func (o *Orchestrator) verifyAndWriteBackupArtifacts(run *backupRunContext, work
 
 	if err := artifacts.archiver.VerifyArchive(run.ctx, artifacts.partialPath); err != nil {
 		discardPartialArchive(workspace.fs, artifacts.partialPath)
+		clearDiscardedArchiveStats(stats)
 		return &BackupError{Phase: "verification", Err: err, Code: types.ExitVerificationError}
 	}
 
 	checksum, err := o.generateArchiveChecksum(run.ctx, artifacts.partialPath)
 	if err != nil {
 		discardPartialArchive(workspace.fs, artifacts.partialPath)
+		clearDiscardedArchiveStats(stats)
 		return err
 	}
 	stats.Checksum = checksum
 
 	if err := promoteBackupArchive(workspace.fs, artifacts.partialPath, artifacts.archivePath); err != nil {
 		discardPartialArchive(workspace.fs, artifacts.partialPath)
+		clearDiscardedArchiveStats(stats)
 		return &BackupError{Phase: "archive", Err: fmt.Errorf("promote verified archive: %w", err), Code: types.ExitArchiveError}
 	}
 
@@ -357,11 +420,18 @@ func (o *Orchestrator) verifyAndWriteBackupArtifacts(run *backupRunContext, work
 }
 
 func (o *Orchestrator) bundleBackupArtifacts(run *backupRunContext, workspace *backupWorkspace, artifacts *backupArtifacts) error {
+	bundleEnabled := o.cfg != nil && o.cfg.BundleAssociatedFiles
 	if o.dryRun {
+		fmt.Println()
+		if bundleEnabled {
+			o.logStep(5, "Bundling skipped (dry run mode)")
+		} else {
+			// Same line a real run prints when bundling is off.
+			o.logger.Skip("Bundling disabled")
+		}
 		return nil
 	}
 
-	bundleEnabled := o.cfg != nil && o.cfg.BundleAssociatedFiles
 	if !bundleEnabled {
 		fmt.Println()
 		o.logger.Skip("Bundling disabled")
@@ -433,6 +503,10 @@ func (o *Orchestrator) finalizeDryRunIssueStats(stats *BackupStats) {
 }
 
 func (o *Orchestrator) dispatchBackupArtifacts(run *backupRunContext) error {
+	// The disabled destinations close step [6] with their SKIP line, after the
+	// enabled ones, in every branch below: the dry run included.
+	defer o.logDisabledStorageTargets(run.stats)
+
 	if len(o.storageTargets) == 0 {
 		fmt.Println()
 		o.logStep(6, "No storage targets registered - skipping")
@@ -441,7 +515,11 @@ func (o *Orchestrator) dispatchBackupArtifacts(run *backupRunContext) error {
 		o.logStep(6, "Storage dispatch skipped (dry run mode)")
 	} else {
 		fmt.Println()
-		o.logStep(6, "Dispatching archive to %d storage target(s)", len(o.storageTargets))
+		// The count is the copies: the Primary already holds the archive, step [6]
+		// only sets its permissions and applies its retention.
+		copies := o.storageCopyTargetCount()
+		o.logger.Debug("Storage targets registered: %d, copies: %d", len(o.storageTargets), copies)
+		o.logStep(6, "Dispatching archive to %d storage target(s)", copies)
 		o.logGlobalRetentionPolicy()
 	}
 
@@ -450,5 +528,39 @@ func (o *Orchestrator) dispatchBackupArtifacts(run *backupRunContext) error {
 	}
 
 	o.logger.Debug("Dispatching archive to %d storage targets", len(o.storageTargets))
-	return o.dispatchPostBackup(run.ctx, run.stats)
+	return o.syncStorageTargets(run.ctx, run.stats)
+}
+
+// storageCopyTarget is implemented by a storage target that can say whether it
+// receives a copy of the archive (an enabled destination other than the Primary).
+type storageCopyTarget interface {
+	receivesCopy() bool
+}
+
+// storageCopyTargetCount counts the registered targets that receive a copy. A target
+// that cannot say is counted: only the Primary is excluded, and it is a StorageAdapter.
+func (o *Orchestrator) storageCopyTargetCount() int {
+	copies := 0
+	for _, target := range o.storageTargets {
+		if c, ok := target.(storageCopyTarget); ok && !c.receivesCopy() {
+			continue
+		}
+		copies++
+	}
+	return copies
+}
+
+// logDisabledStorageTargets prints the SKIP line of each disabled destination at the
+// end of step [6].
+func (o *Orchestrator) logDisabledStorageTargets(stats *BackupStats) {
+	if o == nil || o.logger == nil || stats == nil {
+		return
+	}
+	o.logger.Debug("Disabled storage targets: secondary=%v cloud=%v", !stats.SecondaryEnabled, !stats.CloudEnabled)
+	if !stats.SecondaryEnabled {
+		o.logger.Skip("Secondary Storage: disabled")
+	}
+	if !stats.CloudEnabled {
+		o.logger.Skip("Cloud Storage: disabled")
+	}
 }

@@ -2,8 +2,13 @@ package storage
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/tis24dev/proxsave/internal/config"
 	"github.com/tis24dev/proxsave/internal/types"
@@ -40,7 +45,7 @@ func TestRemoteManifestHostnameReadsTheManifest(t *testing.T) {
 		return []byte(`{"hostname":"from-manifest","created_at":"2025-01-02T10:00:00Z"}`), nil
 	}
 
-	got := cs.remoteManifestHostname(context.Background(), "server9-backup-20250102-100000.tar.zst")
+	got, _ := cs.remoteManifestOwner(context.Background(), "server9-backup-20250102-100000.tar.zst")
 	if got != "from-manifest" {
 		t.Fatalf("hostname = %q, want %q (the manifest must win over the filename token)", got, "from-manifest")
 	}
@@ -64,7 +69,7 @@ func TestRemoteManifestHostnameFallsBackToManifestJSON(t *testing.T) {
 		return []byte(`{"hostname":"from-json"}`), nil
 	}
 
-	if got := cs.remoteManifestHostname(context.Background(), "a-backup-20250102-100000.tar.zst"); got != "from-json" {
+	if got, _ := cs.remoteManifestOwner(context.Background(), "a-backup-20250102-100000.tar.zst"); got != "from-json" {
 		t.Fatalf("hostname = %q, want from-json", got)
 	}
 	if len(tried) != 2 {
@@ -81,7 +86,7 @@ func TestRemoteManifestHostnameUnreadableYieldsEmpty(t *testing.T) {
 		return []byte("not json at all"), nil
 	}
 
-	if got := cs.remoteManifestHostname(context.Background(), "a-backup-20250102-100000.tar.zst"); got != "" {
+	if got, _ := cs.remoteManifestOwner(context.Background(), "a-backup-20250102-100000.tar.zst"); got != "" {
 		t.Fatalf("hostname = %q, want empty", got)
 	}
 }
@@ -103,7 +108,281 @@ func TestResolveRetentionOwnersPrefersManifestOverFilename(t *testing.T) {
 	if list[0].Hostname != "server1" {
 		t.Fatalf("Hostname = %q, want server1 from the manifest", list[0].Hostname)
 	}
-	if !backupBelongsToHost(list[0], cs.hostname) {
+	if !backupBelongsToHost(list[0], hostOnly(cs.hostname)) {
 		t.Fatal("an archive the manifest attributes to this host must be in retention scope")
+	}
+}
+
+// TestApplyRetentionPrunesArchivesWrittenUnderTheRunFQDN is the reported bug end to
+// end. Every archive here was written by this machine under the name "hostname -f"
+// returns, while retention reads the kernel short name, so before the fix scoping
+// left nothing owned and ApplyRetention returned 0 without issuing a single delete.
+// The foreign archive in the listing is there to prove the fix widens ownership to
+// this machine's own names only. It is built through NewCloudStorage rather than by
+// setting the fields, so it also proves the run's own name reaches the field
+// retention reads.
+func TestApplyRetentionPrunesArchivesWrittenUnderTheRunFQDN(t *testing.T) {
+	original := retentionHostname
+	retentionHostname = func() (string, error) { return "pve", nil }
+	defer func() { retentionHostname = original }()
+
+	cfg := &config.Config{CloudEnabled: true, CloudRemote: "gdrive"}
+	cs, err := NewCloudStorage(cfg, newTestLogger(), "pve.home.arpa")
+	if err != nil {
+		t.Fatalf("NewCloudStorage: %v", err)
+	}
+
+	// The second archive was RENAMED on the remote: its filename token names another
+	// machine while its manifest names this one. Only a real resolveRetentionOwners
+	// call can put it in scope, so it is what makes that call load bearing here.
+	const renamed = "pbs.siteb.example-backup-20250102-120000"
+	listing := "" +
+		"      100 2025-01-03 10:00:00.000000000 pve.home.arpa-backup-20250103-100000.tar.zst\n" +
+		"       10 2025-01-03 10:00:00.000000000 pve.home.arpa-backup-20250103-100000.tar.zst.sha256\n" +
+		"      100 2025-01-02 12:00:00.000000000 " + renamed + ".tar.zst\n" +
+		"       10 2025-01-02 12:00:00.000000000 " + renamed + ".tar.zst.sha256\n" +
+		"      100 2025-01-02 10:00:00.000000000 pve.home.arpa-backup-20250102-100000.tar.zst\n" +
+		"       10 2025-01-02 10:00:00.000000000 pve.home.arpa-backup-20250102-100000.tar.zst.sha256\n" +
+		"      100 2025-01-01 10:00:00.000000000 pbs.home.arpa-backup-20250101-100000.tar.zst\n" +
+		"       10 2025-01-01 10:00:00.000000000 pbs.home.arpa-backup-20250101-100000.tar.zst.sha256\n"
+
+	var calls []commandCall
+	cs.execCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, commandCall{name: name, args: append([]string(nil), args...)})
+		if slices.Contains(args, "lsl") {
+			return []byte(listing), nil
+		}
+		// Only the renamed archive's manifest reads back. Every other `cat` returns
+		// nothing usable, so those three degrade to their filename token, which
+		// carries the same FQDN the manifest would; the renamed one can be
+		// attributed by its manifest and by nothing else.
+		if args[0] == "cat" && strings.Contains(args[len(args)-1], renamed) {
+			return []byte(`{"hostname":"pve.home.arpa"}`), nil
+		}
+		return nil, nil
+	}
+
+	deleted, err := cs.ApplyRetention(context.Background(), RetentionConfig{Policy: "simple", MaxBackups: 1})
+	if err != nil {
+		t.Fatalf("ApplyRetention: %v", err)
+	}
+
+	deletedOwn := false
+	deletedRenamed := false
+	for _, call := range calls {
+		joined := strings.Join(call.args, " ")
+		if !strings.Contains(joined, "delete") {
+			continue
+		}
+		if strings.Contains(joined, "pbs.home.arpa") {
+			t.Errorf("retention deleted another host's backup: %+v", calls)
+		}
+		if strings.Contains(joined, "pve.home.arpa-backup-20250102") {
+			deletedOwn = true
+		}
+		if strings.Contains(joined, renamed) {
+			deletedRenamed = true
+		}
+	}
+	if !deletedOwn {
+		t.Errorf("retention pruned nothing written under this run's own name: %+v", calls)
+	}
+	if !deletedRenamed {
+		t.Errorf("retention spared %s: its manifest names this machine, so it is this machine's own work whatever its filename says. Only a real resolveRetentionOwners call can see that, so this is what fails when the call is dropped: %+v", renamed, calls)
+	}
+	// Asserted last, so a real regression reports WHICH archive survived before it
+	// reports a number.
+	if deleted != 2 {
+		t.Errorf("deleted = %d, want 2 (the renamed archive attributed by its manifest and the older archive attributed by its filename token); the count feeds the run summary and the retention report", deleted)
+	}
+}
+
+// TestApplyRetentionLeavesSameShortNameForeignFQDNAlone is the data-loss boundary end
+// to end, and the single most important test in this change. This host is a stock
+// node called "pve" whose "hostname -f" fails, so it has no aliases, and the shared
+// remote root holds only a second machine's archives, spelled "pve.siteb.example".
+// The two share a short label and are different machines. Retention must delete
+// nothing at all. A fold to the first label turns this test red by destroying the
+// other machine's older archive.
+func TestApplyRetentionLeavesSameShortNameForeignFQDNAlone(t *testing.T) {
+	cfg := &config.Config{CloudEnabled: true, CloudRemote: "gdrive"}
+	cs := newCloudStorageForTest(cfg)
+	// Set by hand on purpose: this test pins the deletion boundary, not the
+	// constructor wiring (that is TestNewCloudStorageRecordsWrittenHostnames), and it
+	// must stay true whatever the constructor does.
+	cs.hostname = "pve"
+	cs.hostAliases = nil
+
+	listing := "" +
+		"      100 2025-01-03 10:00:00.000000000 pve.siteb.example-backup-20250103-100000.tar.zst\n" +
+		"       10 2025-01-03 10:00:00.000000000 pve.siteb.example-backup-20250103-100000.tar.zst.sha256\n" +
+		"      100 2025-01-02 10:00:00.000000000 pve.siteb.example-backup-20250102-100000.tar.zst\n" +
+		"       10 2025-01-02 10:00:00.000000000 pve.siteb.example-backup-20250102-100000.tar.zst.sha256\n"
+
+	var calls []commandCall
+	cs.execCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, commandCall{name: name, args: append([]string(nil), args...)})
+		if slices.Contains(args, "lsl") {
+			return []byte(listing), nil
+		}
+		return nil, nil
+	}
+
+	deleted, err := cs.ApplyRetention(context.Background(), RetentionConfig{Policy: "simple", MaxBackups: 1})
+	if err != nil {
+		t.Fatalf("ApplyRetention: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d, want 0: none of these archives belong to this machine", deleted)
+	}
+	for _, call := range calls {
+		if strings.Contains(strings.Join(call.args, " "), "delete") {
+			t.Fatalf("retention deleted another machine's backup: %+v", calls)
+		}
+	}
+	if summary := cs.LastRetentionSummary(); summary.NotRotated != 2 || summary.NotRotatedNames != "pve.siteb.example" {
+		t.Errorf("cloud summary not rotated = %d %q, want 2 \"pve.siteb.example\": they carry this host's short name, and the outcome line reads them", summary.NotRotated, summary.NotRotatedNames)
+	}
+}
+
+// TestResolveRetentionOwnersBoundsItsContext pins the timeout floor on retention's
+// manifest attribution. The run ctx is cancel-only (no deadline), each archive costs
+// one `rclone cat`, and resolveRetentionOwners waits on ALL of them: one wedged cat
+// used to block wg.Wait() forever and hang the unattended cron/daemon run, while the
+// file header of cloud.go promises the retention paths are floored. The whole
+// attribution phase must therefore run under boundManagementCtx: every exec must see
+// a deadline when the caller's ctx has none.
+func TestResolveRetentionOwnersBoundsItsContext(t *testing.T) {
+	cfg := &config.Config{CloudEnabled: true, CloudRemote: "gdrive"}
+	cs := newCloudStorageForTest(cfg)
+
+	deadlines := 0
+	cs.execCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if _, ok := ctx.Deadline(); ok {
+			deadlines++
+		}
+		return []byte(`{"hostname":"server1"}`), nil
+	}
+
+	list := []*types.BackupMetadata{
+		{BackupFile: "a-backup-20250102-100000.tar.zst"},
+		{BackupFile: "b-backup-20250103-100000.tar.zst"},
+	}
+	cs.resolveRetentionOwners(context.Background(), list)
+
+	if deadlines != len(list) {
+		t.Fatalf("%d of %d manifest reads ran with a deadline; a deadline-less run ctx must be floored so a wedged rclone cat cannot hang retention forever", deadlines, len(list))
+	}
+}
+
+// TestCloudReadsEachManifestOncePerRun walks a run's reads on one CloudStorage: the
+// init statistics, the init counts (CountOwnedBackups and OwnedBackups), retention
+// and the step [6] statistics. Each archive's manifest is read once, by the first of
+// them, and the archive retention deletes is dropped from the cache.
+func TestCloudReadsEachManifestOncePerRun(t *testing.T) {
+	original := retentionHostname
+	retentionHostname = func() (string, error) { return "pve", nil }
+	defer func() { retentionHostname = original }()
+
+	cs, err := NewCloudStorage(&config.Config{CloudEnabled: true, CloudRemote: "gdrive"}, newTestLogger(), "pve")
+	if err != nil {
+		t.Fatalf("NewCloudStorage: %v", err)
+	}
+	cs.sleep = func(time.Duration) {}
+	archives := []string{
+		"pve-backup-20250103-100000.tar.zst",
+		"pve-backup-20250102-100000.tar.zst",
+		"other-backup-20250101-100000.tar.zst",
+	}
+	var mu sync.Mutex
+	deleted := map[string]bool{}
+	cats := map[string]int{}
+	cs.execCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		path := args[len(args)-1]
+		switch args[0] {
+		case "lsl":
+			var lines []string
+			for i, a := range archives {
+				if deleted[a] {
+					continue
+				}
+				day := fmt.Sprintf("2025-01-0%d 10:00:00.000000000", 3-i)
+				lines = append(lines, "100 "+day+" "+a, "10 "+day+" "+a+".sha256")
+			}
+			return []byte(strings.Join(lines, "\n")), nil
+		case "cat":
+			cats[path]++
+			if strings.Contains(path, "other-backup") {
+				return []byte(`{"hostname":"other"}`), nil
+			}
+			return []byte(`{"hostname":"pve"}`), nil
+		case "deletefile", "delete":
+			deleted[strings.TrimPrefix(path, "gdrive:")] = true
+		}
+		return nil, nil
+	}
+
+	ctx := context.Background()
+	if stats, err := cs.GetStats(ctx); err != nil || stats.TotalBackups != 2 {
+		t.Fatalf("init GetStats = %+v, %v; want 2 of this host's", stats, err)
+	}
+	listing, err := cs.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if owned, ok := CountOwnedBackups(ctx, cs, listing); !ok || owned != 2 {
+		t.Fatalf("CountOwnedBackups = %d, %v; want 2", owned, ok)
+	}
+	if owned, ok := OwnedBackups(ctx, cs, listing); !ok || len(owned) != 2 {
+		t.Fatalf("OwnedBackups = %d, %v; want 2", len(owned), ok)
+	}
+	if n, err := cs.ApplyRetention(ctx, RetentionConfig{Policy: "simple", MaxBackups: 1}); err != nil || n != 1 {
+		t.Fatalf("ApplyRetention = %d, %v; want 1 deleted", n, err)
+	}
+	if stats, err := cs.GetStats(ctx); err != nil || stats.TotalBackups != 1 {
+		t.Fatalf("step [6] GetStats = %+v, %v; want 1 of this host's", stats, err)
+	}
+
+	total := 0
+	for path, n := range cats {
+		total += n
+		if n != 1 {
+			t.Errorf("manifest %s read %d times in one run, want 1", path, n)
+		}
+	}
+	if total != len(archives) {
+		t.Errorf("rclone cat calls = %d, want %d (one per archive): %v", total, len(archives), cats)
+	}
+	if _, _, ok := cs.cachedOwner("pve-backup-20250102-100000.tar.zst"); ok {
+		t.Error("the archive retention deleted is still in the manifest cache")
+	}
+}
+
+// TestCloudStoreDropsTheCachedManifestOfTheUploadedArchive pins the other
+// invalidation: an archive the run uploads gets a new manifest, so what an earlier read
+// cached about that name is dropped.
+func TestCloudStoreDropsTheCachedManifestOfTheUploadedArchive(t *testing.T) {
+	tmpDir := t.TempDir()
+	backupFile := filepath.Join(tmpDir, "pve-backup-20250104-100000.tar.zst")
+	writeTestFile(t, backupFile, "primary")
+	writeTestFile(t, backupFile+".sha256", "sum")
+
+	cs := newCloudStorageForTest(&config.Config{CloudEnabled: true, CloudRemote: "remote", RcloneRetries: 1, RcloneTimeoutOperation: 10})
+	cs.sleep = func(time.Duration) {}
+	cs.execCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if args[0] == "lsl" {
+			return []byte("7 2025-01-04 10:00:00 pve-backup-20250104-100000.tar.zst"), nil
+		}
+		return nil, nil
+	}
+	cs.storeOwner("pve-backup-20250104-100000.tar.zst", "stale", "")
+
+	if err := cs.Store(context.Background(), backupFile, nil); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if _, _, ok := cs.cachedOwner("pve-backup-20250104-100000.tar.zst"); ok {
+		t.Error("the uploaded archive kept its cached manifest answer")
 	}
 }

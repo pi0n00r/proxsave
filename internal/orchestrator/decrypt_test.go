@@ -203,7 +203,6 @@ func TestBaseNameFromRemoteRef(t *testing.T) {
 		{"gdrive:dir/sub/", "sub"},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.in, func(t *testing.T) {
 			got := baseNameFromRemoteRef(tt.in)
 			if got != tt.want {
@@ -485,7 +484,6 @@ func TestSanitizeBundleEntryName(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := sanitizeBundleEntryName(tt.input)
 			if tt.expectErr {
@@ -862,69 +860,6 @@ func TestFormatTargets(t *testing.T) {
 			got := formatTargets(tt.manifest)
 			if got != tt.want {
 				t.Errorf("formatTargets() = %q; want %q", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestFormatTargetSummary(t *testing.T) {
-	tests := []struct {
-		name     string
-		manifest *backup.Manifest
-		want     string
-	}{
-		{
-			name: "full info with cluster",
-			manifest: &backup.Manifest{
-				ProxmoxTargets: []string{"pve"},
-				ProxmoxVersion: "8.0.4",
-				ClusterMode:    "cluster",
-			},
-			want: "pve v8.0.4 (cluster)",
-		},
-		{
-			name: "standalone mode",
-			manifest: &backup.Manifest{
-				ProxmoxTargets: []string{"pbs"},
-				ProxmoxVersion: "3.1.2",
-				ClusterMode:    "standalone",
-			},
-			want: "pbs v3.1.2 (standalone)",
-		},
-		{
-			name: "version with v prefix",
-			manifest: &backup.Manifest{
-				ProxmoxTargets: []string{"pve"},
-				ProxmoxVersion: "v8.0.4",
-				ClusterMode:    "",
-			},
-			want: "pve v8.0.4",
-		},
-		{
-			name: "unknown version",
-			manifest: &backup.Manifest{
-				ProxmoxTargets: []string{"pve"},
-				ProxmoxVersion: "",
-				ClusterMode:    "",
-			},
-			want: "pve vunknown",
-		},
-		{
-			name: "empty cluster mode ignored",
-			manifest: &backup.Manifest{
-				ProxmoxTargets: []string{"pbs"},
-				ProxmoxVersion: "3.0",
-				ClusterMode:    "",
-			},
-			want: "pbs v3.0",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := formatTargetSummary(tt.manifest)
-			if got != tt.want {
-				t.Errorf("formatTargetSummary() = %q; want %q", got, tt.want)
 			}
 		})
 	}
@@ -3542,24 +3477,6 @@ func TestCopyRawArtifactsToWorkdir_WithChecksum(t *testing.T) {
 	}
 }
 
-func TestPrepareDecryptedBackup_Error(t *testing.T) {
-	origFS := restoreFS
-	restoreFS = osFS{}
-	t.Cleanup(func() { restoreFS = origFS })
-
-	// Empty config with no backup paths
-	cfg := &config.Config{}
-
-	reader := bufio.NewReader(strings.NewReader("1\n")) // Select first option
-	logger := logging.New(types.LogLevelError, false)
-	logger.SetOutput(io.Discard)
-
-	_, _, err := prepareDecryptedBackup(context.Background(), reader, cfg, logger, "1.0.0", false)
-	if err == nil {
-		t.Fatal("expected error for empty config")
-	}
-}
-
 func TestSelectDecryptCandidate_SingleSource(t *testing.T) {
 	origFS := restoreFS
 	restoreFS = osFS{}
@@ -4522,7 +4439,7 @@ exit 0
 }
 
 // fakeStatThenRemoveFS removes the file after stat succeeds
-// This triggers GenerateChecksum error (lines 670-673 of decrypt.go)
+// This triggers the GenerateChecksumBounded error in decrypt_prepare_common.go
 // Needed because tests run as root where chmod 0o000 doesn't prevent reading
 type fakeStatThenRemoveFS struct {
 	osFS
@@ -4533,7 +4450,7 @@ func (f *fakeStatThenRemoveFS) Stat(path string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	// After stat succeeds, remove the file so GenerateChecksum can't open it
+	// After stat succeeds, remove the file so GenerateChecksumBounded can't open it
 	if strings.Contains(path, "proxmox-decrypt") && strings.HasSuffix(path, ".tar.xz") {
 		_ = os.Remove(path)
 	}
@@ -4644,5 +4561,116 @@ exit 0
 	// Either download error or temp root creation error - both validate error handling
 	if !strings.Contains(err.Error(), "permission") && !strings.Contains(err.Error(), "temp") && !strings.Contains(err.Error(), "download") {
 		t.Logf("Got error (expected): %v", err)
+	}
+}
+
+// rclone writes NOTICE and WARNING lines to stderr while the file content goes to
+// stdout. Merged, those lines land in front of the JSON, json.Unmarshal fails, and
+// the function does NOT fail with it: it falls through to the legacy KEY=VALUE
+// branch, which finds no "=" in JSON and returns a manifest carrying only
+// ArchivePath. A run then proceeds with no sha256 and no recorded archive size, so
+// the loss is silent.
+//
+// The NOTICE below is the one measured on a live node (2026-09-05) when the rclone
+// config is missing.
+func TestInspectRcloneMetadataManifestIgnoresRcloneNoiseOnStderr(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataPath := filepath.Join(tmpDir, "backup.metadata")
+
+	const manifestJSON = `{"archive_path":"gdrive:backup.tar.xz","archive_size":4096,` +
+		`"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",` +
+		`"compression_type":"zstd","proxmox_type":"pve","hostname":"pve-test"}`
+	if err := os.WriteFile(metadataPath, []byte(manifestJSON), 0o644); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	scriptPath := filepath.Join(tmpDir, "rclone")
+	script := fmt.Sprintf("#!/bin/sh\n"+
+		"echo '2026/09/05 19:53:22 NOTICE: Config file \"/root/.config/rclone/rclone.conf\" not found - using defaults' >&2\n"+
+		"cat %q\n", metadataPath)
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake rclone: %v", err)
+	}
+
+	prependPathEnv(t, tmpDir)
+
+	logger := logging.New(types.LogLevelError, false)
+	logger.SetOutput(io.Discard)
+
+	got, err := inspectRcloneMetadataManifest(context.Background(), "gdrive:backup.metadata", "gdrive:backup.tar.xz", logger)
+	if err != nil {
+		t.Fatalf("a NOTICE on stderr broke the manifest read: %v", err)
+	}
+	// The legacy fallback would produce exactly this manifest minus every field
+	// below, so these assertions are what separates a real parse from it.
+	if got.SHA256 != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
+		t.Fatalf("sha256 lost, the legacy fallback answered instead: %+v", got)
+	}
+	if got.ArchiveSize != 4096 {
+		t.Fatalf("ArchiveSize=%d; want 4096", got.ArchiveSize)
+	}
+	if got.CompressionType != "zstd" || got.Hostname != "pve-test" {
+		t.Fatalf("manifest did not parse: %+v", got)
+	}
+}
+
+func selectDecryptCandidate(ctx context.Context, reader *bufio.Reader, cfg *config.Config, logger *logging.Logger, requireEncrypted bool) (candidate *backupCandidate, err error) {
+	done := logging.DebugStart(logger, "select backup candidate", "requireEncrypted=%v", requireEncrypted)
+	defer func() { done(err) }()
+
+	ui := newCLIWorkflowUI(reader, logger)
+	return selectBackupCandidateWithUI(ctx, ui, cfg, logger, "Decrypt", requireEncrypted)
+}
+
+func preparePlainBundle(ctx context.Context, reader *bufio.Reader, cand *backupCandidate, version string, logger *logging.Logger, timeout time.Duration) (bundle *preparedBundle, err error) {
+	ui := newCLIWorkflowUI(reader, logger)
+	return preparePlainBundleWithUI(ctx, cand, version, logger, ui, timeout)
+}
+
+func extractBundleToWorkdir(bundlePath, workDir string) (staged stagedFiles, err error) {
+	return extractBundleToWorkdirWithLogger(bundlePath, workDir, nil)
+}
+
+func copyRawArtifactsToWorkdir(ctx context.Context, cand *backupCandidate, workDir string) (staged stagedFiles, err error) {
+	// timeout 0 = unbounded (legacy); the bounded production path passes the
+	// configured FS_IO_TIMEOUT via copyRawArtifactsToWorkdirWithLogger.
+	return copyRawArtifactsToWorkdirWithLogger(ctx, cand, workDir, nil, 0)
+}
+
+func decryptArchiveWithPrompts(ctx context.Context, reader *bufio.Reader, encryptedPath, outputPath string, logger *logging.Logger) error {
+	ui := newCLIWorkflowUI(reader, logger)
+	displayName := filepath.Base(encryptedPath)
+	return decryptArchiveWithSecretPrompt(ctx, encryptedPath, outputPath, displayName, ui.PromptDecryptSecret, nil)
+}
+
+func parseIdentityInput(input string) ([]age.Identity, error) {
+	return parseIdentityInputWithSalts(input, nil)
+}
+
+func ensureWritablePath(ctx context.Context, reader *bufio.Reader, path, description string) (string, error) {
+	ui := newCLIWorkflowUI(reader, nil)
+	return ensureWritablePathWithUI(ctx, ui, path, description)
+}
+
+// A blank base name still yields a named output, "archive.decrypted-*".
+func TestCreateUniquePreparedArchivePathDefaultsABlankBaseName(t *testing.T) {
+	origFS := restoreFS
+	restoreFS = osFS{}
+	t.Cleanup(func() { restoreFS = origFS })
+
+	path, err := createUniquePreparedArchivePath(t.TempDir(), " ")
+	if err != nil {
+		t.Fatalf("createUniquePreparedArchivePath error: %v", err)
+	}
+	if base := filepath.Base(path); !strings.HasPrefix(base, "archive.decrypted-") {
+		t.Fatalf("output name = %q, want an archive.decrypted-* name", base)
+	}
+}
+
+// An .age archive with no encryption mode set names the mode as plain.
+func TestResolvePreparedArchivePathNamesAMissingModePlain(t *testing.T) {
+	_, err := resolvePreparedArchivePath(t.TempDir(), "/staging/backup.tar.age", "")
+	if err == nil || !strings.HasSuffix(err.Error(), "but encryption mode is plain") {
+		t.Fatalf("resolvePreparedArchivePath() error = %v; want it to name the plain mode", err)
 	}
 }

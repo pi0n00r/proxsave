@@ -53,9 +53,24 @@ type Collector struct {
 	deps             CollectorDeps
 	unprivilegedOnce sync.Once
 	unprivilegedCtx  unprivilegedContainerContext
+	// realStaging is tempDir with its symlinks resolved, stagingInfo its stat
+	// (stagingRoot).
+	realStagingOnce sync.Once
+	realStaging     string
+	stagingInfo     os.FileInfo
 
 	// clusteredPVE records whether cluster mode was detected during PVE collection.
 	clusteredPVE bool
+	// standalonePVE is set only after consistent, healthy standalone observations.
+	// Both topology fields are false when detection is uncertain.
+	standalonePVE bool
+	// pveRuntimeSkipLogged records that the PVE runtime commands skip under
+	// SYSTEM_ROOT_PREFIX has been logged, so the run carries it once.
+	pveRuntimeSkipLogged bool
+	// stagingNoSpace is the first write into the working directory that failed for
+	// lack of space; once set, the collection stops (NoteStagingWriteError).
+	stagingSpaceMu sync.Mutex
+	stagingNoSpace error
 
 	// Manifest tracking for backup contents
 	pbsManifest    map[string]ManifestEntry
@@ -70,6 +85,19 @@ type Collector struct {
 	// collectingCustomPaths is set while copying operator-supplied CUSTOM_BACKUP_PATHS,
 	// during which the source walk prunes the staging workspace to avoid self-copy (#56).
 	collectingCustomPaths bool
+
+	// incomplete records a role whose collection aborted while the run carried on.
+	// It exists only for the dual case, where the two halves are independent: losing
+	// PBS is no reason to throw away the PVE payload that is already staged. Whatever
+	// lands here is reported and written into the manifest, so a partial archive is
+	// never mistaken for a whole one.
+	incomplete []incompleteTarget
+}
+
+// incompleteTarget is one role that did not finish, and why.
+type incompleteTarget struct {
+	Target string `json:"target"`
+	Reason string `json:"reason"`
 }
 
 var osSymlink = os.Symlink
@@ -120,41 +148,21 @@ func (c *Collector) depRunCommand(ctx context.Context, name string, args ...stri
 	return runCommand(ctx, name, args...)
 }
 
-func (c *Collector) depRunCommandWithEnv(ctx context.Context, extraEnv []string, name string, args ...string) ([]byte, error) {
-	if c.deps.RunCommandWithEnv != nil {
-		return c.deps.RunCommandWithEnv(ctx, extraEnv, name, args...)
-	}
-	return runCommandWithEnv(ctx, extraEnv, name, args...)
-}
-
 // depRunCommandCaptured runs a command with stdout and stderr kept apart. A Collector
-// wired only with the merged-output hooks falls back to them, reporting the merged text
+// wired only with the merged-output hook falls back to it, reporting the merged text
 // as stdout and no stderr.
 //
-// Any injected hook wins over the package-level runner, extraEnv or not: a caller that
-// supplied a runner never wants a real command executed behind its back. RunCommand
-// cannot carry extraEnv, so a Collector wired with only that hook runs the command
-// without the extra environment; the fact is logged rather than worked around.
-func (c *Collector) depRunCommandCaptured(ctx context.Context, extraEnv []string, name string, args ...string) ([]byte, []byte, error) {
+// Any injected hook wins over the package-level runner: a caller that
+// supplied a runner never wants a real command executed behind its back.
+func (c *Collector) depRunCommandCaptured(ctx context.Context, name string, args ...string) ([]byte, []byte, error) {
 	if c.deps.RunCommandCaptured != nil {
-		return c.deps.RunCommandCaptured(ctx, extraEnv, name, args...)
-	}
-	if len(extraEnv) == 0 && c.deps.RunCommand != nil {
-		out, err := c.deps.RunCommand(ctx, name, args...)
-		return out, nil, err
-	}
-	if c.deps.RunCommandWithEnv != nil {
-		out, err := c.deps.RunCommandWithEnv(ctx, extraEnv, name, args...)
-		return out, nil, err
+		return c.deps.RunCommandCaptured(ctx, name, args...)
 	}
 	if c.deps.RunCommand != nil {
-		if c.logger != nil {
-			c.logger.Debug("Running %s through the RunCommand hook, which cannot carry %d extra environment variable(s)", name, len(extraEnv))
-		}
 		out, err := c.deps.RunCommand(ctx, name, args...)
 		return out, nil, err
 	}
-	return runCommandCapturedWithEnv(ctx, extraEnv, name, args...)
+	return runCommandCaptured(ctx, name, args...)
 }
 
 type CommandSpec struct {
@@ -287,11 +295,6 @@ type CollectorConfig struct {
 	VzdumpConfigPath     string
 	PBSConfigPath        string
 	PBSDatastorePaths    []string
-
-	// PBS Authentication (auto-detected)
-	PBSRepository  string
-	PBSPassword    string
-	PBSFingerprint string
 }
 
 var defaultExcludePatterns = []string{
@@ -358,12 +361,7 @@ func (c *CollectorConfig) normalizeCommandTimeouts() {
 	}
 }
 
-// NewCollector creates a new backup collector
-func NewCollector(logger *logging.Logger, config *CollectorConfig, tempDir string, proxType types.ProxmoxType, dryRun bool) *Collector {
-	return NewCollectorWithDeps(logger, config, tempDir, proxType, dryRun, defaultCollectorDeps())
-}
-
-// NewCollectorWithDeps creates a collector with explicit dependency overrides (for testing).
+// NewCollectorWithDeps creates a collector with explicit dependency overrides.
 func NewCollectorWithDeps(logger *logging.Logger, config *CollectorConfig, tempDir string, proxType types.ProxmoxType, dryRun bool, deps CollectorDeps) *Collector {
 	return &Collector{
 		logger:   logger,
@@ -460,25 +458,35 @@ func (c *Collector) CollectAll(ctx context.Context) error {
 	c.logger.Info("Starting backup collection for %s", c.proxType)
 	c.logger.Debug("Collector dry-run=%v tempDir=%s", c.dryRun, c.tempDir)
 
+	// roleErr is held rather than returned on the spot. The common system payload
+	// below is independent of which hypervisor this is, and returning here skipped it:
+	// a run that lost its PBS half also lost the network, storage-stack and hardware
+	// snapshot it had nothing to do with (issue #315).
+	var roleErr error
 	switch c.proxType {
 	case types.ProxmoxVE:
 		c.logger.Debug("Invoking PVE-specific collectors (configs, jobs, schedules, storage metadata)")
 		if err := c.CollectPVEConfigs(ctx); err != nil {
-			return fmt.Errorf("PVE collection failed: %w", err)
+			roleErr = fmt.Errorf("PVE collection failed: %w", err)
+		} else {
+			c.logger.Debug("PVE-specific collection completed")
 		}
-		c.logger.Debug("PVE-specific collection completed")
 	case types.ProxmoxBS:
 		c.logger.Debug("Invoking PBS-specific collectors (datastores, users, namespaces, pxar metadata)")
 		if err := c.CollectPBSConfigs(ctx); err != nil {
-			return fmt.Errorf("PBS collection failed: %w", err)
+			roleErr = fmt.Errorf("PBS collection failed: %w", err)
+		} else {
+			c.logger.Debug("PBS-specific collection completed")
 		}
-		c.logger.Debug("PBS-specific collection completed")
 	case types.ProxmoxDual:
 		c.logger.Debug("Invoking dual-role collectors (PVE + PBS recipes, shared system/common once)")
 		if err := c.CollectDualConfigs(ctx); err != nil {
-			return fmt.Errorf("dual collection failed: %w", err)
+			roleErr = fmt.Errorf("dual collection failed: %w", err)
+		} else if targets := c.IncompleteTargets(); len(targets) > 0 {
+			c.logger.Debug("Dual-role collection finished without %s", strings.Join(targets, ", "))
+		} else {
+			c.logger.Debug("Dual-role collection completed")
 		}
-		c.logger.Debug("Dual-role collection completed")
 	case types.ProxmoxUnknown:
 		c.logger.Warning("Unknown Proxmox type, collecting generic system info only")
 		c.logger.Debug("Skipping hypervisor-specific collection because type is unknown")
@@ -486,13 +494,36 @@ func (c *Collector) CollectAll(ctx context.Context) error {
 
 	// Collect common system information (always collect)
 	if err := ctx.Err(); err != nil {
+		// A cancelled context ends the run, but not at the cost of what already went
+		// wrong: returning the bare context error here dropped roleErr, so a log said
+		// "context canceled" where the phase that actually died was named one line
+		// earlier. Join keeps both reachable through errors.Is.
+		if roleErr != nil {
+			return errors.Join(roleErr, err)
+		}
 		return err
+	}
+	// A full working directory ends the collection wherever it happened: the system
+	// recipe below turns its own errors into a warning, and past that point every write
+	// fails the same way.
+	if err := c.StagingNoSpaceErr(); err != nil {
+		return errors.Join(roleErr, err)
 	}
 	c.logger.Debug("Collecting baseline system information (network/system files, commands, hardware data)")
 	if err := c.CollectSystemInfo(ctx); err != nil {
+		if spaceErr := c.StagingNoSpaceErr(); spaceErr != nil {
+			return errors.Join(roleErr, spaceErr)
+		}
 		c.logger.Warning("System info collection had warnings: %v", err)
 	}
+	if err := c.StagingNoSpaceErr(); err != nil {
+		return errors.Join(roleErr, err)
+	}
 	c.logger.Debug("Baseline system information collected successfully")
+
+	if roleErr != nil {
+		return roleErr
+	}
 
 	stats := c.GetStats()
 	c.logger.Debug("Collection completed: %d files, %d failed, %d dirs created",
@@ -571,8 +602,18 @@ func (c *Collector) withTemporaryExcludes(extra []string, fn func() error) error
 	return fn()
 }
 
+// uniqueCandidates returns the forms of path the exclusion patterns are matched
+// against. Patterns name host paths, so a path inside the staging tree tempDir is
+// judged by the host path it stands for and its name only: matched by where the
+// staging tree lives (/tmp/proxsave/...), '/tmp/**' or '**/proxsave/**' dropped every
+// staged file.
 func uniqueCandidates(path, tempDir, systemRootPrefix string) []string {
 	base := filepath.Base(path)
+	if tempDir != "" {
+		if relTemp, err := filepath.Rel(tempDir, path); err == nil && relTemp != "." && relTemp != "" && relTemp != ".." && !strings.HasPrefix(relTemp, ".."+string(filepath.Separator)) {
+			return []string{base, relTemp, filepath.Join(string(filepath.Separator), relTemp)}
+		}
+	}
 	candidates := []string{path}
 	if base != "" && base != "." && base != string(filepath.Separator) {
 		candidates = append(candidates, base)
@@ -592,15 +633,6 @@ func uniqueCandidates(path, tempDir, systemRootPrefix string) []string {
 				if relPrefix != "." && relPrefix != "" && relPrefix != ".." && !strings.HasPrefix(relPrefix, ".."+string(filepath.Separator)) {
 					candidates = append(candidates, filepath.Join(string(filepath.Separator), relPrefix))
 				}
-			}
-		}
-	}
-
-	if tempDir != "" {
-		if relTemp, err := filepath.Rel(tempDir, path); err == nil {
-			if relTemp != "." && relTemp != "" && relTemp != ".." {
-				candidates = append(candidates, relTemp)
-				candidates = append(candidates, filepath.Join(string(filepath.Separator), relTemp))
 			}
 		}
 	}
@@ -699,12 +731,31 @@ func (c *Collector) ensureDir(path string) error {
 	}
 
 	if err := os.MkdirAll(path, 0750); err != nil {
+		c.NoteStagingWriteError(err)
 		return err
 	}
 	if created {
 		c.incDirsCreated()
 	}
 	return nil
+}
+
+// fsIoTimeout is the FS_IO_TIMEOUT bound of the collector's probes of storage
+// paths; zero means unbounded.
+func (c *Collector) fsIoTimeout() time.Duration {
+	if c.config != nil && c.config.FsIoTimeoutSeconds > 0 {
+		return time.Duration(c.config.FsIoTimeoutSeconds) * time.Second
+	}
+	return 0
+}
+
+// boundedCommandContext bounds a command that touches storage paths by timeout;
+// zero leaves ctx as it is.
+func (c *Collector) boundedCommandContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func preservedMode(mode os.FileMode) os.FileMode {
@@ -727,6 +778,8 @@ func (c *Collector) applyMetadata(dest string, info os.FileInfo) {
 	}
 
 	if ok {
+		// ProxSave is built and released only for linux/amd64, where these
+		// Timespec fields are int64; 32-bit syscall widths are unsupported.
 		atime := time.Unix(stat.Atim.Sec, stat.Atim.Nsec)
 		mtime := time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec)
 		if err := os.Chtimes(dest, atime, mtime); err != nil {
@@ -885,7 +938,52 @@ func (c *Collector) copySymlinkFile(src, dest string, info os.FileInfo) error {
 	return nil
 }
 
+// stagedSymlinkAncestor returns, as a host path, the first directory between the
+// staging tree and dir that the staging tree holds as a symlink leading out of it:
+// its target, resolved the way the kernel follows it (a chain of links included), is
+// outside the staging tree: /opt/app -> /data/app, or a relative link climbing above
+// it or pointing at such a link. A copy below it would follow the link into the live
+// host, where it truncated the file it was reading and gave its directory the
+// symlink's mode. A link that resolves inside the staging tree is followed as before.
+func (c *Collector) stagedSymlinkAncestor(dir string) (string, bool) {
+	if c.tempDir == "" {
+		return "", false
+	}
+	rel, err := filepath.Rel(c.tempDir, dir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	realTemp, err := filepath.EvalSymlinks(c.tempDir)
+	if err != nil {
+		return "", false
+	}
+	cur := c.tempDir
+	for part := range strings.SplitSeq(rel, string(os.PathSeparator)) {
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			return "", false
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		link := "/" + strings.TrimPrefix(cur, c.tempDir+string(os.PathSeparator))
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err != nil {
+			// A dangling or looping link: nothing below it can be written safely.
+			return link, true
+		}
+		if r, err := filepath.Rel(realTemp, resolved); err != nil || r == ".." || strings.HasPrefix(r, ".."+string(os.PathSeparator)) {
+			return link, true
+		}
+	}
+	return "", false
+}
+
 func (c *Collector) prepareCopyDestination(src, dest string) error {
+	if link, ok := c.stagedSymlinkAncestor(filepath.Dir(dest)); ok {
+		return fmt.Errorf("it is under %s, a symlink in the backup", link)
+	}
 	if err := c.ensureDir(filepath.Dir(dest)); err != nil {
 		return err
 	}
@@ -918,6 +1016,7 @@ func (c *Collector) copyRegularFile(src, dest, description string, info os.FileI
 	written, err := copyRegularFileContents(srcFile, src, dest)
 	if err != nil {
 		c.incFilesFailed()
+		c.NoteStagingWriteError(err)
 		return err
 	}
 
@@ -930,34 +1029,122 @@ func (c *Collector) copyRegularFile(src, dest, description string, info os.FileI
 	return nil
 }
 
+// copyRegularFileContents copies src into dest. When the copy fails after dest was
+// opened, it removes dest: a copy cut short left the file behind truncated (or empty,
+// when the failure came first), and the archive stored it as if it were the real one. A failure on the dest side comes
+// back as a stagingWriteError, so the caller can tell a full working directory from an
+// unreadable source.
 func copyRegularFileContents(srcFile io.Reader, src, dest string) (int64, error) {
 	destFile, err := osOpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
-		return 0, fmt.Errorf("failed to create %s: %w", dest, err)
+		// Nothing was created or truncated: whatever sits at dest is not ours to remove.
+		return 0, &stagingWriteError{fmt.Errorf("failed to create %s: %w", dest, err)}
 	}
 
-	written, err := io.Copy(destFile, srcFile)
+	dst := &writeErrRecorder{w: destFile}
+	written, err := io.Copy(dst, srcFile)
 	closeErr := destFile.Close()
 	if err != nil {
+		_ = os.Remove(dest)
+		if dst.err != nil {
+			return 0, &stagingWriteError{fmt.Errorf("failed to copy %s: %w", src, err)}
+		}
 		return 0, fmt.Errorf("failed to copy %s: %w", src, err)
 	}
 	if closeErr != nil {
-		return 0, fmt.Errorf("failed to close %s: %w", dest, closeErr)
+		_ = os.Remove(dest)
+		return 0, &stagingWriteError{fmt.Errorf("failed to close %s: %w", dest, closeErr)}
 	}
 	return written, nil
+}
+
+// writeErrRecorder remembers the error of the destination side of an io.Copy, which
+// returns read and write errors alike.
+type writeErrRecorder struct {
+	w   io.Writer
+	err error
+}
+
+func (r *writeErrRecorder) Write(p []byte) (int, error) {
+	n, err := r.w.Write(p)
+	if err != nil && r.err == nil {
+		r.err = err
+	}
+	return n, err
 }
 
 // isWithinStagingDir reports whether path is the staging tempDir or lives under
 // it. The source walk must never descend into the destination staging tree, or a
 // broad CUSTOM_BACKUP_PATHS entry (e.g. "/", "/tmp", "/tmp/proxsave") would copy
 // the growing archive into itself, recursing and ballooning the backup (#56).
+//
+// path is compared as written and with its symlinks resolved: /alias/run/etc with
+// /alias pointing at the staging tree's parent names a directory inside it under a
+// path that has nothing in common with tempDir, and the archive's own files were
+// copied into it again. It runs for every source and for every file the copy walk
+// hands to safeCopyFile, so under CUSTOM_BACKUP_PATHS each copied file costs one
+// EvalSymlinks: that is what skips a symlink file outside the staging tree whose target
+// is inside it. The walk checks each directory with isWithinStagingDirAsText and
+// isStagingDirInfo before descending.
 func (c *Collector) isWithinStagingDir(path string) bool {
+	if c.isWithinStagingDirAsText(path) {
+		return true
+	}
+	if !c.collectingCustomPaths || c.tempDir == "" {
+		return false
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	return err == nil && c.isWithinStagingDirAsText(resolved)
+}
+
+// isWithinStagingDirAsText compares path as written with the lexical and the resolved
+// staging root. The resolved root as well: under a symlinked /tmp a source reached
+// through the link's target (CUSTOM_BACKUP_PATHS=/var/tmp) never matched the lexical
+// one, and the staging tree was copied into itself.
+func (c *Collector) isWithinStagingDirAsText(path string) bool {
 	if !c.collectingCustomPaths || c.tempDir == "" {
 		return false
 	}
 	clean := filepath.Clean(path)
-	root := filepath.Clean(c.tempDir)
-	return clean == root || strings.HasPrefix(clean, root+string(os.PathSeparator))
+	for _, root := range []string{filepath.Clean(c.tempDir), c.stagingRoot()} {
+		if clean == root || strings.HasPrefix(clean, root+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// stagingRoot is the staging tempDir with its symlinks resolved, computed once: a
+// resolved path (a symlink's target, or one under a symlinked /tmp) is compared with
+// it. The lexical tempDir stands in when it cannot be resolved.
+func (c *Collector) stagingRoot() string {
+	c.realStagingOnce.Do(func() {
+		if c.tempDir == "" {
+			return
+		}
+		c.realStaging = filepath.Clean(c.tempDir)
+		if real, err := filepath.EvalSymlinks(c.tempDir); err == nil {
+			c.realStaging = real
+		}
+		if info, err := os.Stat(c.tempDir); err == nil {
+			c.stagingInfo = info
+		}
+	})
+	return c.realStaging
+}
+
+// isStagingDirInfo reports whether a directory met while copying CUSTOM_BACKUP_PATHS
+// is the staging tree itself, whatever path reached it: through a symlink in the
+// middle of the source path (/scratch/proxsave with /scratch -> /tmp), /proc/self/root
+// or a bind mount, the path text has nothing in common with tempDir and
+// isWithinStagingDir cannot see it, so the staging tree was copied into itself until
+// the path length limit.
+func (c *Collector) isStagingDirInfo(info os.FileInfo) bool {
+	if !c.collectingCustomPaths || info == nil || !info.IsDir() || c.tempDir == "" {
+		return false
+	}
+	c.stagingRoot()
+	return c.stagingInfo != nil && os.SameFile(info, c.stagingInfo)
 }
 
 func (c *Collector) safeCopyDir(ctx context.Context, src, dest, description string) error {
@@ -991,6 +1178,12 @@ func (c *Collector) safeCopyDir(ctx context.Context, src, dest, description stri
 		return nil
 	}
 
+	if link, ok := c.stagedSymlinkAncestor(dest); ok {
+		err := fmt.Errorf("it is under %s, a symlink in the backup", link)
+		c.recordSystemManifestEntry(dest, ManifestEntry{Status: StatusFailed, Error: err.Error()})
+		return err
+	}
+
 	// Suppress per-file recording during the walk so the manifest stays at target
 	// granularity (#59), then record the directory's FINAL status from the actual
 	// outcome below. Recording StatusCollected up front would misreport a directory
@@ -1010,13 +1203,21 @@ func (c *Collector) safeCopyDir(ctx context.Context, src, dest, description stri
 			}
 
 			if err != nil {
+				// An entry listed by its directory and gone before its lstat (on
+				// /etc/pve, HA and vzdump write through temp siblings that live for
+				// milliseconds) stopped the whole copy, and for /etc/pve the backup.
+				// It is skipped; any other failure still ends the copy.
+				if errors.Is(err, os.ErrNotExist) && path != src {
+					c.logger.Debug("Collecting directory %s: %s vanished during the copy, skipped", description, path)
+					return nil
+				}
 				return err
 			}
 
 			// Never descend into the staging workspace: a broad source (e.g. a custom
 			// path of "/" or "/tmp") would otherwise copy the in-progress archive into
 			// itself (#56).
-			if c.isWithinStagingDir(path) {
+			if c.isWithinStagingDirAsText(path) || c.isStagingDirInfo(info) {
 				if info.IsDir() {
 					return filepath.SkipDir
 				}
@@ -1055,7 +1256,14 @@ func (c *Collector) safeCopyDir(ctx context.Context, src, dest, description stri
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return ctxErr
 				}
-				c.logger.Warning("Skipping unreadable file %s in %s: %v", path, description, err)
+				if spaceErr := c.StagingNoSpaceErr(); spaceErr != nil {
+					return spaceErr
+				}
+				if isStagingWriteError(err) {
+					c.logger.Warning("Skipping file %s in %s: could not write it to the working directory: %v", path, description, err)
+				} else {
+					c.logger.Warning("Skipping unreadable file %s in %s: %v", path, description, err)
+				}
 				failedCount++
 				return nil
 			}
@@ -1174,7 +1382,7 @@ func (c *Collector) runAndClassifyCommand(ctx context.Context, spec CommandSpec,
 		defer cancel()
 	}
 
-	out, stderr, err := c.depRunCommandCaptured(runCtx, nil, spec.Name, spec.Args...)
+	out, stderr, err := c.depRunCommandCaptured(runCtx, spec.Name, spec.Args...)
 	result.output = out
 	if err != nil {
 		// Failure handling reads both streams: exit reasons, privilege hints and the
@@ -1208,8 +1416,7 @@ func (c *Collector) runAndClassifyCommand(ctx context.Context, spec CommandSpec,
 			return result, fmt.Errorf("critical command `%s` failed for %s: %w (output: %s)", cmdString, opts.description, err, result.outputSummary)
 		}
 		exitCode := -1
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			exitCode = exitErr.ExitCode()
 		}
 		outputText := strings.TrimSpace(combined)
@@ -1363,205 +1570,6 @@ func (c *Collector) safeCmdOutputBestEffort(ctx context.Context, spec CommandSpe
 	return nil
 }
 
-// safeCmdOutputWithPBSAuth executes a command with PBS authentication environment variables
-// This enables automatic authentication for proxmox-backup-client commands
-func (c *Collector) safeCmdOutputWithPBSAuth(ctx context.Context, spec CommandSpec, output, description string, critical bool) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := spec.validate(); err != nil {
-		return err
-	}
-
-	if output != "" && c.shouldExclude(output) {
-		c.logger.Debug("Skipping %s: output %s excluded by pattern", description, output)
-		c.incFilesSkipped()
-		return nil
-	}
-
-	// Check if command exists
-	if _, err := c.depLookPath(spec.Name); err != nil {
-		if critical {
-			c.incFilesFailed()
-			return fmt.Errorf("critical command not available: %s", spec.Name)
-		}
-		c.logger.Debug("Command not available: %s (skipping %s)", spec.Name, description)
-		return nil
-	}
-
-	if c.dryRun {
-		c.logger.Debug("[DRY RUN] Would execute command with PBS auth: %s > %s", spec.String(), output)
-		return nil
-	}
-
-	// Set PBS authentication environment variables (if available)
-	var extraEnv []string
-	pbsAuthUsed := false
-	if c.config.PBSRepository != "" {
-		extraEnv = append(extraEnv, fmt.Sprintf("PBS_REPOSITORY=%s", c.config.PBSRepository))
-		pbsAuthUsed = true
-	}
-	if c.config.PBSPassword != "" {
-		extraEnv = append(extraEnv, fmt.Sprintf("PBS_PASSWORD=%s", c.config.PBSPassword))
-		pbsAuthUsed = true
-	}
-	if c.config.PBSFingerprint != "" {
-		extraEnv = append(extraEnv, fmt.Sprintf("PBS_FINGERPRINT=%s", c.config.PBSFingerprint))
-		pbsAuthUsed = true
-	}
-
-	if pbsAuthUsed {
-		c.logger.Debug("Using PBS authentication for command: %s", spec.Name)
-	}
-
-	cmdString := spec.String()
-	out, stderr, err := c.depRunCommandCaptured(ctx, extraEnv, spec.Name, spec.Args...)
-	if err != nil {
-		summary := summarizeCommandOutputText(mergeCommandStreams(out, stderr))
-		if critical {
-			c.incFilesFailed()
-			return fmt.Errorf("critical command `%s` failed for %s: %w (output: %s)", cmdString, description, err, summary)
-		}
-		c.logger.Warning("Skipping %s: command `%s` failed (%v). Non-critical; backup continues. Ensure the PBS CLI is available and has proper permissions. Output: %s",
-			description,
-			cmdString,
-			err,
-			summary,
-		)
-		return nil // Non-critical failure
-	}
-
-	if len(bytes.TrimSpace(stderr)) > 0 {
-		c.logger.Debug("Command `%s` wrote to stderr while succeeding (%s): %s",
-			cmdString, description, summarizeCommandOutputText(string(stderr)))
-	}
-
-	if err := c.writeReportFile(output, out); err != nil {
-		return err
-	}
-	c.logger.Debug("Successfully collected %s via PBS-authenticated command: %s", description, cmdString)
-
-	return nil
-}
-
-func pbsRepositoryWithDatastore(repository, datastoreName string) string {
-	separator := -1
-	bracketDepth := 0
-	for i, r := range repository {
-		switch r {
-		case '[':
-			bracketDepth++
-		case ']':
-			if bracketDepth > 0 {
-				bracketDepth--
-			}
-		case ':':
-			if bracketDepth == 0 {
-				separator = i
-			}
-		}
-	}
-	if separator >= 0 {
-		return repository[:separator+1] + datastoreName
-	}
-	return repository + ":" + datastoreName
-}
-
-// safeCmdOutputWithPBSAuthForDatastore executes a command with PBS authentication for a specific datastore
-// This function appends the datastore name to the PBS_REPOSITORY environment variable
-func (c *Collector) safeCmdOutputWithPBSAuthForDatastore(ctx context.Context, spec CommandSpec, output, description, datastoreName string, critical bool) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := spec.validate(); err != nil {
-		return err
-	}
-
-	if output != "" && c.shouldExclude(output) {
-		c.logger.Debug("Skipping %s: output %s excluded by pattern", description, output)
-		c.incFilesSkipped()
-		return nil
-	}
-
-	// Check if command exists
-	if _, err := c.depLookPath(spec.Name); err != nil {
-		if critical {
-			c.incFilesFailed()
-			return fmt.Errorf("critical command not available: %s", spec.Name)
-		}
-		c.logger.Debug("Command not available: %s (skipping %s)", spec.Name, description)
-		return nil
-	}
-
-	if c.dryRun {
-		c.logger.Debug("[DRY RUN] Would execute command with PBS auth for datastore %s: %s > %s", datastoreName, spec.String(), output)
-		return nil
-	}
-
-	// Check if PBS credentials are configured
-	if c.config.PBSRepository == "" && c.config.PBSPassword == "" {
-		// No PBS credentials configured - skip this command gracefully
-		c.logger.Warning("Skipping %s: PBS credentials not configured. Set PBS_REPOSITORY and PBS_PASSWORD in config or environment to collect namespace information.", description)
-		return nil
-	}
-
-	// Build PBS_REPOSITORY with datastore
-	repoWithDatastore := ""
-	if c.config.PBSRepository != "" {
-		repoWithDatastore = pbsRepositoryWithDatastore(c.config.PBSRepository, datastoreName)
-	} else {
-		// No repository configured but we have password - use root@pam as default user
-		repoWithDatastore = fmt.Sprintf("root@pam@localhost:%s", datastoreName)
-		c.logger.Debug("Using default user root@pam for PBS repository")
-	}
-
-	var extraEnv []string
-	extraEnv = append(extraEnv, fmt.Sprintf("PBS_REPOSITORY=%s", repoWithDatastore))
-	c.logger.Debug("Using PBS_REPOSITORY=%s", repoWithDatastore)
-
-	if c.config.PBSPassword != "" {
-		extraEnv = append(extraEnv, fmt.Sprintf("PBS_PASSWORD=%s", c.config.PBSPassword))
-		c.logger.Debug("Using PBS_PASSWORD (hidden)")
-	}
-	if c.config.PBSFingerprint != "" {
-		extraEnv = append(extraEnv, fmt.Sprintf("PBS_FINGERPRINT=%s", c.config.PBSFingerprint))
-		c.logger.Debug("Using PBS_FINGERPRINT=%s", c.config.PBSFingerprint)
-	}
-
-	cmdString := spec.String()
-	out, stderr, err := c.depRunCommandCaptured(ctx, extraEnv, spec.Name, spec.Args...)
-	if err != nil {
-		summary := summarizeCommandOutputText(mergeCommandStreams(out, stderr))
-		if critical {
-			c.incFilesFailed()
-			return fmt.Errorf("critical command `%s` failed for %s: %w (output: %s)", cmdString, description, err, summary)
-		}
-		c.logger.Warning("Skipping %s: command `%s` failed (%v). Non-critical; backup continues. Ensure the PBS CLI is available and has proper permissions. Output: %s",
-			description,
-			cmdString,
-			err,
-			summary,
-		)
-		return nil // Non-critical failure
-	}
-
-	if len(bytes.TrimSpace(stderr)) > 0 {
-		c.logger.Debug("Command `%s` wrote to stderr while succeeding (%s): %s",
-			cmdString, description, summarizeCommandOutputText(string(stderr)))
-	}
-
-	if err := c.writeReportFile(output, out); err != nil {
-		return err
-	}
-	c.logger.Debug("Successfully collected %s via PBS-authenticated command for datastore %s: %s", description, datastoreName, cmdString)
-
-	return nil
-}
-
-func summarizeCommandOutput(buf *bytes.Buffer) string {
-	return summarizeCommandOutputText(buf.String())
-}
-
 func summarizeCommandOutputText(text string) string {
 	const maxLen = 2048
 	output := strings.TrimSpace(text)
@@ -1656,15 +1664,34 @@ func (c *Collector) writeReportFile(path string, data []byte) error {
 	}
 	defer func() { _ = root.Close() }()
 
-	if err := root.WriteFile(rel, data, 0o640); err != nil {
+	if err := writeFileInRoot(root, rel, data, 0o640); err != nil {
 		c.incFilesFailed()
-		return fmt.Errorf("failed to write report %s: %w", path, err)
+		c.NoteStagingWriteError(err)
+		return &stagingWriteError{fmt.Errorf("failed to write report %s: %w", path, err)}
 	}
 
 	c.incFilesProcessed()
 	c.addBytesCollected(int64(len(data)))
 	c.logger.Debug("Successfully wrote report file: %s", path)
 	return nil
+}
+
+// writeFileInRoot is os.Root.WriteFile that removes the file when the write fails after
+// it was opened: a report cut short would otherwise go into the archive truncated. A
+// failed open created nothing, so it removes nothing.
+func writeFileInRoot(root *os.Root, name string, data []byte, perm os.FileMode) error {
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = root.Remove(name)
+	}
+	return err
 }
 
 // reportRelPath validates that path lies within the collector staging root

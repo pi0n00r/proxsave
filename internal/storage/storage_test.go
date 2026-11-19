@@ -116,7 +116,7 @@ func TestLocalStorageListSkipsAssociatedFilesAndSortsByTimestamp(t *testing.T) {
 		BackupPath:            dir,
 		BundleAssociatedFiles: true,
 	}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -194,7 +194,7 @@ func TestLocalStorageListSkipsStandaloneWhenBundleExists(t *testing.T) {
 		BackupPath:            dir,
 		BundleAssociatedFiles: true,
 	}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -228,7 +228,7 @@ func TestLocalStorageApplyRetentionDeletesOldBackups(t *testing.T) {
 		BackupPath:            dir,
 		BundleAssociatedFiles: false,
 	}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -242,7 +242,7 @@ func TestLocalStorageApplyRetentionDeletesOldBackups(t *testing.T) {
 		mod  time.Time
 	}
 	var metas []backupMeta
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		name := filepath.Join(dir, "node-backup-"+time.Now().Add(time.Duration(i)*time.Second).Format("20060102-150405")+".tar.zst")
 		if err := os.WriteFile(name, []byte{byte(i)}, 0o600); err != nil {
 			t.Fatalf("write backup: %v", err)
@@ -298,7 +298,7 @@ func TestLocalStorageApplyRetentionNoBackups(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -316,13 +316,13 @@ func TestLocalStorageApplyRetentionWrapsListError(t *testing.T) {
 	t.Parallel()
 
 	base := t.TempDir()
-	badPath := filepath.Join(base, "[invalid")
-	if err := os.MkdirAll(badPath, 0o700); err != nil {
+	badPath := filepath.Join(base, "not-a-dir")
+	if err := os.WriteFile(badPath, []byte("x"), 0o600); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 
 	cfg := &config.Config{BackupPath: badPath}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -345,7 +345,7 @@ func TestLocalStorageApplyRetentionDisabledMaxBackupsDoesNothing(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -372,16 +372,17 @@ func TestLocalStorageApplyRetentionHasLogInfoFalseWhenLogGlobFails(t *testing.T)
 
 	dir := t.TempDir()
 	base := t.TempDir()
-	badLogDir := filepath.Join(base, "[invalid")
-	if err := os.MkdirAll(badLogDir, 0o700); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	// A file where the log folder should be: the folder cannot be read.
+	badLogDir := filepath.Join(base, "not-a-dir")
+	if err := os.WriteFile(badLogDir, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
 	}
 
 	cfg := &config.Config{
 		BackupPath: dir,
 		LogPath:    badLogDir,
 	}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -431,7 +432,7 @@ func TestLocalStorageApplyRetentionGFSInvokesGFSRetention(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -488,7 +489,7 @@ func TestLocalStorageLoadMetadataFromBundle(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -558,7 +559,7 @@ func TestLocalStorageLoadMetadataFromBundleOpenError(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -573,7 +574,7 @@ func TestLocalStorageLoadMetadataFromBundleReadError(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -592,7 +593,7 @@ func TestLocalStorageLoadMetadataFromBundleParseError(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -631,7 +632,7 @@ func TestLocalStorageLoadMetadataFromBundleFallsBackToStat(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -695,7 +696,7 @@ func TestLocalStorageLoadMetadataFallsBackToSidecar(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -749,7 +750,7 @@ func TestLocalStorageLoadMetadataMissingFile(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -769,7 +770,7 @@ func TestLocalStorageLoadMetadataFromBundleMissingEntry(t *testing.T) {
 
 	dir := t.TempDir()
 	cfg := &config.Config{BackupPath: dir}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -812,7 +813,7 @@ func TestLocalStorageDeleteAssociatedLogRemovesFile(t *testing.T) {
 		BackupPath: baseDir,
 		LogPath:    logDir,
 	}
-	local, err := NewLocalStorage(cfg, newTestLogger())
+	local, err := NewLocalStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewLocalStorage() error = %v", err)
 	}
@@ -893,10 +894,36 @@ func TestExtractLogKeyFromBackup(t *testing.T) {
 			backupFile: "node-backup-20240102-03040.tar.zst",
 			wantOK:     false,
 		},
+		{
+			// The hostname carries a marker of its own: the key is after the last one.
+			name:       "hostname containing the marker",
+			backupFile: "pbs-backup-01-backup-20261014-120000.tar.zst",
+			wantHost:   "pbs-backup-01",
+			wantTS:     "20261014-120000",
+			wantOK:     true,
+		},
+		{
+			// Fifteen characters after the FIRST marker used to pass as a timestamp
+			// ("datacenter-rome"), and the orphan-log pass then read every log as older.
+			name:       "fifteen characters after an earlier marker",
+			backupFile: "srv-backup-datacenter-rome.example.com-backup-20261014-120000.tar.zst",
+			wantHost:   "srv-backup-datacenter-rome.example.com",
+			wantTS:     "20261014-120000",
+			wantOK:     true,
+		},
+		{
+			name:       "fifteen characters that are not a timestamp",
+			backupFile: "node-backup-datacenter-rome.tar.zst",
+			wantOK:     false,
+		},
+		{
+			name:       "timestamp followed by something other than an extension",
+			backupFile: "node-backup-20240102-030405x.tar.zst",
+			wantOK:     false,
+		},
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			host, ts, ok := extractLogKeyFromBackup(tt.backupFile)
 			if ok != tt.wantOK {
@@ -925,7 +952,6 @@ func TestComputeRemaining(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			remain, ok := computeRemaining(tt.initial, tt.deleted)
 			if ok != tt.wantOK || remain != tt.wantRemain {
@@ -958,40 +984,42 @@ func TestLocalStorageCountLogFiles(t *testing.T) {
 			config: &config.Config{},
 			logger: newTestLogger(),
 		}
-		if local.countLogFiles(context.Background()) != 0 {
-			t.Fatalf("empty log path should return 0")
+		if local.countLogFiles(context.Background()) != -1 {
+			t.Fatalf("empty log path should return -1 (no count)")
 		}
 	})
 
 	t.Run("counts files", func(t *testing.T) {
 		logDir := t.TempDir()
-		for i := 0; i < 2; i++ {
-			name := fmt.Sprintf("backup-node-%d.log", i)
+		for i := range 2 {
+			name := fmt.Sprintf("backup-node-2024010%d-000000.log", i+1)
 			if err := os.WriteFile(filepath.Join(logDir, name), []byte("log"), 0o600); err != nil {
 				t.Fatalf("write log: %v", err)
 			}
 		}
 		local := &LocalStorage{
-			config: &config.Config{LogPath: logDir},
-			logger: newTestLogger(),
+			config:   &config.Config{LogPath: logDir},
+			hostname: "node",
+			logger:   newTestLogger(),
 		}
 		if local.countLogFiles(context.Background()) != 2 {
 			t.Fatalf("countLogFiles() = %d, want 2", local.countLogFiles(context.Background()))
 		}
 	})
 
-	t.Run("glob error", func(t *testing.T) {
+	t.Run("unreadable log folder", func(t *testing.T) {
 		base := t.TempDir()
-		badDir := filepath.Join(base, "[invalid")
-		if err := os.MkdirAll(badDir, 0o700); err != nil {
-			t.Fatalf("mkdir: %v", err)
+		// A file where the log folder should be: the folder cannot be read.
+		badDir := filepath.Join(base, "not-a-dir")
+		if err := os.WriteFile(badDir, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
 		}
 		local := &LocalStorage{
 			config: &config.Config{LogPath: badDir},
 			logger: newTestLogger(),
 		}
 		if local.countLogFiles(context.Background()) != -1 {
-			t.Fatalf("expected -1 for glob error")
+			t.Fatalf("expected -1 for an unreadable log folder")
 		}
 	})
 }
@@ -1008,7 +1036,7 @@ func TestSecondaryStorageStoreCopiesBackupAndAssociatedFiles(t *testing.T) {
 		BundleAssociatedFiles: false,
 	}
 
-	secondary, err := NewSecondaryStorage(cfg, newTestLogger())
+	secondary, err := NewSecondaryStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewSecondaryStorage() error = %v", err)
 	}
@@ -1047,7 +1075,7 @@ func TestClassifyBackupsGFSLimitsDailyCount(t *testing.T) {
 	now := time.Now()
 
 	var backups []*types.BackupMetadata
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		backups = append(backups, &types.BackupMetadata{
 			BackupFile: fmt.Sprintf("backup-%d", i),
 			Timestamp:  now.Add(-time.Duration(i) * time.Hour),
@@ -1090,7 +1118,7 @@ func TestStorageErrorFormatting(t *testing.T) {
 				Err:        errors.New("disk full"),
 				IsCritical: false,
 			},
-			expected: "WARNING: primary storage store operation failed for /backups/full.tar: disk full",
+			expected: "primary storage store operation failed for /backups/full.tar: disk full",
 		},
 		{
 			name: "critical and recoverable",
@@ -1102,7 +1130,7 @@ func TestStorageErrorFormatting(t *testing.T) {
 				IsCritical:  true,
 				Recoverable: true,
 			},
-			expected: "CRITICAL: secondary storage delete operation failed for /mnt/secondary/old.tar (recoverable): permission denied",
+			expected: "secondary storage delete operation failed for /mnt/secondary/old.tar (recoverable): permission denied",
 		},
 	}
 
@@ -1219,40 +1247,42 @@ func TestSecondaryStorageCountLogFiles(t *testing.T) {
 			config: &config.Config{},
 			logger: newTestLogger(),
 		}
-		if storage.countLogFiles(context.Background()) != 0 {
-			t.Fatalf("empty path should return 0")
+		if storage.countLogFiles(context.Background()) != -1 {
+			t.Fatalf("empty path should return -1 (no count)")
 		}
 	})
 
 	t.Run("counts files", func(t *testing.T) {
 		logDir := t.TempDir()
-		for i := 0; i < 3; i++ {
-			name := fmt.Sprintf("backup-node-%d.log", i)
+		for i := range 3 {
+			name := fmt.Sprintf("backup-node-2024010%d-000000.log", i+1)
 			if err := os.WriteFile(filepath.Join(logDir, name), []byte("log"), 0o600); err != nil {
 				t.Fatalf("write log: %v", err)
 			}
 		}
 		storage := &SecondaryStorage{
-			config: &config.Config{SecondaryLogPath: logDir},
-			logger: newTestLogger(),
+			config:   &config.Config{SecondaryLogPath: logDir},
+			hostname: "node",
+			logger:   newTestLogger(),
 		}
 		if got := storage.countLogFiles(context.Background()); got != 3 {
 			t.Fatalf("countLogFiles() = %d, want 3", got)
 		}
 	})
 
-	t.Run("glob error", func(t *testing.T) {
+	t.Run("unreadable log folder", func(t *testing.T) {
 		base := t.TempDir()
-		badDir := filepath.Join(base, "[invalid")
-		if err := os.MkdirAll(badDir, 0o700); err != nil {
-			t.Fatalf("mkdir: %v", err)
+		// A file where the log folder should be: the folder cannot be read.
+		badDir := filepath.Join(base, "not-a-dir")
+		if err := os.WriteFile(badDir, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
 		}
 		storage := &SecondaryStorage{
 			config: &config.Config{SecondaryLogPath: badDir},
 			logger: newTestLogger(),
 		}
 		if got := storage.countLogFiles(context.Background()); got != -1 {
-			t.Fatalf("expected -1 for glob error, got %d", got)
+			t.Fatalf("expected -1 for an unreadable log folder, got %d", got)
 		}
 	})
 }
@@ -1277,7 +1307,7 @@ func TestSecondaryStorageApplyRetentionSimple(t *testing.T) {
 		ts   time.Time
 	}
 	var infos []backupInfo
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		ts := baseTime.Add(-time.Duration(i) * time.Hour)
 		path := createSecondaryBackup(t, backupDir, logDir, "node-simple", ts)
 		// Completion sidecar so List marks the backup Verified (retention gate).
@@ -1593,7 +1623,7 @@ func TestSecondaryStorageStoreHonorsContextCancellation(t *testing.T) {
 
 func newSecondaryStorageForTest(t *testing.T, cfg *config.Config) *SecondaryStorage {
 	t.Helper()
-	storage, err := NewSecondaryStorage(cfg, newTestLogger())
+	storage, err := NewSecondaryStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewSecondaryStorage() error = %v", err)
 	}
@@ -1638,6 +1668,7 @@ func TestSecondaryStorageGetStatsIncludesFilesystemInfo(t *testing.T) {
 
 	// Simulate DetectFilesystem having already populated fsInfo.
 	storage.fsInfo = &FilesystemInfo{Type: FilesystemExt4}
+	storage.hostname = "node-stats"
 
 	ts1 := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
 	ts2 := time.Date(2024, 1, 2, 10, 0, 0, 0, time.UTC)
@@ -1709,7 +1740,7 @@ func TestSecondaryStorageBasicAccessors(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{SecondaryEnabled: true, SecondaryPath: t.TempDir()}
-	storage, err := NewSecondaryStorage(cfg, newTestLogger())
+	storage, err := NewSecondaryStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewSecondaryStorage() error = %v", err)
 	}
@@ -1741,7 +1772,7 @@ func TestSecondaryStorageDetectFilesystemCreatesDirectory(t *testing.T) {
 		SecondaryEnabled: true,
 		SecondaryPath:    tmpDir,
 	}
-	storage, err := NewSecondaryStorage(cfg, newTestLogger())
+	storage, err := NewSecondaryStorage(cfg, newTestLogger(), "")
 	if err != nil {
 		t.Fatalf("NewSecondaryStorage() error = %v", err)
 	}

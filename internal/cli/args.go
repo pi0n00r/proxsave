@@ -50,13 +50,43 @@ type Args struct {
 	// the upgrade flow re-invokes the freshly installed binary with this flag so Screen 0
 	// opens at the end of every upgrade, rendered by the binary that actually carries the
 	// notes (the notes registry is compiled into each binary).
-	ShowWhatsnew  bool
-	CleanupGuards bool
-	Backup        bool
-	Daemon        bool
-	DaemonSetup   bool
-	DaemonRemove  bool
-	DaemonStatus  bool
+	ShowWhatsnew bool
+	// UpgradeFinalize runs ONLY the post-install finalize phase and exits. Internal
+	// plumbing, the same shape as ShowWhatsnew: --upgrade re-invokes the freshly
+	// INSTALLED binary with this flag so the finalize logic that runs is the new
+	// release's, not the one being replaced. Download, signature/checksum
+	// verification and the install itself stay in the old binary and are never
+	// delegated: the downloaded binary is untrusted until that binary has verified
+	// it, so it cannot be the one to verify itself.
+	UpgradeFinalize bool
+	// UpgradeFinalizeVersion carries the version the parent installed, for the
+	// footer the child prints. The child cannot read it from its own build info on
+	// the --localfile path, where the on-disk binary may predate the tag.
+	UpgradeFinalizeVersion string
+	// UpgradeFinalizeSkipWhatsnew collapses the parent's two reasons for not opening
+	// Screen 0 (auto-yes, or the dashboard owning presentation) into one bit, since
+	// the child only needs the verdict.
+	UpgradeFinalizeSkipWhatsnew bool
+	// UpgradeFinalizeSkipDaemonRestart carries the parent's decision NOT to restart
+	// the resident daemon inline, because the parent restarts it itself afterwards.
+	// The dashboard does exactly that (dashboard_upgrade.go, upgRun), and it does it
+	// by flipping a package var, which a child PROCESS cannot see: without this flag
+	// the child restarts too and the operator gets two service interruptions, with
+	// the second one able to be deferred behind a backup that started in between.
+	UpgradeFinalizeSkipDaemonRestart bool
+	CleanupGuards                    bool
+	Backup                           bool
+	Daemon                           bool
+	DaemonSetup                      bool
+	DaemonRemove                     bool
+	DaemonStatus                     bool
+	// UnexpectedArgs holds the words left once flag parsing stopped: the flag package
+	// stops at the first word that is not a flag, so every flag after it is in here
+	// too, unread. Not a CLI flag; main refuses the run when it is not empty.
+	UnexpectedArgs []string
+	// InvalidLogLevel holds a --log-level value that is not a level, which leaves
+	// LogLevel unset. Not a CLI flag; main refuses the run when it is not empty.
+	InvalidLogLevel string
 }
 
 var osExit = os.Exit
@@ -78,7 +108,7 @@ func Parse() *Args {
 		"Log level (shorthand)")
 
 	flag.BoolVar(&args.DryRun, "dry-run", false,
-		"Perform a dry run without making actual changes")
+		"Simulate a backup without creating or uploading archives; diagnostic logs may still be written")
 	flag.BoolVar(&args.DryRun, "n", false,
 		"Perform a dry run (shorthand)")
 
@@ -119,13 +149,13 @@ func Parse() *Args {
 	flag.BoolVar(&args.Install, "install", false,
 		"Run the interactive installer (generate/configure backup.env)")
 	flag.BoolVar(&args.NewInstall, "new-install", false,
-		"Reset the installation directory (preserving build/env/identity) and launch the interactive installer")
+		"Reset the installation directory (preserving build/daemon_state/env/guards/identity/restore) and launch the interactive installer")
 	flag.BoolVar(&args.Upgrade, "upgrade", false,
 		"Download and install the latest ProxSave binary (also upgrades backup.env by adding missing keys from the new template). Append 'y' to auto-confirm (e.g., --upgrade y)")
 	flag.BoolVar(&args.LocalFile, "localfile", false,
 		"With --upgrade: skip the release check and download, and finalize using the binary already on disk (upgrade backup.env, refresh docs/symlinks, install/restart the daemon, fix permissions). Used by upgrade-beta.sh after it swaps in a binary")
 	flag.BoolVar(&args.CleanupGuards, "cleanup-guards", false,
-		"Cleanup ProxSave guard bind mounts and directories (/var/lib/proxsave/guards). Use with --dry-run to preview")
+		"Cleanup ProxSave guard bind mounts and directories (<BASE_DIR>/guards, and /var/lib/proxsave/guards from older versions). Use with --dry-run to preview")
 
 	flag.BoolVar(&args.UpgradeConfig, "upgrade-config", false,
 		"Upgrade configuration file using the embedded template (adds missing keys, preserves existing and custom keys)")
@@ -137,7 +167,16 @@ func Parse() *Args {
 		"Upgrade configuration file using the embedded template and print JSON summary to stdout (for internal use by --upgrade)")
 
 	flag.BoolVar(&args.ShowWhatsnew, "show-whatsnew", false,
-		"Show the what's-new screen once and exit (for internal use by --upgrade)")
+		"Show the release-notes screen once, mark the notes seen, and exit. --upgrade re-invokes it on the freshly installed binary at an interactive terminal; run it by hand after an unattended upgrade (--upgrade y) to clear the unseen-notes warning that otherwise ends every backup at exit 1")
+
+	flag.BoolVar(&args.UpgradeFinalize, "upgrade-finalize", false,
+		"Run only the post-install finalize phase and exit (for internal use by --upgrade)")
+	flag.StringVar(&args.UpgradeFinalizeVersion, "upgrade-finalize-version", "",
+		"With --upgrade-finalize: the version the caller installed (for internal use by --upgrade)")
+	flag.BoolVar(&args.UpgradeFinalizeSkipWhatsnew, "upgrade-finalize-skip-whatsnew", false,
+		"With --upgrade-finalize: do not open the what's-new screen (for internal use by --upgrade)")
+	flag.BoolVar(&args.UpgradeFinalizeSkipDaemonRestart, "upgrade-finalize-skip-daemon-restart", false,
+		"With --upgrade-finalize: do not restart the resident daemon; the caller does it (for internal use by --upgrade)")
 
 	// Custom usage message
 	flag.Usage = func() {
@@ -152,6 +191,7 @@ func Parse() *Args {
 	} else {
 		_ = flag.CommandLine.Parse(nil)
 	}
+	args.UnexpectedArgs = flag.CommandLine.Args()
 
 	args.ConfigPath = configFlag.value
 	if configFlag.set {
@@ -161,10 +201,13 @@ func Parse() *Args {
 	}
 
 	// Parse log level if provided
+	args.LogLevel = types.LogLevelNone // Will be overridden by config
 	if logLevelStr != "" {
-		args.LogLevel = parseLogLevel(logLevelStr)
-	} else {
-		args.LogLevel = types.LogLevelNone // Will be overridden by config
+		if level, ok := parseLogLevel(logLevelStr); ok {
+			args.LogLevel = level
+		} else {
+			args.InvalidLogLevel = logLevelStr
+		}
 	}
 
 	return args
@@ -200,29 +243,31 @@ func extractUpgradeAutoYesArgs(argv []string) ([]string, bool) {
 	return processed, autoYes
 }
 
-// parseLogLevel converts string to LogLevel
-func parseLogLevel(s string) types.LogLevel {
-	switch s {
+// parseLogLevel converts a --log-level value to a LogLevel, ignoring case, and
+// reports false for anything else. There is no "none": LogLevelNone means the flag
+// was not given, so accepting it handed the run to DEBUG_LEVEL instead.
+func parseLogLevel(s string) (types.LogLevel, bool) {
+	switch strings.ToLower(s) {
 	case "debug", "5":
-		return types.LogLevelDebug
+		return types.LogLevelDebug, true
 	case "info", "4":
-		return types.LogLevelInfo
+		return types.LogLevelInfo, true
 	case "warning", "3":
-		return types.LogLevelWarning
+		return types.LogLevelWarning, true
 	case "error", "2":
-		return types.LogLevelError
+		return types.LogLevelError, true
 	case "critical", "1":
-		return types.LogLevelCritical
-	case "none", "0":
-		return types.LogLevelNone
+		return types.LogLevelCritical, true
 	default:
-		return types.LogLevelInfo
+		return types.LogLevelNone, false
 	}
 }
 
-// ShowHelp displays help message and exits
+// ShowHelp displays help message and exits. An explicit --help is the output the
+// operator asked for, so it goes to stdout (`proxsave --help | less`); the usage
+// printed after a parse error stays on stderr.
 func ShowHelp() {
-	printHelp(os.Stderr, os.Args[0])
+	printHelp(os.Stdout, os.Args[0])
 	osExit(0)
 }
 

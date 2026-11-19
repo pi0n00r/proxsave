@@ -26,8 +26,10 @@ import (
 	"github.com/tis24dev/proxsave/internal/cli"
 	"github.com/tis24dev/proxsave/internal/config"
 	"github.com/tis24dev/proxsave/internal/identity"
+	"github.com/tis24dev/proxsave/internal/input"
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/safeexec"
+	"github.com/tis24dev/proxsave/internal/serverbot"
 	"github.com/tis24dev/proxsave/internal/types"
 	buildinfo "github.com/tis24dev/proxsave/internal/version"
 )
@@ -112,7 +114,7 @@ func logUpgradeDaemonRestart(bootstrap *logging.BootstrapLogger, rv *RestartVeri
 	case restartVerifyTimedOut:
 		bootstrap.Warning("Daemon restarted but alignment check timeout")
 	case restartVerifyAligned:
-		bootstrap.Println("Daemon restarted and now aligned with the new binary.")
+		logBootstrapInfo(bootstrap, "Daemon restarted and now aligned with the new binary.")
 	default:
 		bootstrap.Warning("Daemon restarted but alignment could not be confirmed")
 	}
@@ -127,7 +129,15 @@ func logUpgradeDaemonRestart(bootstrap *logging.BootstrapLogger, rv *RestartVeri
 //
 // The shared setup (logger, banner, config load) runs before either phase so the
 // --localfile path prints the same header and honours the same guards.
+type upgradeRunOptions struct {
+	deferWhatsnew bool
+}
+
 func runUpgrade(ctx context.Context, args *cli.Args, bootstrap *logging.BootstrapLogger) int {
+	return runUpgradeWithOptions(ctx, args, bootstrap, upgradeRunOptions{})
+}
+
+func runUpgradeWithOptions(ctx context.Context, args *cli.Args, bootstrap *logging.BootstrapLogger, opts upgradeRunOptions) int {
 	baseDir, _ := detectedBaseDirOrFallback()
 	_ = os.Setenv("BASE_DIR", baseDir)
 
@@ -154,7 +164,7 @@ func runUpgrade(ctx context.Context, args *cli.Args, bootstrap *logging.Bootstra
 	defer func() { done(workflowErr) }()
 
 	if err := ensureConfigExists(args.ConfigPath, bootstrap); err != nil {
-		bootstrap.Error("ERROR: %v", err)
+		bootstrap.Error("%v", err)
 		workflowErr = err
 		return types.ExitConfigError.Int()
 	}
@@ -174,7 +184,7 @@ func runUpgrade(ctx context.Context, args *cli.Args, bootstrap *logging.Bootstra
 	bootstrap.Println("")
 
 	if _, err := config.LoadConfigWithBaseDir(args.ConfigPath, baseDir); err != nil {
-		bootstrap.Error("ERROR: Failed to load configuration: %v", err)
+		bootstrap.Error("Failed to load configuration: %v", err)
 		workflowErr = err
 		return types.ExitConfigError.Int()
 	}
@@ -189,7 +199,7 @@ func runUpgrade(ctx context.Context, args *cli.Args, bootstrap *logging.Bootstra
 	}
 
 	// Phase 2: local finalize, shared by the download and --localfile paths.
-	code, finalizeErr := upgradeFinalizePhase(ctx, args, bootstrap, sessionLogger, baseDir, execPath, versionInstalled, upgradeErr)
+	code, finalizeErr := upgradeFinalizePhase(ctx, args, bootstrap, sessionLogger, baseDir, execPath, versionInstalled, upgradeErr, opts)
 	workflowErr = finalizeErr
 	return code
 }
@@ -220,8 +230,21 @@ func upgradeAcquireBinary(ctx context.Context, args *cli.Args, bootstrap *loggin
 	logging.DebugStepBootstrap(bootstrap, "upgrade workflow", "fetching latest release info")
 	tag, latestVersion, _, err := fetchLatestRelease(ctx)
 	if err != nil {
-		bootstrap.Error("ERROR: Failed to check latest release: %v", err)
-		return "", "", types.ExitConfigError.Int(), true, err
+		if statusErr, ok := errors.AsType[*githubStatusError](err); ok {
+			logging.DebugStepBootstrap(bootstrap, "upgrade workflow", "latest release response body=%q", statusErr.excerpt)
+		}
+		// Four of fetchLatestRelease's five errors open with "failed to ...", so a
+		// wrapper repeated the verb. The fifth, "empty tag_name in latest release
+		// response", does not name the operation: on that shape the cause stands
+		// bare. Known cost.
+		if ctx.Err() != nil {
+			// Ctrl+C or SIGTERM during the check: an interrupted run, not a
+			// configuration error (exit 2 said "Invalid or missing configuration").
+			return "", "", exitCodeInterrupted, true, err
+		}
+		bootstrap.Error("%v", err)
+		// GitHub not answering is a failed run, like a failed download (exit 1).
+		return "", "", types.ExitGenericError.Int(), true, err
 	}
 
 	logging.DebugStepBootstrap(bootstrap, "upgrade workflow", "current=%s latest=%s", currentVersion, latestVersion)
@@ -243,7 +266,17 @@ func upgradeAcquireBinary(ctx context.Context, args *cli.Args, bootstrap *loggin
 		reader := bufio.NewReader(os.Stdin)
 		confirmed, promptErr := promptYesNo(ctx, reader, "Do you want to download and install this version now? (backup.env will be updated with any missing keys; a backup will be created) [y/N]: ", false)
 		if promptErr != nil {
-			bootstrap.Error("ERROR: %v", promptErr)
+			switch {
+			case ctx.Err() != nil:
+				// Ctrl+C or SIGTERM at the prompt: exit 130, as backup and restore.
+				return "", "", exitCodeInterrupted, true, promptErr
+			case errors.Is(promptErr, input.ErrInputAborted):
+				// End of input or the idle timeout: nothing was chosen, nothing changed.
+				logging.DebugStepBootstrap(bootstrap, "upgrade workflow", "prompt ended without an answer: %v", promptErr)
+				bootstrap.Println("Upgrade cancelled by user; no changes were made.")
+				return "", "", types.ExitSuccess.Int(), true, nil
+			}
+			bootstrap.Error("%v", promptErr)
 			return "", "", types.ExitConfigError.Int(), true, promptErr
 		}
 		confirm = confirmed
@@ -258,7 +291,7 @@ func upgradeAcquireBinary(ctx context.Context, args *cli.Args, bootstrap *loggin
 	logging.DebugStepBootstrap(bootstrap, "upgrade workflow", "executing upgrade for %s", execPath)
 	versionInstalled, upgradeErr = downloadAndInstallLatest(ctx, execPath, bootstrap, tag, latestVersion)
 	if upgradeErr != nil {
-		bootstrap.Error("ERROR: Upgrade failed: %v", upgradeErr)
+		bootstrap.Error("Upgrade failed: %v", upgradeErr)
 		// Continue to the footer to show guidance and permission status, but exit
 		// with error (upgradeErr flows through finalize).
 	}
@@ -272,7 +305,23 @@ func upgradeAcquireBinary(ctx context.Context, args *cli.Args, bootstrap *loggin
 // which both reach it with the target binary already in place. Returns the
 // process exit code and the error to attribute to the workflow span (nil on full
 // success, the config-upgrade error, or the binary-install error).
-func upgradeFinalizePhase(ctx context.Context, args *cli.Args, bootstrap *logging.BootstrapLogger, sessionLogger *logging.Logger, baseDir, execPath, versionInstalled string, upgradeErr error) (int, error) {
+func upgradeFinalizePhase(ctx context.Context, args *cli.Args, bootstrap *logging.BootstrapLogger, sessionLogger *logging.Logger, baseDir, execPath, versionInstalled string, upgradeErr error, opts upgradeRunOptions) (int, error) {
+	// Hand the whole phase to the binary that was just installed, when it is new
+	// enough to have the entry point. Everything below this line is release-specific
+	// policy - which keys the config merge adds, whether the daemon is migrated,
+	// what the footer says - and running it from the binary being REPLACED is why
+	// every change to it landed one release late.
+	//
+	// Only the finalize moves. Download, signature and checksum verification and the
+	// install stay here, because the downloaded binary is untrusted until this one
+	// has verified it and it cannot be the party that verifies itself. upgradeErr
+	// != nil means the install failed, so there is nothing new to delegate to.
+	if upgradeErr == nil && !args.UpgradeFinalize {
+		if code, err, delegated := delegateUpgradeFinalize(ctx, args, bootstrap, execPath, versionInstalled, opts); delegated {
+			return code, err
+		}
+	}
+
 	var cfgUpgradeResult *config.UpgradeResult
 	var cfgUpgradeErr error
 	if upgradeErr == nil {
@@ -280,6 +329,11 @@ func upgradeFinalizePhase(ctx context.Context, args *cli.Args, bootstrap *loggin
 		cfgUpgradeResult, cfgUpgradeErr = upgradeConfigWithBinary(ctx, execPath, args.ConfigPath)
 		if cfgUpgradeErr != nil {
 			bootstrap.Warning("Upgrade: configuration upgrade failed: %v", cfgUpgradeErr)
+		}
+		// The notes come back from the child through the JSON and are logged here, before
+		// the footer that lists the configuration warnings.
+		if cfgUpgradeResult != nil {
+			logConfigUpgradeNotes(bootstrap, cfgUpgradeResult.Notes)
 		}
 	}
 	if sessionLogger != nil && cfgUpgradeResult != nil && len(cfgUpgradeResult.MissingKeys) > 0 {
@@ -297,14 +351,19 @@ func upgradeFinalizePhase(ctx context.Context, args *cli.Args, bootstrap *loggin
 	repointLegacyCronEntries(ctx, bootstrap)
 	ensureGoSymlink(execPath, bootstrap)
 
-	// Auto-migrate cron installs to the resident daemon now that the new binary +
-	// config keys are in place. Honours the DAEMON_OPT_OUT tombstone so a manual
-	// --daemon-remove is never undone. Best-effort: a failure stays on cron and is
-	// only warned. (When staying on cron, the canonical /usr/local/bin/proxsave
-	// entry created at install keeps working across binary upgrades.)
+	// Install the resident daemon on a host that has never recorded a scheduler engine, now
+	// that the new binary + config keys are in place. The discriminator is whether the merge
+	// above had to ADD SCHEDULER_MODE, so a host that already recorded one - including one
+	// that recorded cron by running --daemon-remove - is never revisited. Best-effort: a
+	// failure stays on cron and is only warned. (When staying on cron, the canonical
+	// /usr/local/bin/proxsave entry created at install keeps working across binary upgrades.)
+	//
+	// cfgUpgradeResult comes from the NEW binary, run as a child (:280). This decision does
+	// not: runUpgrade never re-execs, so on the download path the code deciding here is the
+	// binary being replaced, and any change to this rule takes effect one release later.
 	var daemonRestart *RestartVerifyResult
 	if upgradeErr == nil {
-		maybeAutoMigrateDaemon(ctx, args.ConfigPath, baseDir, execPath, bootstrap)
+		maybeAutoMigrateDaemon(ctx, args.ConfigPath, baseDir, execPath, cfgUpgradeResult, bootstrap)
 		// The new binary is on disk, but the resident daemon still runs the OLD one
 		// (systemd keeps the process alive across an in-place replace). Restart+verify
 		// it so the upgrade ends with the daemon aligned. This is automatic (no extra
@@ -312,7 +371,7 @@ func upgradeFinalizePhase(ctx context.Context, args *cli.Args, bootstrap *loggin
 		// succeeded. It first waits out any in-progress backup rather than killing it,
 		// and only runs when the daemon is actually active (a cron install has none).
 		if upgradeRestartsDaemon && daemonIsActive(ctx) {
-			bootstrap.Println("Restarting the resident daemon to load the new binary...")
+			logBootstrapInfo(bootstrap, "Restarting the resident daemon to load the new binary...")
 			lockPath, lockKnown := upgradeBackupLockPath(args.ConfigPath, baseDir)
 			rv := restartAndVerifyDaemon(ctx, baseDir, lockPath, lockKnown, upgradeHeartbeatInterval(args.ConfigPath, baseDir))
 			daemonRestart = &rv
@@ -343,12 +402,12 @@ func upgradeFinalizePhase(ctx context.Context, args *cli.Args, bootstrap *loggin
 	// new) for the freshly installed release by re-invoking the installed binary with
 	// --show-whatsnew. The notes registry is compiled into each binary, so the INSTALLED
 	// binary -- not necessarily this process (the download path finalizes from the OLD
-	// binary) -- is the one that must render them. Best-effort and gated (interactive AND
-	// not auto-yes) inside the helper; never changes the exit code. A config-upgrade
+	// binary) -- is the one that must render them. Best-effort and gated by the terminal/
+	// deferred-presentation policy inside the helper; never changes the exit code. A config-upgrade
 	// failure (cfgUpgradeErr) leaves the footer showing "Configuration: ERROR" and a
 	// nonzero exit, so opening a celebratory notes screen there would contradict it.
 	if upgradeErr == nil && cfgUpgradeErr == nil {
-		runWhatsnewAfterUpgrade(ctx, execPath, args, bootstrap)
+		runWhatsnewAfterUpgrade(ctx, execPath, args, bootstrap, opts)
 	}
 
 	// The workflow span error mirrors the exit code's reasoning: a binary-install
@@ -362,6 +421,169 @@ func upgradeFinalizePhase(ctx context.Context, args *cli.Args, bootstrap *loggin
 		workflowErr = cfgUpgradeErr
 	}
 	return upgradeExitCode(upgradeErr, cfgUpgradeErr), workflowErr
+}
+
+// runUpgradeFinalize is the child half of the split: it runs upgradeFinalizePhase
+// and nothing else. It repeats the caller's setup that the phase depends on - the
+// BASE_DIR export and the config existence check - and deliberately does NOT
+// reprint the upgrade banner, because the parent already printed it on the same
+// terminal.
+//
+// execPath is this process's own binary: the child IS the installed one, which is
+// the entire point of handing the phase over.
+func runUpgradeFinalize(ctx context.Context, args *cli.Args, bootstrap *logging.BootstrapLogger) int {
+	baseDir, _ := detectedBaseDirOrFallback()
+	_ = os.Setenv("BASE_DIR", baseDir)
+
+	if bootstrap != nil && args.LogLevel != types.LogLevelNone {
+		bootstrap.SetLevel(args.LogLevel)
+	}
+	if err := ensureConfigExists(args.ConfigPath, bootstrap); err != nil {
+		bootstrap.Error("%v", err)
+		return types.ExitConfigError.Int()
+	}
+
+	// The parent restarts the daemon itself when it passes this (the dashboard does),
+	// so the child must not. Restoring it afterwards is pointless in a process that
+	// exits next, but it keeps the var's meaning honest for anything that reads it.
+	if args.UpgradeFinalizeSkipDaemonRestart {
+		prev := upgradeRestartsDaemon
+		upgradeRestartsDaemon = false
+		defer func() { upgradeRestartsDaemon = prev }()
+	}
+
+	version := strings.TrimSpace(args.UpgradeFinalizeVersion)
+	if version == "" {
+		version = strings.TrimPrefix(buildinfo.String(), "v")
+	}
+
+	code, _ := upgradeFinalizePhase(ctx, args, bootstrap, nil, baseDir,
+		getExecInfo().ExecPath, version, nil,
+		upgradeRunOptions{deferWhatsnew: args.UpgradeFinalizeSkipWhatsnew})
+	return code
+}
+
+// upgradeFinalizeDelegationFloor is the first release whose binary carries
+// --upgrade-finalize. Below it the flag does not exist, so the old binary keeps
+// doing the finalize itself, exactly as before.
+const upgradeFinalizeDelegationFloor = "0.36.0"
+
+// upgradeFinalizeCommand is a seam so a test can drive the delegation without
+// spawning the installed binary.
+var upgradeFinalizeCommand = safeexec.TrustedCommandContext
+
+// delegateUpgradeFinalize runs the finalize phase inside the freshly installed
+// binary. delegated=false means the caller must do the phase itself.
+//
+// The gate is a VERSION COMPARISON, deliberately, and it fails closed: a version
+// that does not parse, or one below the floor, keeps the in-process path. The two
+// alternatives are worse. A probe flag costs a process spawn on every upgrade and
+// answers weakly - a binary that does not know the flag prints usage and exits
+// non-zero, which is indistinguishable from "the flag exists and failed". A
+// try-then-fall-back on the exit code cannot tell "no such flag" from "the finalize
+// ran and failed", and getting that wrong either skips the finalize or runs the
+// config merge twice.
+//
+// A child that never STARTS (exec format error, missing loader) is the one case
+// that falls back: the host must be left no worse than before the split existed.
+// A child that starts and exits non-zero is a finalize that genuinely failed, and
+// it is NOT retried in-process - the config merge is not something to assume
+// idempotent.
+//
+// What this does not do, stated because the parent-child shape invites the
+// assumption: it cannot roll the binary back. installBinary renames the new file
+// over the old one and keeps no copy, so no rollback capability exists here today.
+// The parent's job is to report, and to still finalize when the child cannot run.
+func delegateUpgradeFinalize(ctx context.Context, args *cli.Args, bootstrap *logging.BootstrapLogger, execPath, versionInstalled string, opts upgradeRunOptions) (int, error, bool) {
+	// The parse check has to be its own gate, because compareVersions cannot be the
+	// one to fail closed: it degrades an unparsable component to 0 rather than
+	// rejecting it, so "999.not-a-version" reads as [999,0] and compares ABOVE the
+	// floor. Its other caller (upgradeAcquireBinary) wants exactly that degradation,
+	// where a malformed remote version simply means "not newer", so the fix belongs
+	// here and not there.
+	if !parsableVersionCore(versionInstalled) {
+		bootstrap.Warning("Upgrade: installed version %q does not parse; finalizing here instead of delegating", versionInstalled)
+		return 0, nil, false
+	}
+	if compareVersions(versionInstalled, upgradeFinalizeDelegationFloor) < 0 {
+		logging.DebugStepBootstrap(bootstrap, "upgrade workflow", "finalize stays in this binary: installed %q is below %s", versionInstalled, upgradeFinalizeDelegationFloor)
+		return 0, nil, false
+	}
+
+	cmdArgs := []string{"--upgrade-finalize", "--upgrade-finalize-version", versionInstalled}
+	if configPath := strings.TrimSpace(args.ConfigPath); configPath != "" {
+		cmdArgs = append(cmdArgs, "--config", configPath)
+	}
+	if opts.deferWhatsnew || args.UpgradeAutoYes {
+		cmdArgs = append(cmdArgs, "--upgrade-finalize-skip-whatsnew")
+	}
+	// upgradeRestartsDaemon is a package var, so the dashboard's decision to own the
+	// restart itself (upgRun sets it false) stops at this process boundary. Forward
+	// it, or the child restarts the daemon and the dashboard restarts it again.
+	if !upgradeRestartsDaemon {
+		cmdArgs = append(cmdArgs, "--upgrade-finalize-skip-daemon-restart")
+	}
+	// Without this the half of the upgrade that moved to the child would go quiet
+	// under `--upgrade --log-level debug`, which is the flag someone reaches for
+	// precisely when the finalize is what they are trying to see. LogLevelNone means
+	// "unset, let the config decide" and must NOT be forwarded as a choice.
+	if args.LogLevel != types.LogLevelNone {
+		cmdArgs = append(cmdArgs, "--log-level", strings.ToLower(args.LogLevel.String()))
+	}
+
+	cmd, err := upgradeFinalizeCommand(ctx, execPath, cmdArgs...)
+	if err != nil {
+		bootstrap.Warning("Upgrade: cannot hand the finalize to the installed binary (%v); finalizing here instead", err)
+		return 0, nil, false
+	}
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	logging.DebugStepBootstrap(bootstrap, "upgrade workflow", "delegating finalize to %s %v", execPath, cmdArgs)
+	if err := cmd.Start(); err != nil {
+		bootstrap.Warning("Upgrade: the installed binary would not start for the finalize (%v); finalizing here instead", err)
+		return 0, nil, false
+	}
+	if err := cmd.Wait(); err != nil {
+		bootstrap.Error("Upgrade: the installed binary reported a finalize failure: %v", err)
+		return types.ExitGenericError.Int(), err, true
+	}
+	return types.ExitSuccess.Int(), nil, true
+}
+
+// parsableVersionCore reports whether every dot-separated component of v's numeric
+// core is a non-negative integer. The core is what precedes the first "-" or "+"
+// (semver prerelease and build metadata), so "0.37.0-rc1" and "0.37.0+deadbeef"
+// parse while "0.37.x" and "999.not-a-version" do not.
+//
+// It exists because delegating on a version nobody could parse is the worst
+// outcome available: the child either lacks --upgrade-finalize and exits on an
+// argument error, or is not the binary anyone thinks it is. Either way
+// delegateUpgradeFinalize reports a finalize failure and does NOT retry in
+// process, so the config merge, the docs refresh, the symlinks and the daemon
+// migration are all skipped while the upgrade reports failure.
+func parsableVersionCore(v string) bool {
+	v = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(v), "v"))
+	if v == "" {
+		return false
+	}
+	if idx := strings.IndexAny(v, "-+"); idx >= 0 {
+		v = v[:idx]
+	}
+	if v == "" {
+		return false
+	}
+	for part := range strings.SplitSeq(v, ".") {
+		if part == "" {
+			return false
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // upgradeExitCode maps the binary-install and config-upgrade outcomes to a process
@@ -470,6 +692,37 @@ func resolveReleaseTarget(goos, goarch string) (string, string, error) {
 	return osName, "amd64", nil
 }
 
+// githubStatusError is a non-200 answer from GitHub. Its text is the status, plus the
+// message of GitHub's JSON error (the API's rate limit says why there) when asked for;
+// excerpt is the answer itself, for a DEBUG line only: a proxy in front of GitHub can
+// answer with a multi-line HTML page holding control bytes.
+type githubStatusError struct {
+	code    int
+	message string
+	excerpt string
+}
+
+func newGitHubStatusError(code int, body []byte, withMessage bool) *githubStatusError {
+	e := &githubStatusError{code: code, excerpt: (&serverbot.Response{Body: body}).Snippet(200)}
+	if withMessage {
+		var apiErr struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(body, &apiErr) == nil {
+			e.message = strings.TrimSpace((&serverbot.Response{Body: []byte(apiErr.Message)}).Snippet(200))
+		}
+	}
+	return e
+}
+
+func (e *githubStatusError) Error() string {
+	text := strings.TrimSpace(fmt.Sprintf("status %d %s", e.code, http.StatusText(e.code)))
+	if e.message != "" {
+		text += ": " + e.message
+	}
+	return text
+}
+
 // fetchLatestRelease returns (tag, version, body, err) for the latest GitHub release.
 // body is the raw release description (used to surface the release notes); it is remote-
 // controlled, so every consumer that displays it MUST sanitize it first.
@@ -490,7 +743,7 @@ func fetchLatestRelease(ctx context.Context) (string, string, string, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
-		return "", "", "", fmt.Errorf("failed to fetch latest release: status %d, body: %s", resp.StatusCode, string(body))
+		return "", "", "", fmt.Errorf("failed to fetch latest release: %w", newGitHubStatusError(resp.StatusCode, body, true))
 	}
 
 	var info releaseInfo
@@ -551,12 +804,9 @@ func compareVersions(current, latest string) int {
 	a, aPre := normalize(current)
 	b, bPre := normalize(latest)
 
-	maxLen := len(a)
-	if len(b) > maxLen {
-		maxLen = len(b)
-	}
+	maxLen := max(len(b), len(a))
 
-	for i := 0; i < maxLen; i++ {
+	for i := range maxLen {
 		var av, bv int
 		if i < len(a) {
 			av = a[i]
@@ -604,7 +854,9 @@ func downloadFile(ctx context.Context, url string, root *os.Root, name string, b
 	logging.DebugStepBootstrap(bootstrap, "upgrade download", "status=%s", resp.Status)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024))
-		return fmt.Errorf("download failed with status %d: %s", resp.StatusCode, string(body))
+		statusErr := newGitHubStatusError(resp.StatusCode, body, false)
+		logging.DebugStepBootstrap(bootstrap, "upgrade download", "response body=%q", statusErr.excerpt)
+		return fmt.Errorf("download failed with %w", statusErr)
 	}
 
 	out, err := root.Create(name)
@@ -630,8 +882,8 @@ func verifyChecksum(root *os.Root, checksumName, filename string, bootstrap *log
 	}
 
 	expected := ""
-	lines := bytes.Split(checksums, []byte("\n"))
-	for _, line := range lines {
+	lines := bytes.SplitSeq(checksums, []byte("\n"))
+	for line := range lines {
 		if len(line) == 0 {
 			continue
 		}
@@ -936,11 +1188,11 @@ func upgradeFooterBody(upgradeErr error, version, configPath, baseDir, telegramC
 	fmt.Println()
 
 	fmt.Println("Commands:")
-	fmt.Println("  proxsave (alias: proxmox-backup) - Open the interactive dashboard (runs the backup directly when non-interactive, e.g. cron)")
+	fmt.Println("  proxsave           - Open the interactive dashboard (runs the backup directly when non-interactive, e.g. cron)")
 	fmt.Println("  --backup           - Run a backup now (what bare proxsave does when non-interactive)")
 	fmt.Println("  --upgrade          - Update proxsave binary to latest release (also adds missing keys to backup.env)")
 	fmt.Println("  --install          - Re-run interactive installation/setup")
-	fmt.Println("  --new-install      - Wipe installation directory (keep build/env/identity) then run installer")
+	fmt.Println("  --new-install      - Wipe installation directory (keep build/daemon_state/env/guards/identity/restore) then run installer")
 	fmt.Println("  --upgrade-config   - Upgrade configuration file using the embedded template (run after installing a new binary)")
 	fmt.Println()
 
@@ -996,12 +1248,22 @@ var whatsnewAfterUpgradeInteractive = isTerminalInteractive
 
 // shouldRunWhatsnewAfterUpgrade decides whether to open Screen 0 at the end of an upgrade.
 // It requires an interactive terminal AND that the operator did NOT request auto-yes
-// (`--upgrade y`). Auto-yes signals non-interactive intent even when a pty IS allocated
-// (ssh -tt, Ansible with a pty, `script -c`), where isTerminalInteractive() alone is true;
-// opening a screen that waits for a human keypress there would stall the process until the
-// Screen 0 timeout on an otherwise successful automated upgrade, so auto-yes must skip it.
-func shouldRunWhatsnewAfterUpgrade(args *cli.Args) bool {
-	if args == nil || args.UpgradeAutoYes {
+// (`--upgrade y`), and the dashboard defers the screen because its replacement process owns
+// post-upgrade presentation.
+//
+// The auto-yes arm was removed in 0.35.0 on the reading that the flag "controls only the
+// initial confirmation", and the terminal check alone would then decide. It does not: a pty
+// is routinely allocated where no human is watching - `ssh -tt`, Ansible with a pty,
+// `script -c` - so isTerminalInteractive() is true there and the child opened by
+// runWhatsnewAfterUpgrade waits for a keypress until whatsnewScreenTimeout, which is 10
+// minutes. That is 10 minutes added to every SUCCESSFUL automated upgrade, at the end, after
+// the binary is already in place. Auto-yes is the operator saying nobody will answer
+// prompts; it has to mean that for this prompt too.
+//
+// Cost, accepted: someone who types `--upgrade y` at a real terminal no longer gets the notes
+// opened for them. `proxsave --show-whatsnew` renders them on demand.
+func shouldRunWhatsnewAfterUpgrade(args *cli.Args, opts upgradeRunOptions) bool {
+	if args == nil || opts.deferWhatsnew || args.UpgradeAutoYes {
 		return false
 	}
 	return whatsnewAfterUpgradeInteractive()
@@ -1012,11 +1274,11 @@ func shouldRunWhatsnewAfterUpgrade(args *cli.Args) bool {
 // upgrade. It MUST be the installed binary that renders it: the notes registry is compiled
 // into each binary, so on the download path -- where THIS process is still the OLD binary --
 // only execPath knows the new release's notes. Stdio is inherited so the child paints the
-// TUI on the real terminal. Gated by shouldRunWhatsnewAfterUpgrade (interactive AND not
-// auto-yes) so an automated upgrade never blocks, and best-effort so a render failure never
-// changes the upgrade's exit code.
-func runWhatsnewAfterUpgrade(ctx context.Context, execPath string, args *cli.Args, bootstrap *logging.BootstrapLogger) {
-	if !shouldRunWhatsnewAfterUpgrade(args) {
+// TUI on the real terminal. Gated by shouldRunWhatsnewAfterUpgrade so a no-TTY automated
+// upgrade never blocks and the dashboard can defer presentation; best-effort so a render
+// failure never changes the upgrade's exit code.
+func runWhatsnewAfterUpgrade(ctx context.Context, execPath string, args *cli.Args, bootstrap *logging.BootstrapLogger, opts upgradeRunOptions) {
+	if !shouldRunWhatsnewAfterUpgrade(args, opts) {
 		return
 	}
 	execPath = strings.TrimSpace(execPath)

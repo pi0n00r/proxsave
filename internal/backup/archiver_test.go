@@ -22,7 +22,11 @@ import (
 
 func TestNewArchiver(t *testing.T) {
 	logger := logging.New(types.LogLevelInfo, false)
-	config := GetDefaultArchiverConfig()
+	config := &ArchiverConfig{
+		Compression:      types.CompressionXZ,
+		CompressionLevel: 6,
+		CompressionMode:  "standard",
+	}
 
 	archiver := NewArchiver(logger, config)
 
@@ -32,18 +36,6 @@ func TestNewArchiver(t *testing.T) {
 
 	if archiver.EffectiveCompression() != types.CompressionXZ {
 		t.Errorf("Expected compression XZ, got %s", archiver.EffectiveCompression())
-	}
-}
-
-func TestGetDefaultArchiverConfig(t *testing.T) {
-	config := GetDefaultArchiverConfig()
-
-	if config.Compression != types.CompressionXZ {
-		t.Errorf("Expected default compression XZ, got %s", config.Compression)
-	}
-
-	if config.CompressionLevel != 6 {
-		t.Errorf("Expected default compression level 6, got %d", config.CompressionLevel)
 	}
 }
 
@@ -637,7 +629,7 @@ func TestContextCancellation(t *testing.T) {
 	if err := os.MkdirAll(testDir, 0755); err != nil {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if err := os.WriteFile(filepath.Join(testDir, fmt.Sprintf("file%d.txt", i)), []byte("test content"), 0644); err != nil {
 			t.Fatalf("WriteFile failed: %v", err)
 		}

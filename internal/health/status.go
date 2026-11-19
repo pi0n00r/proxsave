@@ -4,12 +4,12 @@
 // section to report REAL transmission (heartbeat / backup outcome) instead of a
 // cosmetic "active" derived from a secret merely being present on disk.
 //
-// The write is an atomic read-modify-write cloned from
-// internal/orchestrator/temp_registry.go (MarshalIndent -> WriteFile ".tmp" 0o600
-// -> Rename) so a reader never observes a torn file, and it deliberately does NOT
-// reuse identity.PersistNotifySecret (that path sets the immutable +i attribute,
-// which would block every rewrite). This file stays logging-free and stdlib-only
-// so both the daemon and the orchestrator can import it without a logger.
+// Writes marshal into a unique private sibling confined beneath the daemon_state
+// directory, then rename it over the destination so a reader never observes a torn
+// file. They deliberately do NOT reuse identity.PersistNotifySecret (that path sets
+// the immutable +i attribute, which would block every rewrite). This file stays
+// logging-free and stdlib-only so both the daemon and the orchestrator can import it
+// without a logger.
 
 package health
 
@@ -20,9 +20,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 )
 
-// Ping kind constants. These are the values RecordPing accepts for the kind
+// Ping kind constants. These are the values RecordOutcomePing accepts for the kind
 // argument and they match the daemon's own ping labels so the two sides agree
 // without a second mapping table. KindRunStarted/Finished/Hang mirror the
 // reporter labels ("start"/"finish"/"hang"); KindHeartbeat names the liveness
@@ -153,12 +154,12 @@ type UpdateRecord struct {
 	Latest    string     `json:"latest,omitempty"`
 }
 
-// StatusPath returns the shared status-file path under the identity directory,
-// which both the daemon process and the run process already agree on (same
-// convention as identity.NotifySecretPath). Kept a plain Join with no TrimSpace
-// so the daemon and the section always resolve the byte-identical path.
+// StatusPath returns the shared status-file path under the daemon_state directory,
+// which both the daemon process and the run process agree on. Kept a plain Join
+// with no TrimSpace so the daemon and the section always resolve the
+// byte-identical path.
 func StatusPath(baseDir string) string {
-	return filepath.Join(baseDir, "identity", ".healthcheck_status.json")
+	return filepath.Join(DaemonStateDir(baseDir), ".healthcheck_status.json")
 }
 
 // LoadStatus reads the status file tolerantly. A missing OR empty file is a
@@ -226,22 +227,14 @@ func loadStatusForWrite(baseDir string) (Status, error) {
 	return st, err
 }
 
-// RecordPing performs an atomic read-modify-write of the status file: it loads
-// the current Status, replaces the record for kind with the given outcome, sets
-// the mode, and writes the result back atomically. ts is the unix SECONDS of the
-// attempt; ok is whether it transmitted; pingErr is the (already redacted) error
-// on failure. An unknown kind is a programming error and is returned WITHOUT
-// touching the file, never silently dropped.
-func RecordPing(baseDir, mode, kind string, ts int64, ok bool, pingErr error) error {
-	return RecordOutcomePing(baseDir, mode, kind, ts, ok, false, pingErr)
-}
-
-// RecordOutcomePing is RecordPing with the /1-vs-/0 outcome SIGNAL: failed sets PingRecord.Down
+// RecordOutcomePing performs an atomic read-modify-write of the status file: it loads the
+// current Status, replaces the record for kind with the given outcome, sets the mode, and writes
+// the result back atomically. failed is the /1-vs-/0 outcome SIGNAL and sets PingRecord.Down
 // (the backup finish/hang kinds pass failed = exit!=0 / hang so the local sensor renders red for
-// a failed backup, F09-02). RecordPing is the failed==false shorthand for the kinds that have no
-// outcome (heartbeat/start). ts is the unix SECONDS of the attempt; ok is whether it transmitted;
-// pingErr is the (already redacted) error on failure. An unknown/empty kind is a caller bug and is
-// returned WITHOUT touching the file.
+// a failed backup, F09-02); the kinds that have no outcome (heartbeat/start) pass false. ts is
+// the unix SECONDS of the attempt; ok is whether it transmitted; pingErr is the (already
+// redacted) error on failure. An unknown/empty kind is a caller bug and is returned WITHOUT
+// touching the file.
 func RecordOutcomePing(baseDir, mode, kind string, ts int64, ok, failed bool, pingErr error) error {
 	// Reject an empty kind (a caller bug) before the write so it cannot leave the file
 	// mutated (mode changed) without a record. Any non-empty kind is now valid: the map
@@ -276,11 +269,11 @@ func RecordOutcomePing(baseDir, mode, kind string, ts int64, ok, failed bool, pi
 }
 
 // RecordUpdate persists the outcome of one update check + its report ping, atomically,
-// next to RecordPing and sharing LoadStatus/writeStatus. ts is the unix SECONDS of the
+// next to RecordOutcomePing and sharing LoadStatus/writeStatus. ts is the unix SECONDS of the
 // attempt; available is whether a newer release was found (the /0-vs-/1 signal); latest
 // is the newest version string (for display); ok is whether the report ping transmitted;
 // pingErr is the (already redacted) error on failure. A "no updates url resolved" error is
-// stored as the distinct ReasonNoURL code (like RecordPing), never a raw string, so the
+// stored as the distinct ReasonNoURL code (like RecordOutcomePing), never a raw string, so the
 // section renders "not provisioned yet" instead of a transmit failure.
 func RecordUpdate(baseDir, mode string, ts int64, available bool, latest string, ok bool, pingErr error) error {
 	rec := &UpdateRecord{
@@ -307,11 +300,11 @@ func RecordUpdate(baseDir, mode string, ts int64, available bool, latest string,
 }
 
 // RecordNotifyPing persists one per-notification-channel ping outcome into Records[kind]
-// (kind = "notify-<ch>"), atomically, next to RecordPing and sharing LoadStatus/writeStatus.
-// down is the /1 SIGNAL (the channel's send failed/degraded, so the monitor check goes DOWN);
-// ok is whether the ping transmitted. A no-url error is stored as the distinct ReasonNoURL
-// code. It is a separate writer from RecordPing so the fixed-kind callers keep their signature
-// and only the notify path carries Down.
+// (kind = "notify-<ch>"), atomically, next to RecordOutcomePing and sharing
+// LoadStatus/writeStatus. down is the /1 SIGNAL (the channel's send failed/degraded, so the
+// monitor check goes DOWN); ok is whether the ping transmitted. A no-url error is stored as the
+// distinct ReasonNoURL code. It is a separate writer from RecordOutcomePing so the fixed-kind
+// callers keep their signature.
 func RecordNotifyPing(baseDir, mode, kind string, ts int64, ok, down bool, pingErr error) error {
 	if kind == "" {
 		return fmt.Errorf("healthcheck status: empty notify kind")
@@ -368,29 +361,61 @@ func writeStatus(baseDir string, st Status) error {
 	return writeJSONAtomic(StatusPath(baseDir), st)
 }
 
-// writeJSONAtomic writes v as indented JSON to path atomically, byte-for-byte the same
-// idiom as temp_registry.saveEntries: MkdirAll(dir, 0o750) so the parent dir exists,
-// MarshalIndent for a human-readable file, WriteFile to a ".tmp" sibling at 0o600, then
-// Rename over the final path so a concurrent reader sees either the old or the new file,
-// never a partial one. Shared by the status file and the per-run notify-results file, both
-// of which live in the identity dir and must NOT set the immutable +i attribute (which
-// would block every rewrite).
+var atomicJSONTempSequence atomic.Uint64
+
+// writeJSONAtomic writes v as indented JSON to path atomically. The parent is created
+// root-only (DaemonStateDirPerm) when missing. Every operation after
+// creating the parent is relative to an os.Root opened on that directory, so neither a
+// temporary-file symlink nor a concurrent directory rename can redirect the write outside
+// it. A process-local sequence and O_EXCL give concurrent writers separate temporary files;
+// Rename exposes only a complete file to readers. The shared health files must not set the
+// immutable +i attribute because that would block every rewrite.
 func writeJSONAtomic(path string, v any) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := os.MkdirAll(dir, DaemonStateDirPerm); err != nil {
 		return fmt.Errorf("create dir %s: %w", dir, err)
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("open dir %s: %w", dir, err)
+	}
+	defer func() { _ = root.Close() }()
+
+	name := filepath.Base(path)
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshal %s: %w", filepath.Base(path), err)
+		return fmt.Errorf("marshal %s: %w", name, err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", filepath.Base(path), err)
+
+	// Remove the fixed-name temporary file used by older builds. Root.Remove removes a
+	// symlink itself rather than its target, making upgrades safe even if that entry was
+	// replaced before this version starts.
+	if err := root.Remove(name + ".tmp"); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale temporary file for %s: %w", name, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp) // best-effort cleanup so a failed rename leaves no stray ".tmp"
-		return fmt.Errorf("rename %s: %w", filepath.Base(path), err)
+
+	tmpName := fmt.Sprintf("%s.tmp.%d.%d", name, os.Getpid(), atomicJSONTempSequence.Add(1))
+	f, err := root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create temporary file for %s: %w", name, err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = root.Remove(tmpName)
+		return fmt.Errorf("chmod %s: %w", name, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = root.Remove(tmpName)
+		return fmt.Errorf("write %s: %w", name, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = root.Remove(tmpName)
+		return fmt.Errorf("close %s: %w", name, err)
+	}
+	if err := root.Rename(tmpName, name); err != nil {
+		_ = root.Remove(tmpName)
+		return fmt.Errorf("rename %s: %w", name, err)
 	}
 	return nil
 }

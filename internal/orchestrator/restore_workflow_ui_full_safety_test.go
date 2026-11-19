@@ -24,7 +24,6 @@ func TestFullRestoreFallbackKeepsSafetyInvariants(t *testing.T) {
 	origRestoreFS := restoreFS
 	origRestoreCmd := restoreCmd
 	origRestoreSystem := restoreSystem
-	origCompatFS := compatFS
 	origPrepare := prepareRestoreBundleFunc
 	origAnalyze := analyzeRestoreArchiveFunc
 	origSafetyFS := safetyFS
@@ -32,7 +31,6 @@ func TestFullRestoreFallbackKeepsSafetyInvariants(t *testing.T) {
 		restoreFS = origRestoreFS
 		restoreCmd = origRestoreCmd
 		restoreSystem = origRestoreSystem
-		compatFS = origCompatFS
 		prepareRestoreBundleFunc = origPrepare
 		analyzeRestoreArchiveFunc = origAnalyze
 		safetyFS = origSafetyFS
@@ -41,7 +39,6 @@ func TestFullRestoreFallbackKeepsSafetyInvariants(t *testing.T) {
 	fakeFS := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(fakeFS.Root) })
 	restoreFS = fakeFS
-	compatFS = fakeFS
 	safetyFS = fakeFS
 	restoreCmd = runOnlyRunner{}
 	restoreSystem = fakeSystemDetector{systemType: SystemTypePBS}
@@ -84,7 +81,7 @@ func TestFullRestoreFallbackKeepsSafetyInvariants(t *testing.T) {
 	// systemctl is unavailable in the test environment.
 	ui := &fakeRestoreWorkflowUI{confirmRestore: true, confirmCompatible: true, continuePBSServices: true}
 
-	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui); err != nil {
+	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, ""); err != nil {
 		t.Fatalf("runRestoreWorkflowWithUI error: %v", err)
 	}
 
@@ -104,8 +101,8 @@ func TestFullRestoreFallbackKeepsSafetyInvariants(t *testing.T) {
 	}
 
 	// A safety backup must exist: createSafetyBackup writes restore_backup_*.tar.gz
-	// under /tmp/proxsave via safetyFS.
-	entries, err := fakeFS.ReadDir("/tmp/proxsave")
+	// into the restore's own directory (RestoreRunDir) via safetyFS.
+	entries, err := fakeFS.ReadDir(RestoreRunDir())
 	if err != nil {
 		t.Fatalf("no safety backup directory was created: %v", err)
 	}
@@ -133,7 +130,6 @@ func TestFullRestoreFallbackNeverWritesClusterDB(t *testing.T) {
 	origRestoreFS := restoreFS
 	origRestoreCmd := restoreCmd
 	origRestoreSystem := restoreSystem
-	origCompatFS := compatFS
 	origPrepare := prepareRestoreBundleFunc
 	origAnalyze := analyzeRestoreArchiveFunc
 	origSafetyFS := safetyFS
@@ -141,7 +137,6 @@ func TestFullRestoreFallbackNeverWritesClusterDB(t *testing.T) {
 		restoreFS = origRestoreFS
 		restoreCmd = origRestoreCmd
 		restoreSystem = origRestoreSystem
-		compatFS = origCompatFS
 		prepareRestoreBundleFunc = origPrepare
 		analyzeRestoreArchiveFunc = origAnalyze
 		safetyFS = origSafetyFS
@@ -150,7 +145,6 @@ func TestFullRestoreFallbackNeverWritesClusterDB(t *testing.T) {
 	fakeFS := NewFakeFS()
 	t.Cleanup(func() { _ = os.RemoveAll(fakeFS.Root) })
 	restoreFS = fakeFS
-	compatFS = fakeFS
 	safetyFS = fakeFS
 	restoreCmd = runOnlyRunner{}
 	restoreSystem = fakeSystemDetector{systemType: SystemTypePVE}
@@ -190,7 +184,7 @@ func TestFullRestoreFallbackNeverWritesClusterDB(t *testing.T) {
 	cfg := &config.Config{BaseDir: "/base"}
 	ui := &fakeRestoreWorkflowUI{confirmRestore: true, confirmCompatible: true, continuePBSServices: true}
 
-	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui); err != nil {
+	if err := runRestoreWorkflowWithUI(context.Background(), cfg, logger, "vtest", ui, ""); err != nil {
 		t.Fatalf("runRestoreWorkflowWithUI error: %v", err)
 	}
 
@@ -205,5 +199,12 @@ func TestFullRestoreFallbackNeverWritesClusterDB(t *testing.T) {
 	}
 	if strings.TrimSpace(string(live)) != "live-cluster-db" {
 		t.Fatalf("fallback overwrote the live cluster database under a running pmxcfs: %q", string(live))
+	}
+}
+
+// An empty destination root resolves category paths under /.
+func TestResolveCategoryPathDefaultsAnEmptyDestRoot(t *testing.T) {
+	if got := resolveCategoryPath("./etc/fstab", ""); got != "/etc/fstab" {
+		t.Fatalf("resolveCategoryPath() = %q, want %q", got, "/etc/fstab")
 	}
 }

@@ -13,11 +13,12 @@ import (
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/orchestrator"
 	"github.com/tis24dev/proxsave/internal/types"
+	"github.com/tis24dev/proxsave/internal/whatsnew"
 )
 
 // stubWhatsnewShouldWarn saves and restores the whatsnewShouldWarn seam so a test can
 // drive the gate verdict without real disk or a GitHub fetch, and leak nothing.
-func stubWhatsnewShouldWarn(t *testing.T, fn func(baseDir, current string) (bool, string, error)) {
+func stubWhatsnewShouldWarn(t *testing.T, fn func(loc whatsnew.Location, current string) (bool, string, error)) {
 	t.Helper()
 	orig := whatsnewShouldWarn
 	t.Cleanup(func() { whatsnewShouldWarn = orig })
@@ -62,12 +63,12 @@ const lockedWarnCopy = "ProxSave 0.30.0 has unseen release notes. Open proxsave 
 // TestMaybeWarnWhatsnewUnseen: an unseen verdict emits EXACTLY ONE WARNING (the locked
 // copy) and the buffer carries it, bracketed by DEBUG lines.
 func TestMaybeWarnWhatsnewUnseen(t *testing.T) {
-	stubWhatsnewShouldWarn(t, func(baseDir, current string) (bool, string, error) {
+	stubWhatsnewShouldWarn(t, func(loc whatsnew.Location, current string) (bool, string, error) {
 		return true, "0.30.0", nil
 	})
 	logger, buf := captureLogger(t)
 
-	maybeWarnWhatsnew(logger, "/base", "0.30.0", false)
+	maybeWarnWhatsnew(logger, testWhatsnewLoc("/base"), "0.30.0", false)
 
 	if got := logger.WarningCount(); got != 1 {
 		t.Fatalf("WarningCount = %d, want 1", got)
@@ -82,12 +83,12 @@ func TestMaybeWarnWhatsnewUnseen(t *testing.T) {
 
 // TestMaybeWarnWhatsnewSeen: a seen verdict emits no WARNING and a bare-fact DEBUG line.
 func TestMaybeWarnWhatsnewSeen(t *testing.T) {
-	stubWhatsnewShouldWarn(t, func(baseDir, current string) (bool, string, error) {
+	stubWhatsnewShouldWarn(t, func(loc whatsnew.Location, current string) (bool, string, error) {
 		return false, "", nil
 	})
 	logger, buf := captureLogger(t)
 
-	maybeWarnWhatsnew(logger, "/base", "0.30.0", false)
+	maybeWarnWhatsnew(logger, testWhatsnewLoc("/base"), "0.30.0", false)
 
 	if got := logger.WarningCount(); got != 0 {
 		t.Fatalf("WarningCount = %d, want 0", got)
@@ -103,12 +104,12 @@ func TestMaybeWarnWhatsnewSeen(t *testing.T) {
 // TestMaybeWarnWhatsnewGateError: a gate error fails toward silence (no WARNING) and emits
 // a bare-fact DEBUG skip line carrying the error.
 func TestMaybeWarnWhatsnewGateError(t *testing.T) {
-	stubWhatsnewShouldWarn(t, func(baseDir, current string) (bool, string, error) {
+	stubWhatsnewShouldWarn(t, func(loc whatsnew.Location, current string) (bool, string, error) {
 		return false, "", errors.New("boom")
 	})
 	logger, buf := captureLogger(t)
 
-	maybeWarnWhatsnew(logger, "/base", "0.30.0", false)
+	maybeWarnWhatsnew(logger, testWhatsnewLoc("/base"), "0.30.0", false)
 
 	if got := logger.WarningCount(); got != 0 {
 		t.Fatalf("WarningCount = %d, want 0 (fail toward silence)", got)
@@ -124,12 +125,12 @@ func TestMaybeWarnWhatsnewGateError(t *testing.T) {
 // TestMaybeWarnWhatsnewCopy: the emitted WARNING equals the locked single line with the
 // normalized version and is pure ASCII (no em dash U+2014, no en dash U+2013, no emoji).
 func TestMaybeWarnWhatsnewCopy(t *testing.T) {
-	stubWhatsnewShouldWarn(t, func(baseDir, current string) (bool, string, error) {
+	stubWhatsnewShouldWarn(t, func(loc whatsnew.Location, current string) (bool, string, error) {
 		return true, "0.30.0", nil
 	})
 	logger, _ := captureLogger(t)
 
-	maybeWarnWhatsnew(logger, "/base", "0.30.0", false)
+	maybeWarnWhatsnew(logger, testWhatsnewLoc("/base"), "0.30.0", false)
 
 	got := singleEmittedWarning(t, logger)
 	if got != lockedWarnCopy {
@@ -142,11 +143,11 @@ func TestMaybeWarnWhatsnewCopy(t *testing.T) {
 
 // TestMaybeWarnWhatsnewNilLogger: a nil logger is a no-op and must not panic.
 func TestMaybeWarnWhatsnewNilLogger(t *testing.T) {
-	stubWhatsnewShouldWarn(t, func(baseDir, current string) (bool, string, error) {
+	stubWhatsnewShouldWarn(t, func(loc whatsnew.Location, current string) (bool, string, error) {
 		return true, "0.30.0", nil
 	})
 	// Must not panic.
-	maybeWarnWhatsnew(nil, "/base", "0.30.0", false)
+	maybeWarnWhatsnew(nil, testWhatsnewLoc("/base"), "0.30.0", false)
 }
 
 // TestMaybeWarnWhatsnewDeliveredToEmailCategories exercises the REAL gate (no stub) and the
@@ -164,7 +165,7 @@ func TestMaybeWarnWhatsnewDeliveredToEmailCategories(t *testing.T) {
 		t.Fatalf("OpenLogFile: %v", err)
 	}
 
-	maybeWarnWhatsnew(logger, base, "v0.30.0", false) // real ShouldWarn; v-prefix exercises the v-strip
+	maybeWarnWhatsnew(logger, testWhatsnewLoc(base), "v0.30.0", false) // real ShouldWarn; v-prefix exercises the v-strip
 
 	if err := logger.CloseLogFile(); err != nil {
 		t.Fatalf("CloseLogFile: %v", err)
@@ -195,9 +196,20 @@ func TestMaybeWarnWhatsnewDeliveredToEmailCategories(t *testing.T) {
 	}
 }
 
-// TestWhatsnewWarnWiredInBootstrap is a STRUCTURAL (AST) guard for the single wiring line. The
-// behavioral call lives inside bootstrapRuntime, which cannot be unit-invoked cheaply (it runs
-// a real GitHub update probe and a full config load). Parsing the AST -- not scanning text --
+// TestWhatsnewWarnWiredInBootstrap is a STRUCTURAL (AST) guard for the single wiring line.
+//
+// The claim that follows, that bootstrapRuntime cannot be unit-invoked cheaply, has since been
+// measured and is wrong: TestBootstrapRuntimeNamesEveryRunItHandsBack in
+// run_hostname_wiring_test.go calls it in under a tenth of a second, because an empty
+// toolVersion makes checkForUpdates return before any HTTP and makes whatsnew treat the build
+// as a dev build, which is also why that test cannot be extended to cover this wiring: it
+// deliberately switches the probe off. The paragraph is left standing as written so the next
+// person can see which assumption was retested and which was not.
+//
+// This guard shares the reachability blind spot documented on callIsTopLevelStatement: an early
+// return placed above maybeWarnWhatsnew leaves this green. A return above initializeRunLogFile
+// is caught behaviourally, since that call sits higher, but one placed BETWEEN the two is not
+// caught by anything. Parsing the AST -- not scanning text --
 // pins that maybeWarnWhatsnew is an UNCONDITIONAL top-level statement of bootstrapRuntime,
 // AFTER the checkForUpdates assignment. This catches what a substring scan cannot: a
 // commented-out call (not an AST node), a call wrapped in an if/branch (not a direct body
@@ -263,5 +275,18 @@ func TestWhatsnewWarnWiredInBootstrap(t *testing.T) {
 	}
 	if idxWarn <= idxUpd {
 		t.Fatal("maybeWarnWhatsnew must be a direct statement AFTER checkForUpdates in bootstrapRuntime")
+	}
+
+	// Reachability, the half the index checks above are blind to. Being a top-level
+	// statement at a later index says nothing about whether control gets there: a
+	// return inserted anywhere above this call, including in the window between
+	// initializeRunLogFile and here, leaves everything above green while the call is
+	// skipped. Shares callIsSkippedBeforeItRuns with the hostname guard in
+	// run_hostname_wiring_test.go rather than growing a second copy, because the
+	// question is identical and only the callee differs.
+	if reason := callIsSkippedBeforeItRuns(fn, "maybeWarnWhatsnew"); reason != "" {
+		t.Fatalf("bootstrapRuntime can finish a successful run without reaching maybeWarnWhatsnew: %s. "+
+			"NOTF-01 requires the nudge on every non-interactive run, and the same skipped span also drops "+
+			"applyRunPermissions and initializeRunProfiling", reason)
 	}
 }

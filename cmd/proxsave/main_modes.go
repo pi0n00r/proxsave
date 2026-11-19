@@ -2,12 +2,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/tis24dev/proxsave/internal/cli"
+	"github.com/tis24dev/proxsave/internal/installer"
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/orchestrator"
 	"github.com/tis24dev/proxsave/internal/types"
@@ -17,18 +21,20 @@ import (
 // seedWhatsnewOnInstallSuccess seeds last_seen = version.String() at an
 // install-success boundary so a brand-new install never shows Screen 0 on its first
 // bare interactive launch (STATE-03). It is best-effort: it resolves the base via
-// detectedBaseDirOrFallback -- the SAME resolver the dashboard hook reads, so the
-// write-path can never diverge from the read-path (open question A1) -- seeds only a
-// non-empty base, and ignores any error so a seed failure never changes the install
-// exit code. version.String() is used (not the discarded install version param):
-// both yield the same value and version.String() is already normalized (strips a
-// leading v, applies the 0.0.0-dev fallback), avoiding a raw/empty seed (Pitfall 4).
-func seedWhatsnewOnInstallSuccess() {
+// detectedBaseDirOrFallback and LOG_PATH from the configuration the install just wrote
+// (configPath) -- the SAME resolvers the dashboard hook reads, so the write-path can
+// never diverge from the read-path (open question A1) -- seeds only a non-empty base,
+// writes nothing when that configuration cannot be read (LOG_PATH unknown), and ignores
+// any error so a seed failure never changes the install exit code. version.String() is
+// used (not the discarded install version param): both yield the same value and
+// version.String() is already normalized (strips a leading v, applies the 0.0.0-dev
+// fallback), avoiding a raw/empty seed (Pitfall 4).
+func seedWhatsnewOnInstallSuccess(configPath string) {
 	baseDir, _ := detectedBaseDirOrFallback()
 	if strings.TrimSpace(baseDir) == "" {
 		return
 	}
-	_ = whatsnewSaveSeen(baseDir, version.String())
+	_ = whatsnewSaveSeen(whatsnewLocation(configPath, baseDir), version.String())
 }
 
 type incompatibleMode struct {
@@ -44,6 +50,19 @@ func validateModeCompatibility(args *cli.Args) []string {
 	if args == nil {
 		return []string{"command-line arguments are required"}
 	}
+	// A word that is not a flag ends flag parsing, so the flags after it were never
+	// read: `--backup extra --dry-run` would back up for real, and a lone `help` would
+	// start the default backup. The rules below judge only the flags that were read,
+	// so their verdict means nothing here, and this line is the only one printed.
+	if len(args.UnexpectedArgs) > 0 {
+		return []string{fmt.Sprintf("Unexpected argument %q: only flags are accepted. Nothing was run.", args.UnexpectedArgs[0])}
+	}
+	// An unknown --log-level used to become INFO, overriding DEBUG_LEVEL, so `-l DEBUG`
+	// logged less than the configuration asked for. Like the word above, it is a value
+	// that was not understood, so it is refused alone.
+	if args.InvalidLogLevel != "" {
+		return []string{fmt.Sprintf("Unknown log level %q: use debug, info, warning, error or critical. Nothing was run.", args.InvalidLogLevel)}
+	}
 
 	var allMessages []string
 	for _, rule := range []modeCompatibilityRule{
@@ -51,13 +70,56 @@ func validateModeCompatibility(args *cli.Args) []string {
 		validateSupportCompatibility,
 		validateInstallCompatibility,
 		validateUpgradeCompatibility,
+		validateRestoreCompatibility,
+		validateDryRunCompatibility,
 		validateDaemonCompatibility,
 	} {
 		if messages := rule(args); len(messages) > 0 {
 			allMessages = append(allMessages, messages...)
 		}
 	}
+	if len(allMessages) == 0 {
+		allMessages = validateSingleMode(args)
+	}
 	return allMessages
+}
+
+// validateSingleMode refuses two operation modes in one run. Without it the pairs the
+// rules above do not name were settled by dispatch order: the first mode to handle the
+// run won and the other was never read, with no line on the console, so
+// `--backup --show-whatsnew` from cron ran no backup and exited 0. It runs only when
+// no rule above refused, so each conflict is explained by one line.
+func validateSingleMode(args *cli.Args) []string {
+	modes := enabledModes(operationModes(args))
+	if len(modes) < 2 {
+		return nil
+	}
+	return []string{fmt.Sprintf("%s cannot be combined with: %s", modes[0], strings.Join(modes[1:], ", "))}
+}
+
+// operationModes lists every flag that selects what the run does. Modifiers
+// (--dry-run, --cli, --localfile, --support, --config, --log-level and the
+// --upgrade-finalize-* values) are not in it: they change how a mode runs.
+func operationModes(args *cli.Args) []incompatibleMode {
+	return []incompatibleMode{
+		{enabled: args.Backup, label: "--backup"},
+		{enabled: args.Restore, label: "--restore"},
+		{enabled: args.Decrypt, label: "--decrypt"},
+		{enabled: args.Install, label: "--install"},
+		{enabled: args.NewInstall, label: "--new-install"},
+		{enabled: args.Upgrade, label: "--upgrade"},
+		{enabled: args.ForceNewKey, label: "--newkey"},
+		{enabled: args.UpgradeConfig, label: "--upgrade-config"},
+		{enabled: args.UpgradeConfigDry, label: "--upgrade-config-dry-run"},
+		{enabled: args.UpgradeConfigJSON, label: "--upgrade-config-json"},
+		{enabled: args.ShowWhatsnew, label: "--show-whatsnew"},
+		{enabled: args.UpgradeFinalize, label: "--upgrade-finalize"},
+		{enabled: args.CleanupGuards, label: "--cleanup-guards"},
+		{enabled: args.Daemon, label: "--daemon"},
+		{enabled: args.DaemonSetup, label: "--daemon-setup"},
+		{enabled: args.DaemonRemove, label: "--daemon-remove"},
+		{enabled: args.DaemonStatus, label: "--daemon-status"},
+	}
 }
 
 func validateCleanupGuardsCompatibility(args *cli.Args) []string {
@@ -96,7 +158,69 @@ func validateUpgradeCompatibility(args *cli.Args) []string {
 	if args.LocalFile && !args.Upgrade {
 		return []string{"The --localfile flag only applies to --upgrade (use: --upgrade --localfile)."}
 	}
+	// Neither the upgrade nor its finalize phase has ever honoured --dry-run: not one
+	// line of cmd/proxsave/upgrade.go reads args.DryRun, so the combination merges the
+	// configuration, refreshes the support docs and symlinks, repoints legacy cron
+	// entries, may install or restart the resident daemon, and normalizes permissions
+	// on a live installation - while the operator was told nothing would change.
+	//
+	// This refuses the combination rather than implementing a dry run of it. A truthful
+	// dry run would have to model every one of those effects, and a partial one is worse
+	// than none: it teaches the operator that the flag is honoured here. The refusal
+	// mirrors the one --daemon already carries below.
+	//
+	// It closes a gap that PREDATES --upgrade-finalize (`--upgrade --dry-run` has always
+	// silently mutated), so it turns an invocation that used to be accepted into an
+	// error. That is the point: it used to lie.
+	if args.DryRun && (args.Upgrade || args.UpgradeFinalize) {
+		return []string{"--dry-run is not supported with --upgrade: the upgrade and its finalize phase always modify the installation."}
+	}
 	return nil
+}
+
+func validateRestoreCompatibility(args *cli.Args) []string {
+	// A restore cannot run without modifying the system. Under --dry-run it still
+	// stopped the PVE and PBS services, unmounted /etc/pve in RECOVERY, extracted the
+	// direct-write categories (config.db, corosync, ssh, ...) over the live files and
+	// wrote a safety backup; only the staged applies, the fstab merge and a few later
+	// steps read the flag. The operator was told nothing would change and got a host in
+	// a state nobody asked for.
+	//
+	// This refuses the combination rather than completing a dry run of it, for the
+	// reason given for --upgrade above: a partial dry run is worse than none. It turns
+	// an invocation that used to be accepted into an error, and DRY_RUN=true in the
+	// configuration, known only once it is loaded, is refused at the restore dispatch
+	// (dispatchRestoreMode) with the same exit code.
+	if args.DryRun && args.Restore {
+		return []string{"--dry-run is not supported with --restore: a restore cannot run without modifying the system."}
+	}
+	return nil
+}
+
+// validateDryRunCompatibility refuses --dry-run with the modes that never read it, for
+// the reason given for --upgrade above. They returned before the runtime, where the
+// flag is honoured, and wrote for real: --newkey replaced the recipient, --new-install
+// deleted backup/, configs/ and log/, --upgrade-config-json rewrote backup.env.
+// --upgrade-config is not refused: with --dry-run it runs its existing preview
+// (runUpgradeConfigDryMode), which is what the flag asks for.
+func validateDryRunCompatibility(args *cli.Args) []string {
+	if !args.DryRun {
+		return nil
+	}
+	var messages []string
+	if args.Install || args.NewInstall {
+		messages = append(messages, "--dry-run is not supported with --install or --new-install: the installer always writes the installation.")
+	}
+	if args.ForceNewKey {
+		messages = append(messages, "--dry-run is not supported with --newkey: it always replaces the encryption recipient.")
+	}
+	if args.Decrypt {
+		messages = append(messages, "--dry-run is not supported with --decrypt: it always writes the decrypted archive.")
+	}
+	if args.UpgradeConfigJSON {
+		messages = append(messages, "--dry-run is not supported with --upgrade-config-json: use --upgrade-config-dry-run to preview the changes.")
+	}
+	return messages
 }
 
 func validateDaemonCompatibility(args *cli.Args) []string {
@@ -163,6 +287,9 @@ func supportIncompatibleModes(args *cli.Args) []string {
 		{enabled: args.NewInstall, label: "--new-install"},
 		{enabled: args.UpgradeConfig || args.UpgradeConfigDry || args.UpgradeConfigJSON, label: "--upgrade-config"},
 		{enabled: args.ForceNewKey, label: "--newkey"},
+		{enabled: args.Upgrade, label: "--upgrade"},
+		{enabled: args.UpgradeFinalize, label: "--upgrade-finalize"},
+		{enabled: args.ShowWhatsnew, label: "--show-whatsnew"},
 	})
 }
 
@@ -179,6 +306,7 @@ func enabledModes(modes []incompatibleMode) []string {
 func dispatchPreRuntimeModes(ctx context.Context, args *cli.Args, bootstrap *logging.BootstrapLogger, toolVersion string) (int, bool) {
 	for _, handler := range []preRuntimeModeHandler{
 		runShowWhatsnewMode,
+		runUpgradeFinalizeMode,
 		runUpgradeMode,
 		runNewKeyMode,
 		runDecryptOnlyMode,
@@ -211,7 +339,7 @@ func runCleanupGuardsMode(ctx context.Context, args *cli.Args, bootstrap *loggin
 	// uses, so one stub covers both front-ends in tests.
 	report, err := cleanupGuardsReport(ctx, logger, args.DryRun)
 	if err != nil {
-		bootstrap.Error("ERROR: %v", err)
+		bootstrap.Error("%v", err)
 		return types.ExitGenericError.Int(), true
 	}
 
@@ -227,6 +355,26 @@ func runUpgradeMode(ctx context.Context, args *cli.Args, bootstrap *logging.Boot
 	}
 	logging.DebugStepBootstrap(bootstrap, "main run", "mode=upgrade")
 	return runUpgrade(ctx, args, bootstrap), true
+}
+
+// runUpgradeFinalizeMode handles --upgrade-finalize: run only the post-install
+// finalize phase and exit.
+//
+// This is the mode --upgrade re-invokes on the freshly INSTALLED binary, so the
+// finalize policy that runs belongs to the release being installed rather than to
+// the one being replaced - which is why every change to that policy used to take
+// effect one upgrade late. It is not a user-facing entry point: run by hand it
+// would refresh docs, restart the daemon and print an upgrade footer for a version
+// nobody installed.
+//
+// Reached only after the caller verified and installed the binary, so upgradeErr is
+// nil by construction here.
+func runUpgradeFinalizeMode(ctx context.Context, args *cli.Args, bootstrap *logging.BootstrapLogger, _ string) (int, bool) {
+	if !args.UpgradeFinalize {
+		return types.ExitSuccess.Int(), false
+	}
+	logging.DebugStepBootstrap(bootstrap, "main run", "mode=upgrade-finalize")
+	return runUpgradeFinalize(ctx, args, bootstrap), true
 }
 
 // runShowWhatsnewMode handles --show-whatsnew: open Screen 0 (what's new) once and exit.
@@ -265,7 +413,7 @@ func runNewKeyMode(ctx context.Context, args *cli.Args, bootstrap *logging.Boots
 		if isInstallAbortedError(err) || errors.Is(err, orchestrator.ErrAgeRecipientSetupAborted) {
 			return types.ExitSuccess.Int(), true
 		}
-		bootstrap.Error("ERROR: %v", err)
+		bootstrap.Error("%v", err)
 		return types.ExitConfigError.Int(), true
 	}
 	return types.ExitSuccess.Int(), true
@@ -277,7 +425,7 @@ func runDecryptOnlyMode(ctx context.Context, args *cli.Args, bootstrap *logging.
 	}
 	decryptCLI := modeUseCLI(args)
 	logging.DebugStepBootstrap(bootstrap, "main run", "mode=decrypt cli=%v", decryptCLI)
-	if err := runDecryptWorkflowOnly(ctx, args.ConfigPath, bootstrap, toolVersion, decryptCLI); err != nil {
+	if err := runDecryptWorkflowOnly(ctx, args, bootstrap, toolVersion, decryptCLI); err != nil {
 		if errors.Is(err, orchestrator.ErrDecryptAborted) {
 			bootstrap.Info("Decrypt workflow aborted by user")
 			return types.ExitSuccess.Int(), true
@@ -289,7 +437,7 @@ func runDecryptOnlyMode(ctx context.Context, args *cli.Args, bootstrap *logging.
 			// (its CLI-execution lines are left untouched).
 			return types.ExitSuccess.Int(), true
 		}
-		bootstrap.Error("ERROR: %v", err)
+		bootstrap.Error("%v", err)
 		return types.ExitGenericError.Int(), true
 	}
 	bootstrap.Info("Decrypt workflow completed successfully")
@@ -312,13 +460,13 @@ func runNewInstallMode(ctx context.Context, args *cli.Args, bootstrap *logging.B
 		if isInstallAbortedError(err) {
 			return types.ExitSuccess.Int(), true
 		}
-		bootstrap.Error("ERROR: %v", err)
+		bootstrap.Error("%v", err)
 		return types.ExitConfigError.Int(), true
 	}
 	if sessionLogger != nil {
 		sessionLogger.Info("new-install completed successfully")
 	}
-	seedWhatsnewOnInstallSuccess()
+	seedWhatsnewOnInstallSuccess(args.ConfigPath)
 	return types.ExitSuccess.Int(), true
 }
 
@@ -334,6 +482,7 @@ func runInstallMode(ctx context.Context, args *cli.Args, bootstrap *logging.Boot
 		sessionLogger.Info("Starting --install (config=%s)", args.ConfigPath)
 	}
 
+	snapshot := takeInstallConfigSnapshot(args.ConfigPath)
 	var err error
 	if installCLI {
 		err = runInstall(ctx, args.ConfigPath, bootstrap)
@@ -344,16 +493,127 @@ func runInstallMode(ctx context.Context, args *cli.Args, bootstrap *logging.Boot
 	if err != nil {
 		logInstallModeError(sessionLogger, "install", err)
 		if isInstallAbortedError(err) {
-			return types.ExitSuccess.Int(), true
+			return finishAbortedInstall(snapshot, bootstrap), true
 		}
-		bootstrap.Error("ERROR: %v", err)
+		bootstrap.Error("%v", err)
 		return types.ExitConfigError.Int(), true
 	}
 	if sessionLogger != nil {
 		sessionLogger.Info("install completed successfully")
 	}
-	seedWhatsnewOnInstallSuccess()
+	seedWhatsnewOnInstallSuccess(args.ConfigPath)
 	return types.ExitSuccess.Int(), true
+}
+
+// finishAbortedInstall puts backup.env back after an install the operator aborted. A
+// restore that fails is reported and exits as a configuration error: backup.env may be
+// left as the install wrote it, with settings the aborted steps never completed.
+func finishAbortedInstall(snapshot *installConfigSnapshot, bootstrap *logging.BootstrapLogger) int {
+	if err := snapshot.restore(bootstrap); err != nil {
+		bootstrap.Error("%s not restored as it was before the install: %v", snapshot.path, err)
+		return types.ExitConfigError.Int()
+	}
+	return types.ExitSuccess.Int()
+}
+
+// installConfigSnapshot is backup.env as it was before --install. The wizard writes
+// the file before the steps that follow it (AGE recipient, healthchecks, Telegram,
+// scheduler), so an install the operator aborts after the write put it back: left in
+// place, an ENCRYPT_ARCHIVE=true with no recipient, or SCHEDULER_MODE=daemon with no
+// daemon installed, made every later run fail.
+type installConfigSnapshot struct {
+	path    string
+	existed bool
+	data    []byte
+	mode    os.FileMode
+}
+
+func takeInstallConfigSnapshot(configPath string) *installConfigSnapshot {
+	path, err := resolveInstallConfigPath(configPath)
+	if err != nil {
+		return nil
+	}
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &installConfigSnapshot{path: path}
+		}
+		return nil
+	}
+	defer func() { _ = root.Close() }()
+	info, err := root.Stat(filepath.Base(path))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &installConfigSnapshot{path: path}
+		}
+		return nil
+	}
+	data, err := root.ReadFile(filepath.Base(path))
+	if err != nil {
+		return nil
+	}
+	return &installConfigSnapshot{path: path, existed: true, data: data, mode: info.Mode().Perm()}
+}
+
+// restore puts backup.env back as the snapshot found it: removed when the install
+// created it, rewritten when the install changed it. The rewrite goes through a temp
+// file renamed over it, like the wizard's own write (installer.WriteConfigFileAtomic):
+// written in place, a failure partway left a truncated file and the original only in
+// memory. What could not be put back is returned.
+func (s *installConfigSnapshot) restore(bootstrap *logging.BootstrapLogger) error {
+	if s == nil {
+		return nil
+	}
+	debug := func(format string, args ...any) {
+		if bootstrap != nil {
+			bootstrap.Debug(format, args...)
+		}
+	}
+	root, err := os.OpenRoot(filepath.Dir(s.path))
+	if err != nil {
+		// No backup.env before the install and no directory now: the install never
+		// wrote the file, so there is nothing to put back.
+		if !s.existed && os.IsNotExist(err) {
+			debug("Install aborted: %s and its directory absent, as before the install", s.path)
+			return nil
+		}
+		debug("Install aborted: cannot open the directory of %s: %v", s.path, err)
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	name := filepath.Base(s.path)
+	if !s.existed {
+		err := root.Remove(name)
+		switch {
+		case err == nil:
+			debug("Install aborted: removed %s, written by this install", s.path)
+		case !os.IsNotExist(err):
+			debug("Install aborted: cannot remove %s: %v", s.path, err)
+			return err
+		}
+		return nil
+	}
+	if current, err := root.ReadFile(name); err == nil && bytes.Equal(current, s.data) {
+		// The wizard writes through a 0600 temp file, so an unchanged content can
+		// still come back with another mode.
+		if info, err := root.Stat(name); err == nil && info.Mode().Perm() != s.mode {
+			if err := root.Chmod(name, s.mode); err != nil {
+				debug("Install aborted: cannot restore the mode of %s: %v", s.path, err)
+				return err
+			}
+		}
+		return nil
+	}
+	if err := installer.WriteConfigFileAtomic(s.path, s.path+".tmp.restore", string(s.data)); err != nil {
+		debug("Install aborted: cannot restore %s: %v", s.path, err)
+		return err
+	}
+	if err := root.Chmod(name, s.mode); err != nil {
+		debug("Install aborted: cannot restore the mode of %s: %v", s.path, err)
+		return err
+	}
+	debug("Install aborted: %s restored as it was before the install", s.path)
+	return nil
 }
 
 func cliFlowLogLevel(args *cli.Args) types.LogLevel {

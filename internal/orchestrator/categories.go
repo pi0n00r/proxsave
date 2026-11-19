@@ -174,7 +174,10 @@ func GetAllCategories() []Category {
 			Paths: []string{
 				"./etc/proxmox-backup/node.cfg",
 				"./etc/proxmox-backup/proxy.cfg",
-				"./etc/proxmox-backup/acme/accounts.cfg",
+				// The ACME accounts are a directory of per-account JSON documents; the
+				// trailing slash is what makes PathMatchesCategory select the whole
+				// subtree during extraction (#313).
+				"./etc/proxmox-backup/acme/accounts/",
 				"./etc/proxmox-backup/acme/plugins.cfg",
 				"./etc/proxmox-backup/metricserver.cfg",
 				"./etc/proxmox-backup/traffic-control.cfg",
@@ -278,6 +281,7 @@ func GetAllCategories() []Category {
 				"./etc/proxmox-backup/tape-job.cfg",
 				"./etc/proxmox-backup/media-pool.cfg",
 				"./etc/proxmox-backup/tape-encryption-keys.json",
+				"./etc/proxmox-backup/tape-encryption-key-config.json",
 				"./var/lib/proxsave-info/commands/pbs/tape_drives.json",
 				"./var/lib/proxsave-info/commands/pbs/tape_changers.json",
 				"./var/lib/proxsave-info/commands/pbs/tape_pools.json",
@@ -442,80 +446,41 @@ func GetAllCategories() []Category {
 			},
 		},
 		{
+			ID:   "boot",
+			Name: "Boot Configuration (Kernel Command Line)",
+			Description: "Kernel parameters of the backed-up host (IOMMU, VFIO, ...) added to this host's boot configuration; " +
+				"initramfs and bootloader rebuilt",
+			Type: CategoryTypeCommon,
+			Paths: []string{
+				// The source: the backed-up host's /proc/cmdline. The two live files the
+				// merge may write are listed so the safety backup covers them; the old
+				// host's copies are kept under proxsave-info/boot, and one that
+				// CUSTOM_BACKUP_PATHS puts at these paths is never restored
+				// (bootNeverLivePaths).
+				bootKernelCmdlineArchivePath,
+				"./etc/default/grub",
+				"./etc/kernel/cmdline",
+			},
+		},
+		{
 			ID:          "proxsave_info",
 			Name:        "ProxSave Diagnostics (Export Only)",
-			Description: "ProxSave command outputs and inventory reports (export-only; never written to system paths)",
+			Description: "ProxSave command outputs and inventory reports, and the backed-up host's boot files (export-only; never written to system paths)",
 			Type:        CategoryTypeCommon,
 			Paths: []string{
 				"./var/lib/proxsave-info/",
 				"./manifest.json",
+				// The backed-up host's boot files at their natural paths, where
+				// CUSTOM_BACKUP_PATHS can put them: never written (bootNeverLivePaths),
+				// exported with the rest of the diagnostics.
+				"./etc/default/grub",
+				"./etc/default/grub.d/",
+				"./etc/kernel/cmdline",
+				"./etc/kernel/proxmox-boot-uuids",
 			},
 			ExportOnly: true,
 		},
 	}
-}
-
-// GetPVECategories returns only PVE-specific categories
-func GetPVECategories() []Category {
-	all := GetAllCategories()
-	var pve []Category
-	for _, cat := range all {
-		if cat.Type == CategoryTypePVE {
-			pve = append(pve, cat)
-		}
-	}
-	return pve
-}
-
-// GetPBSCategories returns only PBS-specific categories
-func GetPBSCategories() []Category {
-	all := GetAllCategories()
-	var pbs []Category
-	for _, cat := range all {
-		if cat.Type == CategoryTypePBS {
-			pbs = append(pbs, cat)
-		}
-	}
-	return pbs
-}
-
-// GetCommonCategories returns categories common to both PVE and PBS
-func GetCommonCategories() []Category {
-	all := GetAllCategories()
-	var common []Category
-	for _, cat := range all {
-		if cat.Type == CategoryTypeCommon {
-			common = append(common, cat)
-		}
-	}
-	return common
-}
-
-// GetCategoriesForSystem returns categories appropriate for the system type
-func GetCategoriesForSystem(systemType string) []Category {
-	all := GetAllCategories()
-	var categories []Category
-
-	switch systemType {
-	case "pve":
-		// PVE system: include PVE and common categories
-		for _, cat := range all {
-			if cat.Type == CategoryTypePVE || cat.Type == CategoryTypeCommon {
-				categories = append(categories, cat)
-			}
-		}
-	case "pbs":
-		// PBS system: include PBS and common categories
-		for _, cat := range all {
-			if cat.Type == CategoryTypePBS || cat.Type == CategoryTypeCommon {
-				categories = append(categories, cat)
-			}
-		}
-	case "dual":
-		categories = all
-	}
-
-	return categories
 }
 
 // PathMatchesCategory checks if a given file path matches any path in a category
@@ -548,9 +513,9 @@ func PathMatchesCategory(filePath string, category Category) bool {
 		}
 
 		// Check if the file is under a category directory
-		if strings.HasSuffix(normalizedCat, "/") {
+		if before, ok := strings.CutSuffix(normalizedCat, "/"); ok {
 			// Handle directory path both with and without trailing slash
-			dirPath := strings.TrimSuffix(normalizedCat, "/")
+			dirPath := before
 			if normalized == dirPath {
 				return true
 			}

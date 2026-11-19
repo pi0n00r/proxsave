@@ -2,6 +2,7 @@ package notify
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -29,7 +30,7 @@ type CloudRelayConfig struct {
 	RetryDelay  int // seconds
 }
 
-// Default cloud relay configuration (hardcoded for compatibility with Bash script).
+// Default cloud relay configuration, compiled in: no backup.env variable overrides it.
 //
 // WorkerToken and HMACSecret are a SHARED, PUBLIC anti-abuse credential for the
 // open-source relay client: the same value ships in every distributed binary and
@@ -49,11 +50,11 @@ var DefaultCloudRelayConfig = CloudRelayConfig{
 
 // EmailRelayPayload represents the JSON payload sent to the cloud worker
 type EmailRelayPayload struct {
-	To        string                 `json:"to"`
-	Subject   string                 `json:"subject"`
-	Report    map[string]interface{} `json:"report"`
-	Timestamp int64                  `json:"t"`
-	ServerMAC string                 `json:"server_mac"`
+	To        string         `json:"to"`
+	Subject   string         `json:"subject"`
+	Report    map[string]any `json:"report"`
+	Timestamp int64          `json:"t"`
+	ServerMAC string         `json:"server_mac"`
 
 	// Metadata not serialized but needed for headers
 	ScriptVersion string `json:"-"`
@@ -137,7 +138,7 @@ func sendViaCloudRelay(
 				return ctxErr
 			}
 			lastErr = fmt.Errorf("request failed: %w", err)
-			logger.Warning("Cloud relay request failed (attempt %d/%d): %v", attempt+1, config.MaxRetries+1, err)
+			logger.Warning("Cloud relay: request failed, attempt %d/%d: %v", attempt+1, config.MaxRetries+1, err)
 			continue
 		}
 
@@ -168,12 +169,7 @@ func sendViaCloudRelay(
 				var apiResp EmailRelayResponse
 				if err := json.Unmarshal(body, &apiResp); err == nil && !apiResp.Success {
 					errMsg := apiResp.Error
-					if errMsg == "" {
-						errMsg = apiResp.Message
-					}
-					if errMsg == "" {
-						errMsg = "relay returned success=false with no details"
-					}
+					errMsg = cmp.Or(errMsg, apiResp.Message, "relay returned success=false with no details")
 					return fmt.Errorf("cloud relay rejected email (HTTP 200 but success=false): %s", errMsg)
 				}
 			}
@@ -203,9 +199,7 @@ func sendViaCloudRelay(
 			if detail == "" {
 				detail = strings.TrimSpace(apiResp.Error)
 			}
-			if detail == "" {
-				detail = "no additional details provided"
-			}
+			detail = cmp.Or(detail, "no additional details provided")
 
 			logger.Debug("Cloud relay: rate limit exceeded (HTTP 429): %s", detail)
 
@@ -230,13 +224,13 @@ func sendViaCloudRelay(
 
 		case 500, 502, 503, 504:
 			// Server errors - retry
-			logger.Warning("Cloud relay: server error (HTTP %d), will retry", resp.StatusCode)
+			logger.Warning("Cloud relay: server error (HTTP %d), attempt %d/%d", resp.StatusCode, attempt+1, config.MaxRetries+1)
 			lastErr = fmt.Errorf("server error (HTTP %d): %s", resp.StatusCode, string(body))
 			continue
 
 		default:
 			// Unexpected status - retry
-			logger.Warning("Cloud relay: unexpected status (HTTP %d): %s", resp.StatusCode, string(body))
+			logger.Warning("Cloud relay: unexpected status (HTTP %d), attempt %d/%d: %s", resp.StatusCode, attempt+1, config.MaxRetries+1, string(body))
 			lastErr = fmt.Errorf("unexpected status (HTTP %d): %s", resp.StatusCode, string(body))
 			continue
 		}
@@ -282,9 +276,7 @@ func relayResponseDetail(apiResp EmailRelayResponse, fallback string) string {
 	if detail == "" {
 		detail = strings.TrimSpace(apiResp.Message)
 	}
-	if detail == "" {
-		detail = fallback
-	}
+	detail = cmp.Or(detail, fallback)
 	return detail
 }
 
@@ -359,12 +351,12 @@ func isQuotaLimit(detail string) bool {
 	return false
 }
 
-// buildReportData builds the structured report data for cloud relay
-// This must match the Bash script's collect_email_report_data() output exactly
-// to ensure HMAC signature validation passes
-func buildReportData(data *NotificationData) map[string]interface{} {
-	// Build nested structure matching Bash format exactly
-	return map[string]interface{}{
+// buildReportData builds the structured report data for cloud relay.
+// The relay worker builds the email from this shape: a key added or changed
+// here also needs the worker's template.
+func buildReportData(data *NotificationData) map[string]any {
+	// Nested structure read by the relay worker's template.
+	report := map[string]any{
 		// Top-level fields
 		"status":         data.Status.String(),
 		"status_message": data.StatusMessage,
@@ -377,7 +369,7 @@ func buildReportData(data *NotificationData) map[string]interface{} {
 		"script_version": data.ScriptVersion,
 
 		// Nested emojis object
-		"emojis": map[string]interface{}{
+		"emojis": map[string]any{
 			"primary":   GetStorageEmoji(data.LocalStatus),
 			"secondary": GetStorageEmoji(data.SecondaryStatus),
 			"cloud":     GetStorageEmoji(data.CloudStatus),
@@ -385,21 +377,21 @@ func buildReportData(data *NotificationData) map[string]interface{} {
 		},
 
 		// Nested backup object with sub-objects
-		"backup": map[string]interface{}{
-			"primary": map[string]interface{}{
+		"backup": map[string]any{
+			"primary": map[string]any{
 				"status": data.LocalStatusSummary,
 				"emoji":  GetStorageEmoji(data.LocalStatus),
-				"count":  data.LocalCount,
+				"count":  countValue(data.LocalCount),
 			},
-			"secondary": map[string]interface{}{
+			"secondary": map[string]any{
 				"status": data.SecondaryStatusSummary,
 				"emoji":  GetStorageEmoji(data.SecondaryStatus),
-				"count":  data.SecondaryCount,
+				"count":  countValue(data.SecondaryCount),
 			},
-			"cloud": map[string]interface{}{
+			"cloud": map[string]any{
 				"status": data.CloudStatusSummary,
 				"emoji":  GetStorageEmoji(data.CloudStatus),
-				"count":  data.CloudCount,
+				"count":  countValue(data.CloudCount),
 			},
 		},
 
@@ -407,8 +399,10 @@ func buildReportData(data *NotificationData) map[string]interface{} {
 		"storage": buildStorageData(data),
 
 		// Nested metrics object
-		"metrics": map[string]interface{}{
+		"metrics": map[string]any{
 			"backup_file_name":  data.BackupFileName,
+			"backup_file":       data.BackupFile,                // the HTML email's "Backup File" row
+			"telegram_status":   valueOrNA(data.TelegramStatus), // the HTML email's "Telegram Status" row
 			"files_included":    data.FilesIncluded,
 			"file_missing":      data.FilesMissing, // Fixed: was "files_missing"
 			"backup_duration":   FormatDuration(data.BackupDuration),
@@ -420,7 +414,7 @@ func buildReportData(data *NotificationData) map[string]interface{} {
 		},
 
 		// Nested log_summary object with categories array
-		"log_summary": map[string]interface{}{
+		"log_summary": map[string]any{
 			"errors":         data.ErrorCount,
 			"warnings":       data.WarningCount,
 			"total":          data.TotalIssues,
@@ -432,7 +426,7 @@ func buildReportData(data *NotificationData) map[string]interface{} {
 		},
 
 		// Nested paths object
-		"paths": map[string]interface{}{
+		"paths": map[string]any{
 			"local":         data.LocalPath,
 			"secondary":     data.SecondaryPath,
 			"cloud":         data.CloudPath,
@@ -444,12 +438,37 @@ func buildReportData(data *NotificationData) map[string]interface{} {
 		// Exit code at top level
 		"exit_code": data.ExitCode,
 	}
+	addPBSReportData(report, data)
+	return report
 }
 
-// buildStorageData builds the storage section matching Bash format
-func buildStorageData(data *NotificationData) map[string]interface{} {
-	storage := map[string]interface{}{
-		"local": map[string]interface{}{
+// addPBSReportData adds the PBS keys (emojis.pbs, backup.pbs, paths.pbs,
+// paths.has_pbs; storage.pbs is buildStorageData's) only when PBS is on: with PBS
+// off the report keeps the shape it had before the PBS destination existed.
+func addPBSReportData(report map[string]any, data *NotificationData) {
+	if !data.PBSEnabled {
+		return
+	}
+	if emojis, ok := report["emojis"].(map[string]any); ok {
+		emojis["pbs"] = GetStorageEmoji(data.PBSStatus)
+	}
+	if backup, ok := report["backup"].(map[string]any); ok {
+		backup["pbs"] = map[string]any{
+			"status": data.PBSStatusSummary,
+			"emoji":  GetStorageEmoji(data.PBSStatus),
+			"count":  countValue(data.PBSCount),
+		}
+	}
+	if paths, ok := report["paths"].(map[string]any); ok {
+		paths["pbs"] = data.PBSStorageID
+		paths["has_pbs"] = true
+	}
+}
+
+// buildStorageData builds the storage section: local, and secondary and pbs when on
+func buildStorageData(data *NotificationData) map[string]any {
+	storage := map[string]any{
+		"local": map[string]any{
 			"space":       data.LocalFree, // Total space shown as free space
 			"used":        data.LocalUsed,
 			"free":        data.LocalFree,
@@ -460,12 +479,23 @@ func buildStorageData(data *NotificationData) map[string]interface{} {
 
 	// Only add secondary if enabled
 	if data.SecondaryEnabled {
-		storage["secondary"] = map[string]interface{}{
-			"space":       data.SecondaryFree, // Total space shown as free space
-			"used":        data.SecondaryUsed,
-			"free":        data.SecondaryFree,
-			"percent":     data.SecondaryPercent,
-			"percent_num": data.SecondaryUsagePercent,
+		storage["secondary"] = map[string]any{
+			"space":       spaceValue(data.SecondaryFree, data.SecondaryFree), // Total space shown as free space
+			"used":        spaceValue(data.SecondaryFree, data.SecondaryUsed),
+			"free":        spaceValue(data.SecondaryFree, data.SecondaryFree),
+			"percent":     spaceValue(data.SecondaryFree, data.SecondaryPercent),
+			"percent_num": spaceValue(data.SecondaryFree, data.SecondaryUsagePercent),
+		}
+	}
+
+	// PBS, when on, with the same keys
+	if data.PBSEnabled {
+		storage["pbs"] = map[string]any{
+			"space":       spaceValue(data.PBSFree, data.PBSFree), // Total space shown as free space
+			"used":        spaceValue(data.PBSFree, data.PBSUsed),
+			"free":        spaceValue(data.PBSFree, data.PBSFree),
+			"percent":     spaceValue(data.PBSFree, data.PBSPercent),
+			"percent_num": spaceValue(data.PBSFree, data.PBSUsagePercent),
 		}
 	}
 

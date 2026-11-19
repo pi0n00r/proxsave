@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -313,14 +314,18 @@ func (u *charmWorkflowUI) ConfirmApplyStorageCfg(ctx context.Context, storageCfg
 }
 
 func (u *charmWorkflowUI) ConfirmApplyDatacenterCfg(ctx context.Context, datacenterCfgPath string) (bool, error) {
-	return u.confirmApply(ctx, "Apply datacenter.cfg",
-		fmt.Sprintf("Datacenter configuration found:\n\n%s\n\nApply datacenter.cfg via pvesh now?", strings.TrimSpace(datacenterCfgPath)))
+	return u.confirmApplyWithLabel(ctx, "Apply datacenter.cfg", "Write to pmxcfs",
+		fmt.Sprintf("Datacenter configuration found:\n\n%s\n\nApply datacenter.cfg now?", strings.TrimSpace(datacenterCfgPath)))
 }
 
 func (u *charmWorkflowUI) confirmApply(ctx context.Context, title, message string) (bool, error) {
+	return u.confirmApplyWithLabel(ctx, title, "Apply via API", message)
+}
+
+func (u *charmWorkflowUI) confirmApplyWithLabel(ctx context.Context, title, yesLabel, message string) (bool, error) {
 	res, err := shell.Ask(ctx, u.session, components.NewConfirm(
 		title, message,
-		components.WithLabels("Apply via API", "Skip"),
+		components.WithLabels(yesLabel, "Skip"),
 		components.WithDefaultYes(false),
 		components.WithDanger(),
 	))
@@ -332,9 +337,7 @@ func (u *charmWorkflowUI) confirmApply(ctx context.Context, title, message strin
 
 func (u *charmWorkflowUI) ConfirmAction(ctx context.Context, title, message, yesLabel, noLabel string, timeout time.Duration, defaultYes bool) (bool, error) {
 	title = strings.TrimSpace(title)
-	if title == "" {
-		title = "Confirm"
-	}
+	title = cmp.Or(title, "Confirm")
 	opts := []components.ConfirmOption{
 		components.WithLabels(yesLabel, noLabel),
 		components.WithDefaultYes(defaultYes),

@@ -18,14 +18,24 @@ func newPBSRecipe() recipe {
 				c := state.collector
 				c.logger.Debug("Validating PBS environment before collection")
 
+				// This is a sanity check on the path the recipe is about to read, not a
+				// second opinion on what the host is. It used to read as one: a bare Stat
+				// on a directory that no package owns and no removal deletes, logged as
+				// "Detected %s, proceeding with PBS collection". On the host in issue #315
+				// that line was the third place in the codebase to conclude PBS from a
+				// leftover, and it agreed with a type that was already wrong.
+				//
+				// The type is settled before any recipe runs, so reaching here means PBS is
+				// installed. A missing config directory is then a real anomaly on a real
+				// PBS host, which is what the error says.
 				pbsConfigPath := c.pbsConfigPath()
 				if _, err := os.Stat(pbsConfigPath); err != nil {
 					if errors.Is(err, os.ErrNotExist) {
-						return fmt.Errorf("not a PBS system: %s not found", pbsConfigPath)
+						return fmt.Errorf("PBS is installed but %s is missing: the configuration directory a PBS node always has", pbsConfigPath)
 					}
 					return fmt.Errorf("failed to access PBS config path %s: %w", pbsConfigPath, err)
 				}
-				c.logger.Debug("Detected %s, proceeding with PBS collection", pbsConfigPath)
+				c.logger.Debug("PBS configuration directory present at %s", pbsConfigPath)
 				return nil
 			},
 		},
@@ -82,77 +92,6 @@ func newPBSRecipe() recipe {
 	bricks = append(bricks, newPBSFeatureBricks()...)
 	bricks = append(bricks, newPBSFinalizeBricks()...)
 	return recipe{Name: "pbs", Bricks: bricks}
-}
-
-func newPBSCommandsRecipe() recipe {
-	return recipe{Name: "pbs-commands", Bricks: newPBSRuntimeBricks()}
-}
-
-func newPBSDatastoreInventoryRecipe() recipe {
-	return recipe{Name: "pbs-inventory", Bricks: newPBSInventoryBricks()}
-}
-
-func newPBSDatastoreConfigRecipe() recipe {
-	return recipe{Name: "pbs-datastore-config", Bricks: newPBSDatastoreConfigBricks()}
-}
-
-func newPBSPXARRecipe() recipe {
-	return recipe{Name: "pbs-pxar", Bricks: newPBSPXARBricks()}
-}
-
-func newPBSUserConfigRecipe() recipe {
-	return recipe{
-		Name: "pbs-user-config",
-		Bricks: []collectionBrick{
-			{
-				ID:          BrickID("pbs_access_load_user_ids_from_command_file"),
-				Description: "Load PBS user IDs from collected command snapshots",
-				Run: func(_ context.Context, state *collectionState) error {
-					userIDs, err := state.collector.loadPBSUserIDsFromCommandFile(state.collector.proxsaveCommandsDir("pbs"))
-					if err != nil {
-						if errors.Is(err, os.ErrNotExist) {
-							state.collector.logger.Debug("User list not available for token export: %v", err)
-							state.pbs.userIDs = nil
-							return nil
-						}
-						state.collector.logger.Warning("Failed to parse user list for token export: %v", err)
-						state.pbs.userIDs = nil
-						return nil
-					}
-					state.pbs.userIDs = userIDs
-					return nil
-				},
-			},
-			{
-				ID:          brickPBSRuntimeAccessUserTokens,
-				Description: "Collect PBS API token snapshots",
-				Run: func(ctx context.Context, state *collectionState) error {
-					if len(state.pbs.userIDs) == 0 {
-						return nil
-					}
-					usersDir, err := state.collector.ensurePBSAccessControlDir()
-					if err != nil {
-						return err
-					}
-					return state.collector.collectPBSAccessUserTokensRuntime(ctx, usersDir, state.pbs.userIDs)
-				},
-			},
-			{
-				ID:          brickPBSRuntimeAccessTokensAggregate,
-				Description: "Aggregate PBS API token snapshots",
-				Run: func(_ context.Context, state *collectionState) error {
-					if len(state.pbs.userIDs) == 0 {
-						return nil
-					}
-					usersDir, err := state.collector.ensurePBSAccessControlDir()
-					if err != nil {
-						return err
-					}
-					return state.collector.collectPBSAccessTokensAggregateRuntime(usersDir, state.pbs.userIDs)
-				},
-			},
-		},
-	}
 }
 
 func newPBSManifestBricks() []collectionBrick {

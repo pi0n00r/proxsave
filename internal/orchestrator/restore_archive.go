@@ -2,6 +2,7 @@
 package orchestrator
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"os"
@@ -46,17 +47,6 @@ func shouldStopPBSServices(categories []Category) bool {
 	return false
 }
 
-func splitExportCategories(categories []Category) (normal []Category, export []Category) {
-	for _, cat := range categories {
-		if cat.ExportOnly {
-			export = append(export, cat)
-			continue
-		}
-		normal = append(normal, cat)
-	}
-	return normal, export
-}
-
 // redirectClusterCategoryToExport removes pve_cluster from normal categories and adds it to export-only list.
 func redirectClusterCategoryToExport(normal []Category, export []Category) ([]Category, []Category) {
 	filtered := make([]Category, 0, len(normal))
@@ -72,9 +62,7 @@ func redirectClusterCategoryToExport(normal []Category, export []Category) ([]Ca
 
 func exportDestRoot(baseDir string) string {
 	base := strings.TrimSpace(baseDir)
-	if base == "" {
-		base = "/opt/proxsave"
-	}
+	base = cmp.Or(base, "/opt/proxsave")
 	return filepath.Join(base, fmt.Sprintf("proxmox-config-export-%s", nowRestore().Format("20060102-150405")))
 }
 
@@ -115,6 +103,19 @@ func extractSelectiveArchive(ctx context.Context, archivePath, destRoot string, 
 // error. The staged restore path passes failOnPartial=true so an incomplete
 // stage is never applied to the live system; best-effort callers pass false.
 func extractSelectiveArchiveStrict(ctx context.Context, archivePath, destRoot string, categories []Category, mode RestoreMode, logger *logging.Logger, failOnPartial bool) (logPath string, err error) {
+	return extractSelectiveArchiveWith(ctx, archivePath, destRoot, categories, mode, logger, selectiveExtraction{failOnPartial: failOnPartial})
+}
+
+// selectiveExtraction holds the optional behaviour of extractSelectiveArchiveWith.
+type selectiveExtraction struct {
+	failOnPartial bool
+	// skipFn drops matching entries before they are written.
+	skipFn func(entryName string) bool
+	// onExtracted is called with the name of every entry written.
+	onExtracted func(entryName string)
+}
+
+func extractSelectiveArchiveWith(ctx context.Context, archivePath, destRoot string, categories []Category, mode RestoreMode, logger *logging.Logger, opt selectiveExtraction) (logPath string, err error) {
 	done := logging.DebugStart(logger, "extract selective archive", "archive=%s dest=%s categories=%d mode=%s", archivePath, destRoot, len(categories), mode)
 	defer func() { done(err) }()
 	if err := restoreFS.MkdirAll(destRoot, 0o755); err != nil {
@@ -126,8 +127,9 @@ func extractSelectiveArchiveStrict(ctx context.Context, archivePath, destRoot st
 		return "", fmt.Errorf("restore to %s requires root privileges", destRoot)
 	}
 
-	// Create detailed log directory
-	logDir := "/tmp/proxsave"
+	// Create detailed log directory: the restore's own directory, which survives the
+	// reboot the restore recommends.
+	logDir := RestoreRunDir()
 	if err := restoreFS.MkdirAll(logDir, 0o700); err != nil {
 		logger.Warning("Could not create log directory: %v", err)
 	}
@@ -136,7 +138,7 @@ func extractSelectiveArchiveStrict(ctx context.Context, archivePath, destRoot st
 	timestamp := nowRestore().Format("20060102_150405")
 	logSeq := atomic.AddUint64(&restoreLogSequence, 1)
 	logPath = filepath.Join(logDir, fmt.Sprintf("restore_%s_%d.log", timestamp, logSeq))
-	logFile, err := restoreFS.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
+	logFile, err := restoreFS.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		logger.Warning("Could not create detailed log file: %v", err)
 		logFile = nil
@@ -161,7 +163,9 @@ func extractSelectiveArchiveStrict(ctx context.Context, archivePath, destRoot st
 		mode:                    mode,
 		logFile:                 logFile,
 		logFilePath:             logPath,
-		failOnPartialExtraction: failOnPartial,
+		skipFn:                  opt.skipFn,
+		failOnPartialExtraction: opt.failOnPartial,
+		onExtracted:             opt.onExtracted,
 	}); err != nil {
 		return logPath, err
 	}

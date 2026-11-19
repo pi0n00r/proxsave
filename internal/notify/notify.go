@@ -7,6 +7,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/tis24dev/proxsave/internal/config"
 	"github.com/tis24dev/proxsave/internal/types"
 )
 
@@ -44,6 +45,25 @@ func StatusFromExitCode(exitCode int) NotificationStatus {
 		return StatusWarning
 	default:
 		return StatusFailure
+	}
+}
+
+// NotifyOnAllows reports whether a run with the given outcome should be delivered
+// under the NOTIFY_ON policy. The policy is a severity THRESHOLD, not an exact match:
+// "warning" delivers warnings and failures, "failure" delivers failures only.
+//
+// Anything else -- "always", the empty string a zero-value Config carries, or a value
+// the operator mistyped -- delivers everything. Silence is the destructive outcome
+// here, so an unreadable policy fails open; config.IsValidNotifyOn is what tells the
+// caller to warn about the typo.
+func NotifyOnAllows(policy string, status NotificationStatus) bool {
+	switch policy {
+	case config.NotifyOnWarning:
+		return status != StatusSuccess
+	case config.NotifyOnFailure:
+		return status == StatusFailure
+	default:
+		return true
 	}
 }
 
@@ -89,17 +109,13 @@ type NotificationData struct {
 	LocalUsagePercent  float64
 
 	// Local retention info
-	LocalRetentionPolicy   string // "simple" or "gfs"
-	LocalRetentionLimit    int    // MAX_LOCAL_BACKUPS (simple mode)
-	LocalGFSDaily          int    // GFS limits
-	LocalGFSWeekly         int
-	LocalGFSMonthly        int
-	LocalGFSYearly         int
-	LocalGFSCurrentDaily   int // GFS current counts
-	LocalGFSCurrentWeekly  int
-	LocalGFSCurrentMonthly int
-	LocalGFSCurrentYearly  int
-	LocalBackups           int // Total current backups
+	LocalRetentionPolicy string // "simple" or "gfs"
+	LocalRetentionLimit  int    // MAX_LOCAL_BACKUPS (simple mode)
+	LocalGFSDaily        int    // GFS limits
+	LocalGFSWeekly       int
+	LocalGFSMonthly      int
+	LocalGFSYearly       int
+	LocalBackups         int // Total current backups
 
 	SecondaryEnabled       bool
 	SecondaryStatus        string
@@ -112,17 +128,13 @@ type NotificationData struct {
 	SecondaryUsagePercent  float64
 
 	// Secondary retention info
-	SecondaryRetentionPolicy   string
-	SecondaryRetentionLimit    int
-	SecondaryGFSDaily          int
-	SecondaryGFSWeekly         int
-	SecondaryGFSMonthly        int
-	SecondaryGFSYearly         int
-	SecondaryGFSCurrentDaily   int
-	SecondaryGFSCurrentWeekly  int
-	SecondaryGFSCurrentMonthly int
-	SecondaryGFSCurrentYearly  int
-	SecondaryBackups           int
+	SecondaryRetentionPolicy string
+	SecondaryRetentionLimit  int
+	SecondaryGFSDaily        int
+	SecondaryGFSWeekly       int
+	SecondaryGFSMonthly      int
+	SecondaryGFSYearly       int
+	SecondaryBackups         int
 
 	CloudEnabled       bool
 	CloudStatus        string
@@ -130,17 +142,33 @@ type NotificationData struct {
 	CloudCount         int
 
 	// Cloud retention info
-	CloudRetentionPolicy   string
-	CloudRetentionLimit    int
-	CloudGFSDaily          int
-	CloudGFSWeekly         int
-	CloudGFSMonthly        int
-	CloudGFSYearly         int
-	CloudGFSCurrentDaily   int
-	CloudGFSCurrentWeekly  int
-	CloudGFSCurrentMonthly int
-	CloudGFSCurrentYearly  int
-	CloudBackups           int
+	CloudRetentionPolicy string
+	CloudRetentionLimit  int
+	CloudGFSDaily        int
+	CloudGFSWeekly       int
+	CloudGFSMonthly      int
+	CloudGFSYearly       int
+	CloudBackups         int
+
+	// PBS storage (PBS_TARGET_ENABLED): the outcome of the PBS block at step [7]. A
+	// count never read is -1 (summary "?/<M>"), a datastore space never read is empty.
+	PBSEnabled       bool
+	PBSStatus        string
+	PBSStatusSummary string
+	PBSCount         int
+	PBSFree          string
+	PBSUsed          string
+	PBSPercent       string
+	PBSSpaceBytes    uint64
+	PBSUsagePercent  float64
+
+	// PBS retention info
+	PBSRetentionPolicy string
+	PBSRetentionLimit  int // MAX_PBS_TARGET_BACKUPS (simple mode)
+	PBSGFSDaily        int
+	PBSGFSWeekly       int
+	PBSGFSMonthly      int
+	PBSGFSYearly       int
 
 	// Email notification status (for Telegram messages)
 	EmailStatus    string
@@ -150,6 +178,7 @@ type NotificationData struct {
 	LocalPath     string
 	SecondaryPath string
 	CloudPath     string
+	PBSStorageID  string // PBS_TARGET_STORAGE
 
 	// Error/Warning summary
 	ErrorCount    int
@@ -192,7 +221,7 @@ type NotificationResult struct {
 	Method       string // "telegram", "email-relay", "email-pmf", "email-sendmail", or "*-fallback"
 	Error        error  // Original error (even if fallback succeeded)
 	Duration     time.Duration
-	Metadata     map[string]interface{} // Additional info (HTTP status, etc.)
+	Metadata     map[string]any // Additional info (HTTP status, etc.)
 }
 
 // Notifier is the interface that must be implemented by all notification providers
@@ -240,6 +269,34 @@ func GetStorageEmoji(status string) string {
 	default:
 		return "❓"
 	}
+}
+
+// A destination value that was never read (a destination that failed at startup, a PBS
+// block that got no count or no datastore space) reaches the channels as a negative count
+// and an empty free space. The text channels print "?" for it, the JSON payloads null.
+
+// countValue is a backup count in a JSON payload: null when it was never read.
+func countValue(count int) any {
+	if count < 0 {
+		return nil
+	}
+	return count
+}
+
+// freeText is a free space in a text body: "?" when it was never read.
+func freeText(free string) string {
+	if free == "" {
+		return "?"
+	}
+	return free
+}
+
+// spaceValue is a space figure in a JSON payload: null when the space was never read.
+func spaceValue(free string, value any) any {
+	if free == "" {
+		return nil
+	}
+	return value
 }
 
 // FormatDuration formats a duration in human-readable format (e.g., "2h 15m 30s")

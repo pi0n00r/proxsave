@@ -10,8 +10,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/tis24dev/proxsave/internal/logging"
 )
 
 // FakeFS is a sandboxed filesystem rooted at a temporary directory.
@@ -33,8 +31,13 @@ type FakeOwnership struct {
 	GID int
 }
 
+// NewFakeFS creates its root under fakeFSRoot, which TestMain removes at the end of the
+// run. A failed MkdirTemp panics: an empty Root would point the fake at the real tree.
 func NewFakeFS() *FakeFS {
-	root, _ := os.MkdirTemp("", "fakefs-*")
+	root, err := os.MkdirTemp(fakeFSRoot, "fakefs-*")
+	if err != nil {
+		panic(fmt.Sprintf("NewFakeFS: %v", err))
+	}
 	return &FakeFS{
 		Root:        root,
 		StatErr:     make(map[string]error),
@@ -276,38 +279,6 @@ func backgroundRollbackCallKey(timeoutSeconds int, scriptPath string) string {
 		fmt.Sprintf("%d", timeoutSeconds),
 		scriptPath,
 	})
-}
-
-// FakePrompter simulates user choices.
-type FakePrompter struct {
-	Mode       RestoreMode
-	Categories []Category
-	Confirm    bool
-	Err        error
-}
-
-func (f *FakePrompter) SelectRestoreMode(ctx context.Context, logger *logging.Logger, systemType SystemType) (RestoreMode, error) {
-	return f.Mode, f.Err
-}
-
-func (f *FakePrompter) SelectCategories(ctx context.Context, logger *logging.Logger, available []Category, systemType SystemType) ([]Category, error) {
-	if f.Err != nil {
-		return nil, f.Err
-	}
-	return f.Categories, nil
-}
-
-func (f *FakePrompter) ConfirmRestore(ctx context.Context, logger *logging.Logger) (bool, error) {
-	return f.Confirm, f.Err
-}
-
-// FakeSystemDetector lets tests control the reported system type.
-type FakeSystemDetector struct {
-	Type SystemType
-}
-
-func (f FakeSystemDetector) DetectCurrentSystem() SystemType {
-	return f.Type
 }
 
 // FakeCommandStreamRunner extends FakeCommandRunner with streaming support.

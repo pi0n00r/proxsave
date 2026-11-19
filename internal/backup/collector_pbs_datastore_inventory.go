@@ -2,16 +2,20 @@ package backup
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/tis24dev/proxsave/internal/safefs"
 )
 
 type inventoryFileSnapshot struct {
@@ -408,17 +412,27 @@ func (c *Collector) populatePBSDatastoreInventoryEntries(ctx context.Context, in
 		}
 		entry.StatPath = statPath
 
+		// Every probe of the datastore path is bounded by FS_IO_TIMEOUT: on a dead
+		// NFS/CIFS mount an unbounded stat, df or findmnt blocks the run in the kernel,
+		// before the PXAR bricks that would skip the datastore with a timeout warning.
+		timeout := c.fsIoTimeout()
 		if statPath != "" {
-			if info, err := os.Stat(statPath); err == nil {
+			info, err := safefs.Stat(ctx, statPath, timeout)
+			switch {
+			case err == nil:
 				entry.PathOK = true
 				entry.PathIsDir = info.IsDir()
-				entry.Markers = c.inspectPBSDatastorePathMarkers(statPath)
+				entry.Markers = c.inspectPBSDatastorePathMarkers(ctx, statPath, timeout)
+			case errors.Is(err, safefs.ErrTimeout):
+				c.logger.Debug("PBS datastore inventory: stat of %s timed out after %s (dead/stale mount?)", statPath, timeout)
 			}
 		}
 
 		if inventory.hostCommandsEnabled && def.Path != "" && filepath.IsAbs(def.Path) {
-			entry.Findmnt = c.captureInventoryCommand(ctx, fmt.Sprintf("findmnt -J -T %s", def.Path), "findmnt", "-J", "-T", def.Path)
-			entry.DF = c.captureInventoryCommand(ctx, fmt.Sprintf("df -T %s", def.Path), "df", "-T", def.Path)
+			cmdCtx, cancel := c.boundedCommandContext(ctx, timeout)
+			entry.Findmnt = c.captureInventoryCommand(cmdCtx, fmt.Sprintf("findmnt -J -T %s", def.Path), "findmnt", "-J", "-T", def.Path)
+			entry.DF = c.captureInventoryCommand(cmdCtx, fmt.Sprintf("df -T %s", def.Path), "df", "-T", def.Path)
+			cancel()
 		}
 
 		report.Datastores = append(report.Datastores, entry)
@@ -593,8 +607,8 @@ func (c *Collector) captureInventoryDir(ctx context.Context, sourcePath, logical
 		snap.Error = walkErr.Error()
 	}
 
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].RelativePath < files[j].RelativePath
+	slices.SortFunc(files, func(a, b inventoryDirEntry) int {
+		return strings.Compare(a.RelativePath, b.RelativePath)
 	})
 	snap.Files = files
 	return snap
@@ -734,20 +748,14 @@ func mergePBSDatastoreDefinitions(cli, config []pbsDatastore) []pbsDatastoreDefi
 	}
 	assignUniquePBSDatastoreDefinitionOutputKeys(out)
 
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Name != out[j].Name {
-			return out[i].Name < out[j].Name
-		}
-		if p1, p2 := pbsDatastoreOriginSortPriority(out[i].Origin), pbsDatastoreOriginSortPriority(out[j].Origin); p1 != p2 {
-			return p1 < p2
-		}
-		if out[i].Path != out[j].Path {
-			return out[i].Path < out[j].Path
-		}
-		if out[i].OutputKey != out[j].OutputKey {
-			return out[i].OutputKey < out[j].OutputKey
-		}
-		return out[i].CLIName < out[j].CLIName
+	slices.SortFunc(out, func(a, b pbsDatastoreDefinition) int {
+		return cmp.Or(
+			strings.Compare(a.Name, b.Name),
+			cmp.Compare(pbsDatastoreOriginSortPriority(a.Origin), pbsDatastoreOriginSortPriority(b.Origin)),
+			strings.Compare(a.Path, b.Path),
+			strings.Compare(a.OutputKey, b.OutputKey),
+			strings.Compare(a.CLIName, b.CLIName),
+		)
 	})
 	return out
 }
@@ -839,14 +847,14 @@ func parsePBSDatastoreCfg(contents string) []pbsDatastore {
 	return out
 }
 
-func (c *Collector) inspectPBSDatastorePathMarkers(path string) pbsDatastorePathMarkers {
+func (c *Collector) inspectPBSDatastorePathMarkers(ctx context.Context, path string, timeout time.Duration) pbsDatastorePathMarkers {
 	markers := pbsDatastorePathMarkers{}
 	if path == "" {
 		return markers
 	}
 
 	statAny := func(rel string) bool {
-		_, err := os.Stat(filepath.Join(path, rel))
+		_, err := safefs.Stat(ctx, filepath.Join(path, rel), timeout)
 		return err == nil
 	}
 
@@ -881,7 +889,7 @@ func uniqueSortedStrings(in []string) []string {
 		seen[raw] = struct{}{}
 		out = append(out, raw)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 
@@ -982,8 +990,8 @@ func (c *Collector) captureInventoryDirFiltered(ctx context.Context, sourcePath,
 		snap.Error = walkErr.Error()
 	}
 
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].RelativePath < files[j].RelativePath
+	slices.SortFunc(files, func(a, b inventoryDirEntry) int {
+		return strings.Compare(a.RelativePath, b.RelativePath)
 	})
 	snap.Files = files
 	return snap

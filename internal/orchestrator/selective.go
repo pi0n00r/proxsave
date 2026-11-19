@@ -1,7 +1,6 @@
 package orchestrator
 
 import (
-	"archive/tar"
 	"bufio"
 	"context"
 	"errors"
@@ -22,12 +21,6 @@ type SelectiveRestoreConfig struct {
 	SelectedCategories []Category
 	SystemType         SystemType
 	Metadata           *backup.Manifest
-}
-
-// AnalyzeBackupCategories detects which categories are available in the backup
-func AnalyzeBackupCategories(archivePath string, logger *logging.Logger) (categories []Category, err error) {
-	availableCategories, _, err := AnalyzeRestoreArchive(archivePath, logger)
-	return availableCategories, err
 }
 
 // AnalyzeArchivePaths determines available categories from the provided archive entries.
@@ -58,18 +51,6 @@ func AnalyzeArchivePaths(archivePaths []string, allCategories []Category) []Cate
 		}
 	}
 	return availableCategories
-}
-
-func collectArchivePaths(tarReader *tar.Reader) []string {
-	var archivePaths []string
-	for {
-		header, err := tarReader.Next()
-		if err != nil {
-			break // EOF or error
-		}
-		archivePaths = append(archivePaths, header.Name)
-	}
-	return archivePaths
 }
 
 // pathMatchesPattern checks if an archive path matches a category pattern
@@ -204,7 +185,7 @@ func ShowCategorySelectionMenuWithReader(ctx context.Context, reader *bufio.Read
 
 		fmt.Println()
 		fmt.Println("Commands:")
-		fmt.Println("  1-9    - Toggle category selection")
+		fmt.Printf("  %-7s- Toggle category selection\n", categoryToggleRange(len(relevantCategories)))
 		fmt.Println("  a      - Select all")
 		fmt.Println("  n      - Deselect all")
 		fmt.Println("  c      - Continue with selected categories")
@@ -232,24 +213,20 @@ func ShowCategorySelectionMenuWithReader(ctx context.Context, reader *bufio.Read
 			// Deselect all
 			selected = make(map[int]bool)
 		case "c":
-			// Continue - check if at least one category is selected
-			selectedCount := 0
-			for range selected {
-				selectedCount++
-			}
-
-			if selectedCount == 0 {
-				fmt.Println()
-				fmt.Println("⚠ Warning: No categories selected. Please select at least one category.")
-				continue
-			}
-
-			// Build list of selected categories
+			// Continue with the categories selected now. A category turned off stays in
+			// the map as false, so the map's size is not the count: counted that way, an
+			// empty selection went through and the restore ran with zero categories. The
+			// minimum and its text are the TUI's (WithMinSelected(1)).
 			var selectedCategories []Category
 			for i, cat := range relevantCategories {
 				if selected[i] {
 					selectedCategories = append(selectedCategories, cat)
 				}
+			}
+			if len(selectedCategories) == 0 {
+				fmt.Println()
+				fmt.Println("Select at least 1 item(s); 0 selected")
+				continue
 			}
 
 			return selectedCategories, nil
@@ -276,6 +253,15 @@ func ShowCategorySelectionMenuWithReader(ctx context.Context, reader *bufio.Read
 			selected[index] = !selected[index]
 		}
 	}
+}
+
+// categoryToggleRange is the numbers the CUSTOM menu accepts for a toggle: the help
+// line used to read "1-9" whatever the count, with 18 or more categories listed.
+func categoryToggleRange(count int) string {
+	if count <= 1 {
+		return "1"
+	}
+	return fmt.Sprintf("1-%d", count)
 }
 
 // GetCategoriesForMode returns categories based on the selected restore mode

@@ -20,7 +20,7 @@ func TestLoadStatusParseErrorIsErrStatusParse(t *testing.T) {
 // A corrupt status file must NOT freeze the writers: the next write self-heals by
 // quarantining the unreadable bytes and overwriting from a zero Status, and the
 // corrupt-file hook fires so the daemon can debug-log the event.
-func TestRecordPingSelfHealsCorruptStatus(t *testing.T) {
+func TestRecordOutcomePingSelfHealsCorruptStatus(t *testing.T) {
 	base := writeCorruptStatus(t)
 	path := StatusPath(base)
 
@@ -29,8 +29,8 @@ func TestRecordPingSelfHealsCorruptStatus(t *testing.T) {
 	corruptStatusHook = func(p string) { quarantined = p }
 	t.Cleanup(func() { corruptStatusHook = orig })
 
-	if err := RecordPing(base, "self", KindHeartbeat, 1234, true, nil); err != nil {
-		t.Fatalf("RecordPing on a corrupt file should self-heal, got %v", err)
+	if err := RecordOutcomePing(base, "self", KindHeartbeat, 1234, true, false, nil); err != nil {
+		t.Fatalf("RecordOutcomePing on a corrupt file should self-heal, got %v", err)
 	}
 
 	st, err := LoadStatus(base)
@@ -78,7 +78,7 @@ func writeCorruptStatus(t *testing.T) string {
 	base := t.TempDir()
 	path := StatusPath(base)
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		t.Fatalf("mkdir identity dir: %v", err)
+		t.Fatalf("mkdir daemon_state dir: %v", err)
 	}
 	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 		t.Fatalf("write corrupt status file: %v", err)

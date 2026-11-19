@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -46,62 +47,6 @@ func TestShortHostname(t *testing.T) {
 			result := shortHostname(tt.input)
 			if result != tt.expected {
 				t.Errorf("shortHostname(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
-// TestRelativeDepth tests relative depth calculation
-func TestRelativeDepth(t *testing.T) {
-	tests := []struct {
-		name     string
-		base     string
-		path     string
-		expected int
-	}{
-		{
-			name:     "same path",
-			base:     "/etc/pve",
-			path:     "/etc/pve",
-			expected: 0,
-		},
-		{
-			name:     "one level deep",
-			base:     "/etc/pve",
-			path:     "/etc/pve/nodes",
-			expected: 1,
-		},
-		{
-			name:     "two levels deep",
-			base:     "/etc/pve",
-			path:     "/etc/pve/nodes/pve1",
-			expected: 2,
-		},
-		{
-			name:     "three levels deep",
-			base:     "/etc/pve",
-			path:     "/etc/pve/nodes/pve1/qemu-server",
-			expected: 3,
-		},
-		{
-			name:     "not under base",
-			base:     "/etc/pve",
-			path:     "/var/lib/pve",
-			expected: 0,
-		},
-		{
-			name:     "trailing slashes",
-			base:     "/etc/pve/",
-			path:     "/etc/pve/nodes/",
-			expected: 1,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := relativeDepth(tt.base, tt.path)
-			if result != tt.expected {
-				t.Errorf("relativeDepth(%q, %q) = %d, want %d", tt.base, tt.path, result, tt.expected)
 			}
 		})
 	}
@@ -436,13 +381,7 @@ func TestCephConfigPaths(t *testing.T) {
 			}
 
 			for _, expected := range tt.expectContains {
-				found := false
-				for _, path := range paths {
-					if path == expected {
-						found = true
-						break
-					}
-				}
+				found := slices.Contains(paths, expected)
 				if !found {
 					t.Errorf("cephConfigPaths() should contain %q, got: %v", expected, paths)
 				}
@@ -502,146 +441,6 @@ mon_host = 10.0.0.1`
 	_ = result2
 }
 
-// TestHasCorosyncClusterConfigDetailed tests corosync cluster configuration detection
-func TestHasCorosyncClusterConfigDetailed(t *testing.T) {
-	tests := []struct {
-		name     string
-		content  string
-		expected bool
-	}{
-		{
-			name: "config with cluster_name",
-			content: `totem {
-    cluster_name: testcluster
-}`,
-			expected: true,
-		},
-		{
-			name: "config with nodelist",
-			content: `nodelist {
-    node {
-        ring0_addr: 10.0.0.1
-        name: pve1
-    }
-}`,
-			expected: true,
-		},
-		{
-			name: "config with ring0_addr",
-			content: `totem {
-    interface {
-        ring0_addr: 192.168.1.1
-    }
-}`,
-			expected: true,
-		},
-		{
-			name: "config without cluster keywords",
-			content: `[global]
-logging = debug`,
-			expected: false,
-		},
-		{
-			name:     "empty config",
-			content:  "",
-			expected: false,
-		},
-		{
-			name: "config with uppercase keywords",
-			content: `CLUSTER_NAME: uppercase
-NODELIST {
-}`,
-			expected: true, // Should match case-insensitively
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			pveDir := filepath.Join(tmpDir, "etc", "pve")
-			if err := os.MkdirAll(pveDir, 0o755); err != nil {
-				t.Fatal(err)
-			}
-
-			corosyncConf := filepath.Join(pveDir, "corosync.conf")
-			if tt.content != "" {
-				if err := os.WriteFile(corosyncConf, []byte(tt.content), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			logger := newTestLogger()
-			cfg := GetDefaultCollectorConfig()
-			cfg.PVEConfigPath = pveDir
-			cfg.CorosyncConfigPath = "" // Use default based on PVEConfigPath
-			collector := NewCollector(logger, cfg, tmpDir, "pve", false)
-
-			result := collector.hasCorosyncClusterConfig()
-			if result != tt.expected {
-				t.Errorf("hasCorosyncClusterConfig() = %v, want %v", result, tt.expected)
-			}
-		})
-	}
-}
-
-// TestHasCorosyncClusterConfigCustomPath tests custom corosync config path
-func TestHasCorosyncClusterConfigCustomPath(t *testing.T) {
-	tmpDir := t.TempDir()
-	pveDir := filepath.Join(tmpDir, "etc", "pve")
-	if err := os.MkdirAll(pveDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create custom corosync config in a different location
-	customPath := filepath.Join(tmpDir, "custom", "corosync.conf")
-	if err := os.MkdirAll(filepath.Dir(customPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(customPath, []byte("cluster_name: test"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	logger := newTestLogger()
-	cfg := GetDefaultCollectorConfig()
-	cfg.PVEConfigPath = pveDir
-	cfg.CorosyncConfigPath = customPath // Absolute path
-	collector := NewCollector(logger, cfg, tmpDir, "pve", false)
-
-	result := collector.hasCorosyncClusterConfig()
-	if !result {
-		t.Error("hasCorosyncClusterConfig() should return true with custom path")
-	}
-}
-
-// TestHasCorosyncClusterConfigRelativePath tests relative corosync config path
-func TestHasCorosyncClusterConfigRelativePath(t *testing.T) {
-	tmpDir := t.TempDir()
-	pveDir := filepath.Join(tmpDir, "etc", "pve")
-	if err := os.MkdirAll(pveDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create corosync config in a subdirectory
-	subDir := filepath.Join(pveDir, "cluster")
-	if err := os.MkdirAll(subDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(subDir, "corosync.conf"), []byte("cluster_name: test"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	logger := newTestLogger()
-	cfg := GetDefaultCollectorConfig()
-	cfg.PVEConfigPath = pveDir
-	cfg.CorosyncConfigPath = "cluster/corosync.conf" // Relative path
-	collector := NewCollector(logger, cfg, tmpDir, "pve", false)
-
-	result := collector.hasCorosyncClusterConfig()
-	if !result {
-		t.Error("hasCorosyncClusterConfig() should return true with relative path")
-	}
-}
-
 // TestIsClusteredPVE tests cluster detection
 func TestIsClusteredPVE(t *testing.T) {
 	t.Run("detects via corosync config", func(t *testing.T) {
@@ -661,11 +460,6 @@ func TestIsClusteredPVE(t *testing.T) {
 		cfg.PVEConfigPath = pveDir
 		cfg.CorosyncConfigPath = "" // Use default based on PVEConfigPath
 		collector := NewCollector(logger, cfg, tmpDir, "pve", false)
-
-		// Since hasCorosyncClusterConfig should detect this, test it directly
-		if !collector.hasCorosyncClusterConfig() {
-			t.Error("hasCorosyncClusterConfig() should return true when corosync config exists")
-		}
 
 		// isClusteredPVE should detect cluster via corosync config
 		clustered, err := collector.isClusteredPVE(context.Background())
@@ -727,8 +521,8 @@ func TestIsClusteredPVE(t *testing.T) {
 		}
 
 		clustered, err := collector.isClusteredPVE(context.Background())
-		if err != nil {
-			t.Fatalf("isClusteredPVE error: %v", err)
+		if err == nil {
+			t.Fatal("multiple node directories without configuration/runtime proof must remain unknown")
 		}
 		if clustered {
 			t.Error("isClusteredPVE() should return false when only multiple node directories exist without corosync config")
@@ -1001,114 +795,6 @@ func TestCollectPVEDirectoriesWithConfigDB(t *testing.T) {
 	}
 }
 
-// TestHasMultiplePVENodesDetailed tests multiple node detection
-func TestHasMultiplePVENodesDetailed(t *testing.T) {
-	t.Run("single node", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		pveDir := filepath.Join(tmpDir, "etc", "pve")
-		nodesDir := filepath.Join(pveDir, "nodes")
-		if err := os.MkdirAll(filepath.Join(nodesDir, "node1"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-
-		logger := newTestLogger()
-		cfg := GetDefaultCollectorConfig()
-		cfg.PVEConfigPath = pveDir
-		collector := NewCollector(logger, cfg, tmpDir, "pve", false)
-
-		result := collector.hasMultiplePVENodes()
-		if result {
-			t.Error("hasMultiplePVENodes() should return false for single node")
-		}
-	})
-
-	t.Run("multiple nodes", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		pveDir := filepath.Join(tmpDir, "etc", "pve")
-		nodesDir := filepath.Join(pveDir, "nodes")
-		if err := os.MkdirAll(filepath.Join(nodesDir, "node1"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.MkdirAll(filepath.Join(nodesDir, "node2"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-
-		logger := newTestLogger()
-		cfg := GetDefaultCollectorConfig()
-		cfg.PVEConfigPath = pveDir
-		collector := NewCollector(logger, cfg, tmpDir, "pve", false)
-
-		result := collector.hasMultiplePVENodes()
-		if !result {
-			t.Error("hasMultiplePVENodes() should return true for multiple nodes")
-		}
-	})
-
-	t.Run("empty nodes directory", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		pveDir := filepath.Join(tmpDir, "etc", "pve")
-		nodesDir := filepath.Join(pveDir, "nodes")
-		if err := os.MkdirAll(nodesDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-
-		logger := newTestLogger()
-		cfg := GetDefaultCollectorConfig()
-		cfg.PVEConfigPath = pveDir
-		collector := NewCollector(logger, cfg, tmpDir, "pve", false)
-
-		result := collector.hasMultiplePVENodes()
-		if result {
-			t.Error("hasMultiplePVENodes() should return false for empty nodes dir")
-		}
-	})
-
-	t.Run("nonexistent nodes directory", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		pveDir := filepath.Join(tmpDir, "etc", "pve")
-		if err := os.MkdirAll(pveDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		// Note: nodes directory not created
-
-		logger := newTestLogger()
-		cfg := GetDefaultCollectorConfig()
-		cfg.PVEConfigPath = pveDir
-		collector := NewCollector(logger, cfg, tmpDir, "pve", false)
-
-		result := collector.hasMultiplePVENodes()
-		if result {
-			t.Error("hasMultiplePVENodes() should return false for missing nodes dir")
-		}
-	})
-
-	t.Run("nodes dir contains files not directories", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		pveDir := filepath.Join(tmpDir, "etc", "pve")
-		nodesDir := filepath.Join(pveDir, "nodes")
-		if err := os.MkdirAll(nodesDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		// Create files instead of directories
-		if err := os.WriteFile(filepath.Join(nodesDir, "file1.txt"), []byte(""), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(nodesDir, "file2.txt"), []byte(""), 0o644); err != nil {
-			t.Fatal(err)
-		}
-
-		logger := newTestLogger()
-		cfg := GetDefaultCollectorConfig()
-		cfg.PVEConfigPath = pveDir
-		collector := NewCollector(logger, cfg, tmpDir, "pve", false)
-
-		result := collector.hasMultiplePVENodes()
-		if result {
-			t.Error("hasMultiplePVENodes() should return false when nodes contains only files")
-		}
-	})
-}
-
 // TestEffectivePVEConfigPathDetailed tests effective config path resolution
 func TestEffectivePVEConfigPathDetailed(t *testing.T) {
 	tests := []struct {
@@ -1151,5 +837,18 @@ func TestEffectivePVEConfigPathDetailed(t *testing.T) {
 				t.Errorf("effectivePVEConfigPath() = %q, want %q", result, tt.expected)
 			}
 		})
+	}
+}
+
+// A blank PVEConfigPath still looks for ceph under /etc/pve.
+func TestCephConfigPathsDefaultsABlankPVEConfigPath(t *testing.T) {
+	cfg := GetDefaultCollectorConfig()
+	cfg.PVEConfigPath = "  "
+	cfg.CephConfigPath = ""
+	collector := NewCollector(newTestLogger(), cfg, t.TempDir(), "pve", false)
+
+	paths := collector.cephConfigPaths()
+	if !slices.Contains(paths, "/etc/pve/ceph") {
+		t.Fatalf("cephConfigPaths() = %v, want it to contain %q", paths, "/etc/pve/ceph")
 	}
 }

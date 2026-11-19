@@ -2,6 +2,7 @@ package notify
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -12,12 +13,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/safeexec"
+	"github.com/tis24dev/proxsave/internal/safefs"
 	"github.com/tis24dev/proxsave/internal/types"
 )
 
@@ -116,13 +119,11 @@ func NewEmailNotifier(config EmailConfig, proxmoxType types.ProxmoxType, logger 
 
 	// Validate delivery method
 	if config.DeliveryMethod != EmailDeliveryRelay && config.DeliveryMethod != EmailDeliverySendmail && config.DeliveryMethod != EmailDeliveryPMF {
-		return nil, fmt.Errorf("invalid email delivery method: %s (must be 'relay', 'sendmail', or 'pmf')", config.DeliveryMethod)
+		return nil, fmt.Errorf("invalid email delivery mode: %s (must be 'relay', 'sendmail', or 'pmf')", config.DeliveryMethod)
 	}
 
 	// Validate from address
-	if config.From == "" {
-		config.From = "no-reply@proxmox.tis24.it"
-	}
+	config.From = cmp.Or(config.From, "no-reply@proxmox.tis24.it")
 
 	return &EmailNotifier{
 		config:      config,
@@ -151,7 +152,7 @@ func (e *EmailNotifier) Send(ctx context.Context, data *NotificationData) (*Noti
 	startTime := time.Now()
 	result := &NotificationResult{
 		Method:   "email",
-		Metadata: make(map[string]interface{}),
+		Metadata: make(map[string]any),
 	}
 
 	if !e.config.Enabled {
@@ -165,24 +166,24 @@ func (e *EmailNotifier) Send(ctx context.Context, data *NotificationData) (*Noti
 	switch e.config.DeliveryMethod {
 	case EmailDeliveryRelay:
 		if e.config.FallbackSendmail {
-			e.logger.Info("Email delivery method: relay (fallback: sendmail enabled)")
+			e.logger.Info("Email delivery mode: relay (fallback: sendmail enabled)")
 			e.logger.Debug("Email delivery plan: primary=relay fallback=sendmail relay_requires_recipient=true sendmail_requires_recipient=true")
 		} else {
-			e.logger.Info("Email delivery method: relay (fallback: disabled)")
+			e.logger.Info("Email delivery mode: relay (fallback: disabled)")
 			e.logger.Debug("Email delivery plan: primary=relay fallback=disabled relay_requires_recipient=true")
 		}
 	case EmailDeliverySendmail:
-		e.logger.Info("Email delivery method: sendmail (/usr/sbin/sendmail)")
+		e.logger.Info("Email delivery mode: sendmail (/usr/sbin/sendmail)")
 		e.logger.Debug("Email delivery plan: primary=sendmail fallback=disabled relay_requires_recipient=true")
 	case EmailDeliveryPMF:
-		e.logger.Info("Email delivery method: pmf (proxmox-mail-forward)")
+		e.logger.Info("Email delivery mode: pmf (proxmox-mail-forward)")
 		if e.config.FallbackSendmail {
 			e.logger.Debug("Email delivery plan: primary=pmf fallback=relay,sendmail recipient_optional=true relay_requires_recipient=true sendmail_requires_recipient=true")
 		} else {
 			e.logger.Debug("Email delivery plan: primary=pmf fallback=relay recipient_optional=true relay_requires_recipient=true")
 		}
 	default:
-		e.logger.Info("Email delivery method: %s", e.config.DeliveryMethod)
+		e.logger.Info("Email delivery mode: %s", e.config.DeliveryMethod)
 	}
 
 	// Resolve recipient
@@ -227,7 +228,7 @@ func (e *EmailNotifier) Send(ctx context.Context, data *NotificationData) (*Noti
 			result.Error = fmt.Errorf("no valid email recipient configured")
 			return result, nil
 		default:
-			e.logger.Warning("WARNING: Email recipient is empty after configuration/detection")
+			e.logger.Warning("Email recipient is empty after configuration/detection")
 			e.logger.Info("  EMAIL_DELIVERY_METHOD=pmf routes via Proxmox Notifications; recipient is only used for the To: header")
 		}
 	}
@@ -236,9 +237,9 @@ func (e *EmailNotifier) Send(ctx context.Context, data *NotificationData) (*Noti
 		redactedRecipient := redactEmail(recipient)
 		if e.config.FallbackSendmail {
 			if autoDetected {
-				e.logger.Warning("WARNING: Auto-detected recipient %s belongs to root and is blocked for relay delivery", redactedRecipient)
+				e.logger.Warning("Auto-detected recipient %s belongs to root and is blocked for relay delivery", redactedRecipient)
 			} else {
-				e.logger.Warning("WARNING: Configured email recipient %s belongs to root and is blocked for relay delivery", redactedRecipient)
+				e.logger.Warning("Configured email recipient %s belongs to root and is blocked for relay delivery", redactedRecipient)
 			}
 			preflightFallbackReason = "recipient_blocked_root"
 			preflightFallbackCause = fmt.Errorf("recipient %s is not allowed (root accounts are blocked)", redactedRecipient)
@@ -280,7 +281,7 @@ func (e *EmailNotifier) Send(ctx context.Context, data *NotificationData) (*Noti
 			result.Error = fmt.Errorf("invalid email recipient format: %s", redactedRecipient)
 			return result, nil
 		default:
-			e.logger.Warning("WARNING: Invalid email format: %s", redactedRecipient)
+			e.logger.Warning("Invalid email format: %s", redactedRecipient)
 		}
 	}
 
@@ -305,7 +306,7 @@ func (e *EmailNotifier) Send(ctx context.Context, data *NotificationData) (*Noti
 		// Fallback to local sendmail if relay fails and fallback is enabled.
 		if err != nil && e.config.FallbackSendmail {
 			relayErr = err // Store original relay error
-			e.logger.Warning("WARNING: Email delivery via cloud relay failed: %v", err)
+			e.logger.Warning("Email delivery via cloud relay failed: %v", err)
 			e.logger.Info("Attempting sendmail fallback after relay delivery failure...")
 			e.logger.Debug("Email fallback decision: stage=delivery reason=relay_send_failed cause=%v", relayErr)
 
@@ -322,7 +323,7 @@ func (e *EmailNotifier) Send(ctx context.Context, data *NotificationData) (*Noti
 		}
 		err = sendErr
 		if err != nil {
-			e.logger.Warning("WARNING: PMF delivery failed: %v", err)
+			e.logger.Warning("PMF delivery failed: %v", err)
 			err = e.sendPMFFallbackChain(ctx, result, recipient, subject, htmlBody, textBody, data, err)
 		}
 	} else {
@@ -353,9 +354,9 @@ func (e *EmailNotifier) Send(ctx context.Context, data *NotificationData) (*Noti
 
 	// Success (either primary or fallback)
 	if result.UsedFallback {
-		// Fallback succeeded after relay failure. The adapter emits the single
-		// "sent via fallback" WARNING for the channel; keep this at Debug so it is
-		// not double-reported.
+		// Fallback succeeded after the primary method failed. That failure already
+		// printed its own WARNING and the adapter adds the channel's "sent via
+		// fallback" one; this line stays at Debug so neither is printed twice.
 		e.logger.Debug("Email: sent via fallback after primary delivery failure")
 	}
 
@@ -371,9 +372,7 @@ func (e *EmailNotifier) Send(ctx context.Context, data *NotificationData) (*Noti
 		}
 
 		recipientHint := redactEmail(strings.TrimSpace(recipient))
-		if recipientHint == "" {
-			recipientHint = "(recipient not set - routed by Proxmox Notifications)"
-		}
+		recipientHint = cmp.Or(recipientHint, "(recipient not set - routed by Proxmox Notifications)")
 		e.logger.Info("Email notification handed off to %s for %s", backend, recipientHint)
 	}
 
@@ -463,7 +462,7 @@ func (e *EmailNotifier) sendPMFFallbackChain(
 		if relayErr == nil {
 			return nil
 		}
-		e.logger.Warning("WARNING: Relay fallback failed after PMF failure: %v", relayErr)
+		e.logger.Warning("Relay fallback failed after PMF failure: %v", relayErr)
 		if !e.config.FallbackSendmail {
 			return fmt.Errorf("pmf failed: %w; relay fallback failed: %v", pmfErr, relayErr)
 		}
@@ -617,12 +616,16 @@ func (e *EmailNotifier) detectRecipientPBS(ctx context.Context, targetUserID str
 		e.logger.Debug("Recipient auto-detection: resolved via proxmox-backup-manager for %s", targetUserID)
 		return email, nil
 	}
+	if errors.Is(err, errRecipientWithoutEmail) {
+		// The CLI read the user: the file holds no email either.
+		return "", fmt.Errorf("recipient auto-detection failed for %s (pbs): proxmox-backup-manager: %w", targetUserID, err)
+	}
 	if err != nil {
 		failures = append(failures, fmt.Sprintf("proxmox-backup-manager: %v", err))
 	}
 
 	// Last resort: parse /etc/proxmox-backup/user.cfg directly.
-	email, err = e.detectRecipientViaUserCfg(pbsUserCfgPath, targetUserID)
+	email, err = e.detectRecipientViaPBSUserCfg(pbsUserCfgPath, targetUserID)
 	if err == nil && strings.TrimSpace(email) != "" {
 		e.logger.Debug("Recipient auto-detection: resolved via user.cfg for %s (path=%s)", targetUserID, pbsUserCfgPath)
 		return email, nil
@@ -640,10 +643,10 @@ func (e *EmailNotifier) detectRecipientPVEViaPvesh(ctx context.Context, targetUs
 	cmdName := "pvesh"
 	args := []string{"get", endpoint, "--output-format=json"}
 
-	out, err := runCombinedOutput(ctx, cmdName, args...)
+	out, errOut, err := runCapturedOutput(ctx, cmdName, args...)
 	if err != nil {
 		e.logger.Debug("Recipient auto-detection: pvesh call failed (cmd=%s %s): %v", cmdName, strings.Join(args, " "), err)
-		if diag := strings.TrimSpace(string(out)); diag != "" {
+		if diag := commandDiagnostic(out, errOut); diag != "" {
 			e.logger.Debug("Recipient auto-detection: pvesh diagnostic output: %s", truncateForLog(diag, recipientDetectMaxDiagBytes))
 		}
 		return "", fmt.Errorf("pvesh API query failed: %w", err)
@@ -666,7 +669,7 @@ func (e *EmailNotifier) detectRecipientPVEViaPvesh(ctx context.Context, targetUs
 }
 
 func (e *EmailNotifier) detectRecipientViaUserListCLI(ctx context.Context, cmdName string, args []string, targetUserID string) (string, error) {
-	out, err := runCombinedOutput(ctx, cmdName, args...)
+	out, errOut, err := runCapturedOutput(ctx, cmdName, args...)
 	if err != nil {
 		// Command not found or non-zero exit status: include diagnostics in debug logs.
 		if errors.Is(err, exec.ErrNotFound) {
@@ -674,7 +677,7 @@ func (e *EmailNotifier) detectRecipientViaUserListCLI(ctx context.Context, cmdNa
 		} else {
 			e.logger.Debug("Recipient auto-detection: %s command failed (args=%s): %v", cmdName, strings.Join(args, " "), err)
 		}
-		if diag := strings.TrimSpace(string(out)); diag != "" {
+		if diag := commandDiagnostic(out, errOut); diag != "" {
 			e.logger.Debug("Recipient auto-detection: %s diagnostic output: %s", cmdName, truncateForLog(diag, recipientDetectMaxDiagBytes))
 		}
 		return "", fmt.Errorf("failed to query Proxmox user list via %s: %w", cmdName, err)
@@ -691,7 +694,7 @@ func (e *EmailNotifier) detectRecipientViaUserListCLI(ctx context.Context, cmdNa
 		}
 		email := strings.TrimSpace(u.Email)
 		if email == "" {
-			return "", fmt.Errorf("%s user exists but has no email configured (%s)", targetUserID, cmdName)
+			return "", fmt.Errorf("%s %w (%s)", targetUserID, errRecipientWithoutEmail, cmdName)
 		}
 		e.logger.Debug("Recipient auto-detection: %s returned an email for %s: %s", cmdName, targetUserID, redactEmail(email))
 		return email, nil
@@ -700,21 +703,61 @@ func (e *EmailNotifier) detectRecipientViaUserListCLI(ctx context.Context, cmdNa
 	return "", fmt.Errorf("%s user not found in Proxmox configuration (%s)", targetUserID, cmdName)
 }
 
+// errRecipientWithoutEmail is a user that exists with no email address set.
+var errRecipientWithoutEmail = errors.New("user exists but has no email configured")
+
+// detectRecipientViaPBSUserCfg reads PBS's user.cfg, which is section-config, not PVE's
+// colon lines: a "user: <userid>" header, then indented "<key> <value>" lines. Read as
+// colon lines it never matched, so the email was never found there.
+func (e *EmailNotifier) detectRecipientViaPBSUserCfg(cfgPath string, targetUserID string) (string, error) {
+	// Through an *os.Root on the file's directory, as every other config read of the repo (safefs).
+	data, err := safefs.ReadFileUnderRoot(cfgPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read %s: %w", cfgPath, err)
+	}
+	inTarget, found := false, false
+	for line := range strings.SplitSeq(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if line[0] != ' ' && line[0] != '\t' {
+			kind, id, ok := strings.Cut(trimmed, ":")
+			inTarget = ok && strings.TrimSpace(kind) == "user" && strings.TrimSpace(id) == targetUserID
+			found = found || inTarget
+			continue
+		}
+		if !inTarget {
+			continue
+		}
+		if key, value, ok := strings.Cut(trimmed, " "); ok && key == "email" && strings.TrimSpace(value) != "" {
+			email := strings.TrimSpace(value)
+			e.logger.Debug("Recipient auto-detection: user.cfg contains an email for %s: %s", targetUserID, redactEmail(email))
+			return email, nil
+		}
+	}
+	if found {
+		return "", fmt.Errorf("%s %w (user.cfg)", targetUserID, errRecipientWithoutEmail)
+	}
+	return "", fmt.Errorf("%s user not found in %s", targetUserID, cfgPath)
+}
+
 func (e *EmailNotifier) detectRecipientViaUserCfg(cfgPath string, targetUserID string) (string, error) {
-	data, err := os.ReadFile(cfgPath)
+	// Through an *os.Root on the file's directory, as every other config read of the repo (safefs).
+	data, err := safefs.ReadFileUnderRoot(cfgPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read %s: %w", cfgPath, err)
 	}
 
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(string(data), "\n")
+	for line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
 		// Expected format (PVE/PBS): user:<userid>:<enable>:<expire>:<firstname>:<lastname>:<email>:...
-		// Example: user:root@pam:1:0:::info@tis24.it::
+		// Example: user:root@pam:1:0:::admin@example.com::
 		if !strings.HasPrefix(line, "user:") {
 			continue
 		}
@@ -738,16 +781,49 @@ func (e *EmailNotifier) detectRecipientViaUserCfg(cfgPath string, targetUserID s
 	return "", fmt.Errorf("%s user not found in %s", targetUserID, cfgPath)
 }
 
-func runCombinedOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmd, err := safeexec.CommandContext(ctx, name, args...)
-	if err != nil {
-		return nil, err
+// runCapturedOutput keeps stdout and stderr apart. Both callers parse stdout as
+// JSON, and a merged capture makes that parse fail on a byte the tool never meant
+// as data.
+//
+// Measured on a live PVE 9.1.9 node (2026-09-05), locale as the only variable:
+//
+//	pvesh get /access/users/root@pam   control rc=0 stdout=74B stderr=0B   merged parses
+//	                                   LC_ALL=xx_YY.UTF-8 rc=0 stdout=74B stderr=542B merged FAILS
+//	pveum user list                    control rc=0 stdout=89B stderr=0B   merged parses
+//	                                   LC_ALL=xx_YY.UTF-8 rc=0 stdout=89B stderr=542B merged FAILS
+//
+// Both commands exit 0 and their JSON is intact; what breaks the parse is Perl's
+// "Setting locale failed." on stderr. Both are the SAME Perl, so a locale the node
+// lacks takes out tiers 1 and 2 of detectRecipientPVE together and the recipient is
+// only found because tier 3 reads /etc/pve/user.cfg directly. That node ships the
+// stock `AcceptEnv LANG LC_*` in sshd_config, so an operator sshing in with a
+// locale it does not have is the whole reproduction.
+//
+// A var so tests can drive it without executing anything. This mirrors
+// internal/backup/collector_deps.go, which keeps the streams apart for the same
+// reason and states it for proxmox-backup-manager.
+var runCapturedOutput = func(ctx context.Context, name string, args ...string) (stdout, stderr []byte, err error) {
+	cmd, cmdErr := safeexec.CommandContext(ctx, name, args...)
+	if cmdErr != nil {
+		return nil, nil, cmdErr
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return out, err
+	safeexec.ApplyWaitDelay(cmd)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	runErr := cmd.Run()
+	return outBuf.Bytes(), errBuf.Bytes(), runErr
+}
+
+// commandDiagnostic picks what to show a human when a detection command failed.
+// The reason is normally on stderr; some tools put it on stdout instead, so that
+// is the fallback rather than a merge, which would reintroduce the very mixing
+// this file exists to avoid.
+func commandDiagnostic(stdout, stderr []byte) string {
+	if msg := strings.TrimSpace(string(stderr)); msg != "" {
+		return msg
 	}
-	return out, nil
+	return strings.TrimSpace(string(stdout))
 }
 
 func truncateForLog(s string, maxBytes int) string {
@@ -757,11 +833,58 @@ func truncateForLog(s string, maxBytes int) string {
 	return s[:maxBytes] + "...(truncated)"
 }
 
+// mailToolWaitDelay is the drain budget for the mail tools, and it is deliberately far
+// larger than safeexec.CommandWaitDelay.
+//
+// Three seconds is right for a probe, where anything slower is a wedged helper. It is
+// wrong here: a delivery binary can hand the message to a local consumer that is still
+// draining after the binary itself has exited, and cutting that produces a FALSE
+// failure on a report the MTA already accepted. On the proxmox-mail-forward path a
+// false failure is not merely noise, it sends the report into sendPMFFallbackChain and
+// the operator receives the same backup report twice.
+//
+// Thirty seconds still bounds the hang this exists to stop, and it does so at the very
+// end of a run whose archive is already written, so the cost of waiting is small and
+// the cost of guessing wrong is a duplicate delivery.
+var mailToolWaitDelay = 30 * time.Second
+
+// commandForMailTool builds the command for sendmail, proxmox-mail-forward and mailq.
+// systemctl is bounded separately, by the constructor, at its own call site.
+//
+// Both branches are stamped, and both are stamped with mailToolWaitDelay rather than
+// the constructor's value. The absolute branch would otherwise inherit the 3 second
+// probe budget from TrustedCommandContext, which is the wrong number for a delivery.
+// The bare-name branch is unreachable today, because every resolver here goes through
+// lookupAbsolutePath and refuses a non-absolute answer; it is stamped so that a future
+// resolver which does not is bounded rather than silently exempt.
+//
+// The mail path is where a bound matters most and where it is most often
+// misunderstood. The message travels on stdin as a strings.Reader, so os/exec builds
+// a parent pipe for it, and a delivery binary that reads part of the message and
+// exits 0 leaves the rest undelivered. That happens TODAY, without any bound: os/exec
+// drops the resulting EPIPE on stdin by design (go.dev/issue/9173), so the call
+// returns nil and the report is logged as handed off. The bound does not cause that
+// and cannot cure it. What it does is stop the OTHER shape, where a grandchild holds
+// the descriptor and the run stalls for that grandchild's lifetime with no output.
+//
+// Whatever this returns, exec.ErrWaitDelay must reach the caller. Translating it to
+// nil would report a hand-off that was cut as a delivery that succeeded, which is
+// strictly worse than the stall it replaced.
 func commandForMailTool(ctx context.Context, pathOrName string, args ...string) (*exec.Cmd, error) {
+	var (
+		cmd *exec.Cmd
+		err error
+	)
 	if filepath.IsAbs(pathOrName) {
-		return safeexec.TrustedCommandContext(ctx, pathOrName, args...)
+		cmd, err = safeexec.TrustedCommandContext(ctx, pathOrName, args...)
+	} else {
+		cmd, err = safeexec.CommandContext(ctx, pathOrName, args...)
 	}
-	return safeexec.CommandContext(ctx, pathOrName, args...)
+	if err != nil {
+		return nil, err
+	}
+	cmd.WaitDelay = mailToolWaitDelay
+	return cmd, nil
 }
 
 func lookupAbsolutePath(name string) (string, error) {
@@ -879,86 +1002,41 @@ func (e *EmailNotifier) checkRelayHostConfigured(ctx context.Context) (bool, str
 
 // checkMailQueue checks the mail queue status
 func (e *EmailNotifier) checkMailQueue(ctx context.Context) (int, error) {
-	// Try mailq command (works for both Postfix and Sendmail)
+	count, _, err := e.checkMailQueueFor(ctx, "")
+	return count, err
+}
+
+// checkMailQueueFor runs mailq (it works for both Postfix and Sendmail) and returns the
+// count of queued messages and the entries with a line naming the recipient.
+func (e *EmailNotifier) checkMailQueueFor(ctx context.Context, recipient string) (int, []mailQueueEntry, error) {
 	mailqPath, err := findMailqPath()
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	cmd, err := commandForMailTool(ctx, mailqPath)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	output, err := cmd.Output()
 	if err != nil {
-		return 0, fmt.Errorf("mailq failed: %w", err)
+		return 0, nil, fmt.Errorf("mailq failed: %w", err)
 	}
 
-	// Parse output to count queued messages
 	outputStr := string(output)
 	if strings.Contains(outputStr, "Mail queue is empty") {
 		e.logger.Debug("Mail queue is empty")
-		return 0, nil
+		return 0, nil, nil
 	}
 
-	// Count lines that look like queue entries
-	lines := strings.Split(outputStr, "\n")
-	queueCount := 0
-	for _, line := range lines {
-		// Basic heuristic: lines with queue IDs (hex strings) and @ symbols
-		if len(line) > 10 && strings.Contains(line, "@") {
-			// Skip header and footer lines
-			if !strings.Contains(line, "Mail queue") && !strings.Contains(line, "Total requests") {
-				queueCount++
-			}
-		}
-	}
-
+	// Count lines that look like queue entries (lines with an @, header and footer left
+	// out), and collect the entries for the recipient.
+	queueCount, entries := parseMailQueue(outputStr, recipient)
 	if queueCount > 0 {
 		e.logger.Debug("Found %d message(s) in mail queue", queueCount)
 	}
 
-	return queueCount, nil
-}
-
-// detectQueueEntry scans the mail queue for a recipient and returns the latest queue ID.
-func (e *EmailNotifier) detectQueueEntry(ctx context.Context, recipient string) (string, string, error) {
-	mailqPath, err := findMailqPath()
-	if err != nil {
-		return "", "", err
-	}
-
-	cmd, err := commandForMailTool(ctx, mailqPath)
-	if err != nil {
-		return "", "", err
-	}
-	output, err := cmd.Output()
-	if err != nil {
-		return "", "", fmt.Errorf("mailq failed: %w", err)
-	}
-
-	lines := strings.Split(string(output), "\n")
-	lowerRecipient := strings.ToLower(strings.TrimSpace(recipient))
-	var currentID string
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-
-		fields := strings.Fields(trimmed)
-		if len(fields) > 0 && mailQueueIDLineRegex.MatchString(fields[0]) {
-			currentID = strings.TrimSuffix(strings.TrimSuffix(fields[0], "*"), "!")
-			continue
-		}
-
-		if currentID != "" && lowerRecipient != "" && strings.Contains(strings.ToLower(trimmed), lowerRecipient) {
-			return currentID, trimmed, nil
-		}
-	}
-
-	return "", "", nil
+	return queueCount, entries, nil
 }
 
 // tailMailLog reads the last maxLines from the first available mail log file.
@@ -976,6 +1054,7 @@ func (e *EmailNotifier) tailMailLog(ctx context.Context, maxLines int) ([]string
 		if err != nil {
 			continue
 		}
+		safeexec.ApplyWaitDelay(cmd)
 		output, err := cmd.Output()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -1002,6 +1081,7 @@ func (e *EmailNotifier) tailMailLog(ctx context.Context, maxLines int) ([]string
 		if err != nil {
 			return nil, ""
 		}
+		safeexec.ApplyWaitDelay(cmd)
 		output, err := cmd.Output()
 		if err == nil && len(output) > 0 {
 			lines := strings.Split(strings.TrimRight(string(output), "\n"), "\n")
@@ -1049,48 +1129,31 @@ func extractQueueID(outputs ...string) string {
 	return ""
 }
 
-// inspectMailLogStatus looks for a delivery status line for the given queue ID.
+// inspectMailLogStatus looks for a delivery status line for the given queue ID. Only
+// the lines of that message are read (mailLogLineNamesQueueID): a line that only
+// mentions the ID (another message's "notification: <ID>", a forwarded notice's
+// message-id) is not one of them. With no such line it reports nothing: the status of
+// another message is never reported as this one's.
 func (e *EmailNotifier) inspectMailLogStatus(ctx context.Context, queueID string) (status, matchedLine, logPath string) {
 	lines, logPath := e.tailMailLog(ctx, 80)
-	if len(lines) == 0 || logPath == "" {
+	if len(lines) == 0 || logPath == "" || strings.TrimSpace(queueID) == "" {
 		return "", "", logPath
 	}
 
-	relevant := lines
-	if queueID != "" {
-		filtered := make([]string, 0, len(lines))
-		for _, line := range lines {
-			if strings.Contains(line, queueID) {
-				filtered = append(filtered, line)
-			}
-		}
-		if len(filtered) > 0 {
-			relevant = filtered
+	relevant := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if mailLogLineNamesQueueID(line, queueID) {
+			relevant = append(relevant, line)
 		}
 	}
 
-	for i := len(relevant) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(relevant[i])
+	for _, r := range slices.Backward(relevant) {
+		line := strings.TrimSpace(r)
 		if line == "" {
 			continue
 		}
-		lower := strings.ToLower(line)
-		switch {
-		case strings.Contains(lower, "status=sent"):
-			return "sent", line, logPath
-		case strings.Contains(lower, "status=deferred"):
-			return "deferred", line, logPath
-		case strings.Contains(lower, "status=bounced"), strings.Contains(lower, "status=softbounce"):
-			return "bounced", line, logPath
-		case strings.Contains(lower, "status=expired"):
-			return "expired", line, logPath
-		case strings.Contains(lower, "status=rejected") || strings.Contains(lower, "rejected "):
-			return "rejected", line, logPath
-		case strings.Contains(lower, "connection refused"),
-			strings.Contains(lower, "host not found"),
-			strings.Contains(lower, "no route to host"),
-			strings.Contains(lower, "timeout"):
-			return "error", line, logPath
+		if status := mailLogLineStatus(line, queueID); status != "" {
+			return status, line, logPath
 		}
 	}
 
@@ -1132,8 +1195,10 @@ func (e *EmailNotifier) logMailLogStatus(queueID, status, matchedLine, logPath s
 		e.logger.Debug("Mail log (%s) has entries for queue ID %s, but status is inconclusive", logPath, displayID)
 	default:
 		if status == "" {
+			// Nothing in the log names this message: inconclusive, like an entry without
+			// a status, so DEBUG only.
 			if queueID != "" && logPath != "" {
-				e.logger.Info("Mail log (%s) has no recent entries for queue ID %s (delivery status pending)", logPath, displayID)
+				e.logger.Debug("Mail log (%s) has no recent entries for queue ID %s (delivery status pending)", logPath, displayID)
 			}
 			return
 		}
@@ -1225,7 +1290,10 @@ func sanitizeHeaderValue(value string) string {
 	return strings.TrimSpace(value)
 }
 
-func (e *EmailNotifier) buildEmailMessage(recipient, subject, htmlBody, textBody string, data *NotificationData) (emailMessage, toHeader string) {
+// buildEmailMessage builds the MIME message sendmail and proxmox-mail-forward receive,
+// with a Message-ID of its own (newMessageID): the mail log is searched for it to find
+// this email's queue ID.
+func (e *EmailNotifier) buildEmailMessage(recipient, subject, htmlBody, textBody string, data *NotificationData) (emailMessage, toHeader, messageID string) {
 	e.logger.Debug("=== Building email message ===")
 
 	// Encode subject in Base64 for proper UTF-8 handling
@@ -1234,15 +1302,14 @@ func (e *EmailNotifier) buildEmailMessage(recipient, subject, htmlBody, textBody
 	// Build email headers and body
 	var email strings.Builder
 	toHeader = sanitizeHeaderValue(recipient)
-	if toHeader == "" {
-		toHeader = "root"
-	}
+	toHeader = cmp.Or(toHeader, "root")
 	fromHeader := sanitizeHeaderValue(e.config.From)
-	if fromHeader == "" {
-		fromHeader = "no-reply@proxmox.tis24.it"
-	}
+	fromHeader = cmp.Or(fromHeader, "no-reply@proxmox.tis24.it")
+	messageID = newMessageID(fromHeader)
+	e.logger.Debug("email message-id: <%s>", messageID)
 	fmt.Fprintf(&email, "To: %s\n", toHeader)
 	fmt.Fprintf(&email, "From: %s\n", fromHeader)
+	fmt.Fprintf(&email, "Message-ID: <%s>\n", messageID)
 	fmt.Fprintf(&email, "Subject: =?UTF-8?B?%s?=\n", encodedSubject)
 	email.WriteString("MIME-Version: 1.0\n")
 
@@ -1252,7 +1319,8 @@ func (e *EmailNotifier) buildEmailMessage(recipient, subject, htmlBody, textBody
 	if attachLog {
 		// Try to read log file; on failure, fall back to plain multipart/alternative
 		logPath := strings.TrimSpace(data.LogFilePath)
-		content, err := os.ReadFile(logPath)
+		// Through an *os.Root on the log's directory, as the user.cfg reads above (safefs).
+		content, err := safefs.ReadFileUnderRoot(logPath)
 		if err != nil {
 			e.logger.Warning("Failed to read log file for email attachment (%s): %v", logPath, err)
 			attachLog = false
@@ -1302,10 +1370,7 @@ func (e *EmailNotifier) buildEmailMessage(recipient, subject, htmlBody, textBody
 			encoded := base64.StdEncoding.EncodeToString(content)
 			const maxLineLength = 76
 			for i := 0; i < len(encoded); i += maxLineLength {
-				end := i + maxLineLength
-				if end > len(encoded) {
-					end = len(encoded)
-				}
+				end := min(i+maxLineLength, len(encoded))
 				email.WriteString(encoded[i:end])
 				email.WriteString("\n")
 			}
@@ -1340,7 +1405,7 @@ func (e *EmailNotifier) buildEmailMessage(recipient, subject, htmlBody, textBody
 	}
 
 	e.logger.Debug("Email message built (%d bytes)", email.Len())
-	return email.String(), toHeader
+	return email.String(), toHeader, messageID
 }
 
 func (e *EmailNotifier) sendViaPMF(ctx context.Context, recipient, subject, htmlBody, textBody string, data *NotificationData) (backend, backendPath string, err error) {
@@ -1358,7 +1423,7 @@ func (e *EmailNotifier) sendViaPMF(ctx context.Context, recipient, subject, html
 	}
 	e.logger.Debug("✓ Proxmox mail forwarder found at %s", pmfPath)
 
-	emailMessage, toHeader := e.buildEmailMessage(recipient, subject, htmlBody, textBody, data)
+	emailMessage, toHeader, _ := e.buildEmailMessage(recipient, subject, htmlBody, textBody, data)
 
 	e.logger.Debug("=== Sending email via proxmox-mail-forward ===")
 	e.logger.Debug("proxmox-mail-forward routing is handled by Proxmox Notifications; To=%q is only a mail header", toHeader)
@@ -1420,12 +1485,14 @@ func (e *EmailNotifier) sendViaSendmail(ctx context.Context, recipient, subject,
 	}
 	e.logger.Debug("✓ Sendmail binary found at %s", sendmailPath)
 
-	// Check MTA service status
+	// The service and config checks guess from fixed lists: a working stock Debian
+	// exim4 (it ships exim4.conf.template, never exim4.conf) or a daemonless MTA
+	// (msmtp-mta, dma) reads as missing. They stay at DEBUG; what is visible comes from
+	// the post-send checks below, which look at what happened to this email.
 	if active, service := e.isMTAServiceActive(ctx); active {
 		e.logger.Debug("✓ MTA service '%s' is active", service)
 	} else {
-		e.logger.Warning("⚠ No MTA service appears to be running (checked: postfix, sendmail, exim4)")
-		e.logger.Warning("  Emails may be accepted but not delivered. Consider using EMAIL_DELIVERY_METHOD=relay")
+		e.logger.Debug("No MTA service found active (checked: postfix, sendmail, exim4): %s", service)
 	}
 
 	// Check MTA configuration
@@ -1441,13 +1508,18 @@ func (e *EmailNotifier) sendViaSendmail(ctx context.Context, recipient, subject,
 			}
 		}
 	} else {
-		e.logger.Warning("⚠ No MTA configuration file found")
-		e.logger.Warning("  Sendmail may queue emails but not deliver them")
+		e.logger.Debug("No MTA configuration file found (checked: /etc/postfix/main.cf, /etc/mail/sendmail.cf, /etc/exim4/exim4.conf)")
 	}
 
-	// Check current mail queue
-	if queueCount, err := e.checkMailQueue(ctx); err == nil {
+	// Check current mail queue; its entries for the recipient are left out when this
+	// email's queue entry is looked for after sending.
+	var queuedBefore map[string]bool
+	if queueCount, entries, err := e.checkMailQueueFor(ctx, recipient); err == nil {
 		initialQueueCount = queueCount
+		queuedBefore = make(map[string]bool, len(entries))
+		for _, entry := range entries {
+			queuedBefore[entry.id] = true
+		}
 		if queueCount > 0 {
 			e.logger.Warning("⚠ %d message(s) currently in mail queue (previous emails may be stuck)", queueCount)
 			if queueCount > 10 {
@@ -1460,7 +1532,7 @@ func (e *EmailNotifier) sendViaSendmail(ctx context.Context, recipient, subject,
 		e.logger.Debug("Could not inspect mail queue before sending: %v", err)
 	}
 
-	emailMessage, _ := e.buildEmailMessage(recipient, subject, htmlBody, textBody, data)
+	emailMessage, _, messageID := e.buildEmailMessage(recipient, subject, htmlBody, textBody, data)
 
 	// ========================================================================
 	// SEND EMAIL WITH VERBOSE OUTPUT
@@ -1581,7 +1653,7 @@ func (e *EmailNotifier) sendViaSendmail(ctx context.Context, recipient, subject,
 				}
 			} else {
 				e.logger.Debug("Recent mail log entries (%d found, showing first 5):", len(recentErrors))
-				for i := 0; i < 5; i++ {
+				for i := range 5 {
 					errLine := recentErrors[i]
 					if len(errLine) > 200 {
 						errLine = errLine[:200] + "..."
@@ -1592,26 +1664,20 @@ func (e *EmailNotifier) sendViaSendmail(ctx context.Context, recipient, subject,
 		}
 	}
 
+	// This email's queue ID: the one sendmail returned, else the one the mail log gives
+	// its Message-ID, else, while the mail log has no line of it yet, the one new mail
+	// queue entry for the recipient. Never another message's.
+	if queueID == "" {
+		if found, readable := e.findQueueIDByMessageID(ctx, messageID); found != "" {
+			queueID = found
+		} else if readable {
+			queueID = e.newQueueEntryFor(ctx, recipient, queuedBefore)
+		}
+	}
 	if queueID != "" {
 		status, matchedLine, logPath := e.inspectMailLogStatus(ctx, queueID)
+		e.logQueueStatusDebug(queueID, status, matchedLine)
 		e.logMailLogStatus(queueID, status, matchedLine, logPath)
-	} else {
-		e.logger.Debug("Sendmail did not report a queue ID; attempting to detect from mail queue output")
-		if detectedID, queueLine, err := e.detectQueueEntry(ctx, recipient); err == nil {
-			if detectedID != "" {
-				queueID = detectedID
-				e.logger.Info("Detected queue ID %s for %s by inspecting mail queue output", queueID, recipient)
-				if queueLine != "" && e.logger.GetLevel() >= types.LogLevelDebug {
-					e.logger.Debug("Mail queue entry: %s", queueLine)
-				}
-				status, matchedLine, logPath := e.inspectMailLogStatus(ctx, queueID)
-				e.logMailLogStatus(queueID, status, matchedLine, logPath)
-			} else {
-				e.logger.Debug("No matching mail queue entry found for %s immediately after sending", recipient)
-			}
-		} else {
-			e.logger.Debug("Unable to inspect mail queue entries for %s: %v", recipient, err)
-		}
 	}
 
 	e.logger.Debug("✅ Email handed off to sendmail successfully")

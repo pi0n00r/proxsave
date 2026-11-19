@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -17,9 +19,11 @@ import (
 	"github.com/tis24dev/proxsave/internal/orchestrator"
 	"github.com/tis24dev/proxsave/internal/types"
 	"github.com/tis24dev/proxsave/internal/ui/components"
+	"github.com/tis24dev/proxsave/internal/ui/flows/menu"
 	"github.com/tis24dev/proxsave/internal/ui/shell"
 	"github.com/tis24dev/proxsave/internal/ui/theme"
 	"github.com/tis24dev/proxsave/internal/uitest"
+	"github.com/tis24dev/proxsave/internal/whatsnew"
 )
 
 // installDashboardGates fixes the two gate seams for a test. It also pins the
@@ -38,11 +42,11 @@ func installDashboardGates(t *testing.T, bare, interactive bool) {
 		return &config.Config{SchedulerMode: "cron"}, nil
 	}
 	// Stub the privileged apply ops (no real systemctl / /etc/systemd writes).
-	daemonApplyDaemonMode = func(ctx context.Context, cfg *config.Config, configPath, execToken string, bl *logging.BootstrapLogger) error {
-		return nil
+	daemonApplyDaemonMode = func(ctx context.Context, cfg *config.Config, configPath, execToken string, bl *logging.BootstrapLogger) (cronRemovalOutcome, error) {
+		return cronRemovalOutcome{Removed: 1, Verified: true}, nil
 	}
-	daemonApplyCronMode = func(ctx context.Context, cfg *config.Config, configPath, execToken string, bl *logging.BootstrapLogger, optOut bool) error {
-		return nil
+	daemonApplyCronMode = func(ctx context.Context, cfg *config.Config, configPath, execToken string, bl *logging.BootstrapLogger) (cronRevertReport, error) {
+		return cronRevertReport{}, nil
 	}
 	t.Cleanup(func() {
 		dashboardIsBareInvocation = origBare
@@ -96,7 +100,7 @@ func installDashboardSessionSeam(t *testing.T) *newkeyUIDriver {
 	// byte-identical to before this hook existed. The Screen 0 behavior itself is
 	// covered by whatsnew_wiring_test.go.
 	origDecide := whatsnewDecide
-	whatsnewDecide = func(baseDir, current string) (bool, string, error) { return false, "", nil }
+	whatsnewDecide = func(loc whatsnew.Location, current string) (bool, string, error) { return false, "", nil }
 	t.Cleanup(func() {
 		testDashboardSession = orig
 		whatsnewDecide = origDecide
@@ -331,7 +335,15 @@ func TestBuildDaemonStatusPrompt(t *testing.T) {
 		Diagnosis:    health.Diagnosis{State: health.TxRunningNoReport},
 	}
 	level, keyword, expl := daemonStatusStyle(behind)
-	prompt := ansi.Strip(buildDaemonStatusPrompt(level, keyword, expl, "daemon", "installed", "active", "no", behind))
+	prompt := ansi.Strip(buildDaemonStatusPrompt(daemonDiagnostics{
+		Mode:        "daemon",
+		Unit:        "installed",
+		Active:      "active",
+		State:       behind,
+		Level:       level,
+		Keyword:     keyword,
+		Explanation: expl,
+	}))
 	for _, want := range []string{
 		"Status: ",
 		keyword,
@@ -340,13 +352,81 @@ func TestBuildDaemonStatusPrompt(t *testing.T) {
 		"Scheduler mode: daemon",
 		"Daemon service (proxsave-daemon.service): installed",
 		"Service state (systemctl is-active): active",
-		"Opted out of auto-migration (--daemon-remove): no",
 		"Running version: 1.2.3 (abc1234)",
 		"Binary alignment: BEHIND (restart needed)",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q\n---\n%s", want, prompt)
 		}
+	}
+
+	// The screen used to carry "Opted out of auto-migration (--daemon-remove): yes|no". There is
+	// no opt-out any longer: the retrofit reads whether SCHEDULER_MODE was already in the file,
+	// and the "Scheduler mode:" line directly above already states the answer that matters. A
+	// line naming a key nobody writes is a claim about the host that is no longer true.
+	for _, gone := range []string{"Opted out", "auto-migration", "DAEMON_OPT_OUT"} {
+		if strings.Contains(prompt, gone) {
+			t.Errorf("the status screen must not mention %q\n---\n%s", gone, prompt)
+		}
+	}
+}
+
+func TestBuildDaemonStatusPromptAndCLIAgreeOnRuntimeAndSynchronization(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		availability daemonRuntimeAvailability
+		sync         personalScriptSynchronization
+		wantRunning  string
+		wantSync     string
+	}{
+		{"in sync", daemonRuntimeAvailable, personalScriptInSync, "Daemon now: REFUSED", "Synchronization: IN SYNC"},
+		{"configuration drift", daemonRuntimeAvailable, personalScriptConfigurationDrift, "Daemon now: REFUSED", "Synchronization: OUT OF SYNC"},
+		{"path changed", daemonRuntimeAvailable, personalScriptPathStateChanged, "Daemon now: REFUSED", "Synchronization: PATH STATE CHANGED SINCE STARTUP"},
+		{"missing", daemonRuntimeMissing, personalScriptRuntimeUnavailable, "Daemon now: UNAVAILABLE", "Synchronization: UNKNOWN"},
+		{"stale", daemonRuntimeStale, personalScriptRuntimeUnavailable, "Daemon now: UNAVAILABLE", "Synchronization: UNKNOWN"},
+		{"invalid", daemonRuntimeInvalid, personalScriptRuntimeUnavailable, "Daemon now: UNAVAILABLE", "Synchronization: UNKNOWN"},
+		{"unsupported", daemonRuntimeUnsupported, personalScriptRuntimeUnavailable, "Daemon now: UNAVAILABLE", "Synchronization: UNKNOWN"},
+		{"not running", daemonRuntimeNotApplicable, personalScriptSyncNotApplicable, "Daemon now: NOT RUNNING", "Synchronization: NOT APPLICABLE"},
+		{"unknown sync", daemonRuntimeAvailable, "", "Daemon now: REFUSED", "Synchronization: UNKNOWN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			comparison := personalScriptComparison{
+				Running:         personalScriptDiagnostic{Path: "/running.sh", State: personalScriptRefused, Reason: "unsafe\x1b]0;refusal-payload\x07owner"},
+				Current:         personalScriptDiagnostic{Path: "/current.sh", State: personalScriptReady},
+				Synchronization: tc.sync,
+				SyncReason:      "sync\x1b]0;sync-payload\x07detail",
+			}
+			diagnostics := daemonDiagnostics{
+				Runtime:           daemonRuntimeDiagnostic{Availability: tc.availability, Reason: "runtime\x1b]0;runtime-payload\x07detail"},
+				ScriptComparisons: personalScriptComparisons{Pre: comparison, Post: comparison},
+			}
+			buf := &bytes.Buffer{}
+			logger := logging.New(types.LogLevelInfo, false)
+			logger.SetOutput(buf)
+			logDaemonDiagnostics(logger, diagnostics)
+			for name, out := range map[string]string{"cli": buf.String(), "dashboard": ansi.Strip(buildDaemonStatusPrompt(diagnostics))} {
+				assertNoRawInjection(t, out)
+				for _, want := range []string{tc.wantRunning, tc.wantSync, "Configuration: READY (/current.sh)"} {
+					if !strings.Contains(out, want) {
+						t.Errorf("%s missing %q:\n%s", name, want, out)
+					}
+				}
+				for _, forbidden := range []string{"payload", "Daemon now: NOT CONFIGURED"} {
+					if strings.Contains(out, forbidden) {
+						t.Errorf("%s retained %q:\n%s", name, forbidden, out)
+					}
+				}
+				if tc.availability == daemonRuntimeAvailable {
+					if !strings.Contains(out, "REFUSED (/running.sh): unsafeowner") {
+						t.Errorf("%s omitted refusal detail:\n%s", name, out)
+					}
+				} else if tc.availability != daemonRuntimeNotApplicable {
+					if !strings.Contains(out, "UNAVAILABLE (runtimedetail)") {
+						t.Errorf("%s omitted unavailable reason:\n%s", name, out)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -368,14 +448,15 @@ func TestBuildDaemonStatusPromptSanitizesInjection(t *testing.T) {
 		Diagnosis:    health.Diagnosis{State: health.TxRunningNoReport},
 	}
 	level, keyword, expl := daemonStatusStyle(behind)
-	prompt := buildDaemonStatusPrompt(
-		level, keyword, expl,
-		"cron\x1b]0;evilmode\x07", // mode: from the config file
-		"installed",
-		"active\x9b\x1b]0;x\x07running", // active: from systemctl (0x9b is the bare C1 CSI byte)
-		"no",
-		behind,
-	)
+	prompt := buildDaemonStatusPrompt(daemonDiagnostics{
+		Mode:        "cron\x1b]0;evilmode\x07", // mode: from the config file
+		Unit:        "installed",
+		Active:      "active\x9b\x1b]0;x\x07running", // active: from systemctl (0x9b is the bare C1 CSI byte)
+		State:       behind,
+		Level:       level,
+		Keyword:     keyword,
+		Explanation: expl,
+	})
 	assertNoRawInjection(t, prompt)
 	// OSC payloads ("pwned", "evilmode") are stripped WHOLE with their escape, so
 	// they must NOT survive. Commit's CSI erase carries no payload, so "abcdef"
@@ -467,9 +548,9 @@ func TestDashboardDaemonStatusLoopsBack(t *testing.T) {
 func TestDashboardDaemonInstallInSession(t *testing.T) {
 	installDashboardGates(t, true, true) // cron -> Install daemon; apply stubbed -> nil
 	applied := 0
-	daemonApplyDaemonMode = func(ctx context.Context, cfg *config.Config, configPath, execToken string, bl *logging.BootstrapLogger) error {
+	daemonApplyDaemonMode = func(ctx context.Context, cfg *config.Config, configPath, execToken string, bl *logging.BootstrapLogger) (cronRemovalOutcome, error) {
 		applied++
-		return nil
+		return cronRemovalOutcome{Removed: 1, Verified: true}, nil
 	}
 	driver := installDashboardSessionSeam(t)
 	args := &cli.Args{}
@@ -496,6 +577,158 @@ func TestDashboardDaemonInstallInSession(t *testing.T) {
 	}
 }
 
+// The dashboard mutes the global logger and the bootstrap console for the whole operation and
+// never flushes them (dashboard.go:589-595), because raw log lines would corrupt the alternate
+// screen. The result screen is therefore the ONLY channel open on this path, and the install
+// direction had none for the #298 finding: warnIndirectProxsaveCronOnDaemonInstall wrote its
+// three lines into the muted logger and cronRemovalOutcome had no field to carry them, so an
+// operator installing the daemon on a host whose backup runs through their own script saw a
+// green INSTALLED and got two backups a night. The revert direction already had this channel.
+func TestDashboardDaemonInstallWarnsOnADuplicateSchedule(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		outcome     cronRemovalOutcome
+		wantLevel   orchestrator.HealthcheckSetupLevel
+		wantKeyword string
+		wantText    string
+		alsoWants   []string
+	}{
+		{
+			name:        "nothing else schedules ProxSave: unchanged",
+			outcome:     cronRemovalOutcome{Removed: 1, Verified: true},
+			wantLevel:   orchestrator.HealthcheckSetupLevelOk,
+			wantKeyword: "INSTALLED",
+			wantText:    "Cron entry: removed.",
+		},
+		{
+			// An unverified removal already SAYS a proxsave entry may still be scheduled next to
+			// the daemon just installed. Saying that under a green tick is the contradiction: the
+			// level has to carry the same doubt the sentence does.
+			name:        "the crontab could not be checked: not a green tick",
+			outcome:     cronRemovalOutcome{},
+			wantLevel:   orchestrator.HealthcheckSetupLevelWarn,
+			wantKeyword: "INSTALLED - NO CRON ENTRY REMOVED",
+			wantText:    "Cron entry: could not be checked, one may still be scheduled alongside the daemon.",
+		},
+		{
+			name:        "an unmanaged schedule survives: warning",
+			outcome:     cronRemovalOutcome{Verified: true, UnmanagedSchedules: 1},
+			wantLevel:   orchestrator.HealthcheckSetupLevelWarn,
+			wantKeyword: "INSTALLED - DUPLICATE SCHEDULE",
+			wantText:    "Check your crons to remove duplication.",
+			// The duplicate sentence is ADDED, not swapped in. Replacing the message threw away
+			// the line saying what the removal actually did, on the screen that is the only
+			// channel this path has.
+			alsoWants: []string{"Daemon service: active (", "Cron entry: none was present to remove."},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installDashboardGates(t, true, true)
+			origShow := showDaemonResultScreenFn
+			t.Cleanup(func() { showDaemonResultScreenFn = origShow })
+			daemonApplyDaemonMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRemovalOutcome, error) {
+				return tc.outcome, nil
+			}
+			type shown struct {
+				level   orchestrator.HealthcheckSetupLevel
+				keyword string
+				text    string
+			}
+			ch := make(chan shown, 1)
+			showDaemonResultScreenFn = func(_ context.Context, _ *shell.Session, _ string, level orchestrator.HealthcheckSetupLevel, kw, explanation string) {
+				ch <- shown{level, kw, explanation}
+			}
+
+			driver := installDashboardSessionSeam(t)
+			res := driver.spawn(&cli.Args{})
+			driver.waitScreen("Dashboard")
+			driver.keys("down down down down down down down down down enter") // Install daemon
+
+			var got shown
+			select {
+			case got = <-ch:
+			case <-time.After(uitest.Deadline(60 * time.Second)):
+				t.Fatal("the install never reached the result screen")
+			}
+			driver.waitScreen("Dashboard")
+			driver.keys("esc")
+			select {
+			case <-res:
+			case <-time.After(uitest.Deadline(60 * time.Second)):
+				t.Fatal("dashboard did not resolve")
+			}
+
+			if got.level != tc.wantLevel {
+				t.Errorf("level = %v, want %v", got.level, tc.wantLevel)
+			}
+			if got.keyword != tc.wantKeyword {
+				t.Errorf("keyword = %q, want %q", got.keyword, tc.wantKeyword)
+			}
+			if !strings.Contains(got.text, tc.wantText) {
+				t.Errorf("the screen must state %q, got:\n%s", tc.wantText, got.text)
+			}
+			for _, want := range tc.alsoWants {
+				if !strings.Contains(got.text, want) {
+					t.Errorf("the screen must also state %q, got:\n%s", want, got.text)
+				}
+			}
+		})
+	}
+}
+
+// The other drivable #298 call site (see TestMaybeAutoMigrateDaemonReportsWhatTheRemovalDid).
+// The result screen is the only channel open on this path, so if the removal claim regressed
+// here the TUI would state a fact the code had not established while the CLI stated the truth.
+func TestDashboardDaemonInstallReportsWhatTheRemovalDid(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		outcome cronRemovalOutcome
+	}{
+		{"nothing matched", cronRemovalOutcome{Verified: true}},
+		{"crontab unreadable", cronRemovalOutcome{}},
+		{"one line removed", cronRemovalOutcome{Removed: 1, Verified: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installDashboardGates(t, true, true) // cron -> the menu offers "Install daemon"
+			origShow := showDaemonResultScreenFn
+			t.Cleanup(func() { showDaemonResultScreenFn = origShow })
+			daemonApplyDaemonMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRemovalOutcome, error) {
+				return tc.outcome, nil
+			}
+			shown := make(chan string, 1)
+			showDaemonResultScreenFn = func(_ context.Context, _ *shell.Session, _ string, _ orchestrator.HealthcheckSetupLevel, kw, explanation string) {
+				shown <- kw + "\n" + explanation
+			}
+
+			driver := installDashboardSessionSeam(t)
+			res := driver.spawn(&cli.Args{})
+			driver.waitScreen("Dashboard")
+			driver.keys("down down down down down down down down down enter") // Install daemon
+
+			var msg string
+			select {
+			case msg = <-shown:
+			case <-time.After(uitest.Deadline(60 * time.Second)):
+				t.Fatal("the install never reached the result screen")
+			}
+			driver.waitScreen("Dashboard")
+			driver.keys("esc")
+			select {
+			case <-res:
+			case <-time.After(uitest.Deadline(60 * time.Second)):
+				t.Fatal("dashboard did not resolve")
+			}
+
+			if want := cronRemovalScreenClause(tc.outcome); !strings.Contains(msg, want) {
+				t.Errorf("the result screen must carry %q, got:\n%s", want, msg)
+			}
+			if tc.outcome.Removed == 0 && strings.Contains(msg, "cron entry was removed") {
+				t.Errorf("nothing was removed but the screen claims a removal, got:\n%s", msg)
+			}
+		})
+	}
+}
+
 // TestDashboardDaemonRemoveWhenActive: with the daemon active the menu offers
 // "Disable daemon", which runs the revert op in-session (RunTask + notice) and
 // loops back. An op failure surfaces as an error notice, still non-blocking.
@@ -507,12 +740,9 @@ func TestDashboardDaemonRemoveWhenActive(t *testing.T) {
 	}
 	t.Cleanup(func() { daemonStatusLoadConfig = orig })
 	reverted := 0
-	daemonApplyCronMode = func(ctx context.Context, cfg *config.Config, configPath, execToken string, bl *logging.BootstrapLogger, optOut bool) error {
+	daemonApplyCronMode = func(ctx context.Context, cfg *config.Config, configPath, execToken string, bl *logging.BootstrapLogger) (cronRevertReport, error) {
 		reverted++
-		if !optOut {
-			t.Errorf("disable must opt out (optOut=true)")
-		}
-		return nil
+		return cronRevertReport{}, nil
 	}
 	driver := installDashboardSessionSeam(t)
 	args := &cli.Args{}
@@ -722,7 +952,7 @@ func TestDashboardFlowActionHandsSessionOver(t *testing.T) {
 	}
 	askRes := make(chan askOut, 1)
 	go func() {
-		_, err := shell.Ask(context.Background(), s, components.NewNotice(components.NoticeInfo, "Adopted", "still alive"))
+		_, err := shell.Ask(t.Context(), s, components.NewNotice(components.NoticeInfo, "Adopted", "still alive"))
 		askRes <- askOut{err}
 	}()
 	driver.waitScreen("Adopted")
@@ -781,4 +1011,801 @@ func TestDashboardSubScreenIdleTimeoutExits(t *testing.T) {
 	case <-time.After(uitest.Deadline(5 * time.Second)):
 		t.Fatal("dashboard sub-screen hung: the idle timeout did not bound it")
 	}
+}
+
+// The revert screen's "Future upgrades will not reinstall it" was a claim about a config write
+// that is best-effort: applyCronMode only warns when it fails and tears the daemon down anyway,
+// so a read-only or full filesystem produced a green screen asserting something that had not
+// happened. The host is then left with no unit and a config that still records the daemon.
+func TestDashboardDaemonRevertReportsAFailedConfigWrite(t *testing.T) {
+	installDashboardGates(t, true, true)
+	origCfg, origShow := daemonStatusLoadConfig, showDaemonResultScreenFn
+	t.Cleanup(func() { daemonStatusLoadConfig, showDaemonResultScreenFn = origCfg, origShow })
+	daemonStatusLoadConfig = func(string, string) (*config.Config, error) {
+		return &config.Config{SchedulerMode: "daemon"}, nil
+	}
+	daemonApplyCronMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRevertReport, error) {
+		return cronRevertReport{CronScheduled: true, ModeRecorded: false}, nil
+	}
+	type shown struct {
+		level   orchestrator.HealthcheckSetupLevel
+		keyword string
+		text    string
+	}
+	ch := make(chan shown, 1)
+	showDaemonResultScreenFn = func(_ context.Context, _ *shell.Session, _ string, level orchestrator.HealthcheckSetupLevel, kw, explanation string) {
+		ch <- shown{level, kw, explanation}
+	}
+
+	driver := installDashboardSessionSeam(t)
+	res := driver.spawn(&cli.Args{})
+	driver.waitScreen("Dashboard")
+	driver.keys("down down down down down down down down down enter") // Disable daemon
+
+	var got shown
+	select {
+	case got = <-ch:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("the revert never reached the result screen")
+	}
+	driver.waitScreen("Dashboard")
+	driver.keys("esc")
+	select {
+	case <-res:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("dashboard did not resolve")
+	}
+
+	if got.level != orchestrator.HealthcheckSetupLevelWarn {
+		t.Errorf("a config write that did not land must not be green, level = %v", got.level)
+	}
+	if !strings.Contains(got.text, "Configuration: NOT updated") {
+		t.Errorf("the screen must say the configuration was not updated, got:\n%s", got.text)
+	}
+	if strings.Contains(got.text, "SCHEDULER_MODE=cron recorded") {
+		t.Errorf("the screen must not claim the record that was not written, got:\n%s", got.text)
+	}
+}
+
+// The revert deliberately creates the duplicate it reports: it writes its cron line even when
+// something unmanaged already schedules ProxSave, because withholding it would leave a
+// misidentified host with nothing scheduled. The CLI says so with a WARNING. On the dashboard
+// that warning goes into a logger muted for the whole operation and never flushed, and
+// cronRevertReport carried only the /etc findings, so a host that now runs the backup twice got
+// a green REVERTED TO CRON. The install direction already had this channel.
+func TestDashboardDaemonRevertWarnsOnADuplicateSchedule(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		report      cronRevertReport
+		wantLevel   orchestrator.HealthcheckSetupLevel
+		wantKeyword string
+		wantText    string
+	}{
+		{
+			name:        "nothing else schedules ProxSave: unchanged",
+			report:      cronRevertReport{CronScheduled: true, ModeRecorded: true},
+			wantLevel:   orchestrator.HealthcheckSetupLevelOk,
+			wantKeyword: "REVERTED TO CRON",
+			wantText:    "Daemon service: removed.",
+		},
+		{
+			name:        "an unmanaged schedule survives: warning",
+			report:      cronRevertReport{CronScheduled: true, ModeRecorded: true, UnmanagedAdvisory: []string{"1 unmanaged crontab line(s) also appear to schedule ProxSave:", "  - 30 02 * * * /usr/local/sbin/nas-guard"}},
+			wantLevel:   orchestrator.HealthcheckSetupLevelWarn,
+			wantKeyword: "REVERTED - DUPLICATE SCHEDULE",
+			wantText:    "Check your crons to remove duplication.",
+		},
+		{
+			// Same fact, other habitat. The CLI already warns on both through
+			// logBootstrapWarning, so a screen that stays green on this one hands the same host
+			// two different levels depending on which channel the operator read.
+			name:        "the surviving schedule is under /etc: same level, same keyword",
+			report:      cronRevertReport{CronScheduled: true, ModeRecorded: true, SystemCronAdvisory: []string{"Reverting to cron: 1 possible ProxSave cron line(s) under /etc:", "  - 0 5 * * * root /usr/local/bin/proxsave --backup", "ProxSave owns the root crontab only and never edits files it did not place, 1 entry(ies) in /etc unchanged"}},
+			wantLevel:   orchestrator.HealthcheckSetupLevelWarn,
+			wantKeyword: "REVERTED - DUPLICATE SCHEDULE",
+			wantText:    "1 entry(ies) in /etc unchanged",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installDashboardGates(t, true, true)
+			origCfg, origShow := daemonStatusLoadConfig, showDaemonResultScreenFn
+			t.Cleanup(func() { daemonStatusLoadConfig, showDaemonResultScreenFn = origCfg, origShow })
+			daemonStatusLoadConfig = func(string, string) (*config.Config, error) {
+				return &config.Config{SchedulerMode: "daemon"}, nil
+			}
+			daemonApplyCronMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRevertReport, error) {
+				return tc.report, nil
+			}
+			type shown struct {
+				level   orchestrator.HealthcheckSetupLevel
+				keyword string
+				text    string
+			}
+			ch := make(chan shown, 1)
+			showDaemonResultScreenFn = func(_ context.Context, _ *shell.Session, _ string, level orchestrator.HealthcheckSetupLevel, kw, explanation string) {
+				ch <- shown{level, kw, explanation}
+			}
+
+			driver := installDashboardSessionSeam(t)
+			res := driver.spawn(&cli.Args{})
+			driver.waitScreen("Dashboard")
+			driver.keys("down down down down down down down down down enter") // Disable daemon
+
+			var got shown
+			select {
+			case got = <-ch:
+			case <-time.After(uitest.Deadline(60 * time.Second)):
+				t.Fatal("the revert never reached the result screen")
+			}
+			driver.waitScreen("Dashboard")
+			driver.keys("esc")
+			select {
+			case <-res:
+			case <-time.After(uitest.Deadline(60 * time.Second)):
+				t.Fatal("dashboard did not resolve")
+			}
+
+			if got.level != tc.wantLevel {
+				t.Errorf("level = %v, want %v", got.level, tc.wantLevel)
+			}
+			if got.keyword != tc.wantKeyword {
+				t.Errorf("keyword = %q, want %q", got.keyword, tc.wantKeyword)
+			}
+			if !strings.Contains(got.text, tc.wantText) {
+				t.Errorf("the screen must state %q, got:\n%s", tc.wantText, got.text)
+			}
+		})
+	}
+}
+
+// A revert whose cron entry could not be written is abandoned before anything changes, and the
+// dashboard has to say so on the screen that is its only channel: the logger is muted for the
+// whole operation. The daemon line must not borrow the teardown failure's wording ("NOT removed,
+// may still be running"): nobody tried to remove it, and it is certainly still scheduling the
+// backup. The title and the keyword of the failure screen stay, because both are true.
+func TestDashboardDaemonRevertKeepsTheDaemonWhenTheCronEntryIsNotWritten(t *testing.T) {
+	installDashboardGates(t, true, true)
+	origCfg, origShow := daemonStatusLoadConfig, showDaemonResultScreenFn
+	t.Cleanup(func() { daemonStatusLoadConfig, showDaemonResultScreenFn = origCfg, origShow })
+	daemonStatusLoadConfig = func(string, string) (*config.Config, error) {
+		return &config.Config{SchedulerMode: "daemon"}, nil
+	}
+	daemonApplyCronMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRevertReport, error) {
+		return cronRevertReport{CronWritten: true, CronVerified: true}, errCronRevertCronNotWritten
+	}
+	type shown struct {
+		title   string
+		level   orchestrator.HealthcheckSetupLevel
+		keyword string
+		text    string
+	}
+	ch := make(chan shown, 1)
+	showDaemonResultScreenFn = func(_ context.Context, _ *shell.Session, title string, level orchestrator.HealthcheckSetupLevel, kw, explanation string) {
+		ch <- shown{title, level, kw, explanation}
+	}
+
+	driver := installDashboardSessionSeam(t)
+	res := driver.spawn(&cli.Args{})
+	driver.waitScreen("Dashboard")
+	driver.keys("down down down down down down down down down enter") // Disable daemon
+
+	var got shown
+	select {
+	case got = <-ch:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("the revert never reached the result screen")
+	}
+	driver.waitScreen("Dashboard")
+	driver.keys("esc")
+	select {
+	case <-res:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("dashboard did not resolve")
+	}
+
+	if got.title != "Daemon disable failed" {
+		t.Errorf("title = %q, want the failure screen's own title", got.title)
+	}
+	if got.level != orchestrator.HealthcheckSetupLevelError {
+		t.Errorf("level = %v, want Error", got.level)
+	}
+	if got.keyword != "DAEMON NOT REMOVED" {
+		t.Errorf("keyword = %q, want DAEMON NOT REMOVED", got.keyword)
+	}
+	const want = "Daemon service: left in place, it keeps scheduling the backup.\n" +
+		"Cron entry: NOT written.\n" +
+		"Configuration: NOT updated, it still records the daemon engine."
+	if got.text != want {
+		t.Errorf("the screen must read exactly:\n%s\ngot:\n%s", want, got.text)
+	}
+}
+
+// The screen is the only channel on this path, and it carried the /etc findings as rendered lines
+// while carrying the root-crontab ones as a bare COUNT: a sentence pointing at an entry "below"
+// had nothing to list for one of them. The two habitats are now carried the same way, which is
+// also how the CLI has always printed them.
+func TestDashboardDaemonRevertListsBothHabitats(t *testing.T) {
+	unmanaged := []string{
+		"1 unmanaged crontab line(s) also appear to schedule ProxSave:",
+		"  - 30 02 * * * /usr/local/sbin/nas-guard",
+	}
+	etc := []string{
+		"Reverting to cron: 1 possible ProxSave cron line(s) under /etc:",
+		"  - 0 5 * * * root /usr/local/bin/proxsave --backup  [/etc/cron.d/proxsave]",
+	}
+	installDashboardGates(t, true, true)
+	origCfg, origShow := daemonStatusLoadConfig, showDaemonResultScreenFn
+	t.Cleanup(func() { daemonStatusLoadConfig, showDaemonResultScreenFn = origCfg, origShow })
+	daemonStatusLoadConfig = func(string, string) (*config.Config, error) {
+		return &config.Config{SchedulerMode: "daemon"}, nil
+	}
+	daemonApplyCronMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRevertReport, error) {
+		return cronRevertReport{
+			CronWritten:        true,
+			CronScheduled:      true,
+			CronVerified:       true,
+			ModeRecorded:       true,
+			UnmanagedAdvisory:  unmanaged,
+			SystemCronAdvisory: etc,
+		}, nil
+	}
+	type shown struct {
+		keyword string
+		text    string
+	}
+	ch := make(chan shown, 1)
+	showDaemonResultScreenFn = func(_ context.Context, _ *shell.Session, _ string, _ orchestrator.HealthcheckSetupLevel, kw, explanation string) {
+		ch <- shown{kw, explanation}
+	}
+
+	driver := installDashboardSessionSeam(t)
+	res := driver.spawn(&cli.Args{})
+	driver.waitScreen("Dashboard")
+	driver.keys("down down down down down down down down down enter") // Disable daemon
+
+	var got shown
+	select {
+	case got = <-ch:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("the revert never reached the result screen")
+	}
+	driver.waitScreen("Dashboard")
+	driver.keys("esc")
+	select {
+	case <-res:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("dashboard did not resolve")
+	}
+
+	if got.keyword != "REVERTED - DUPLICATE SCHEDULE" {
+		t.Errorf("keyword = %q, want REVERTED - DUPLICATE SCHEDULE", got.keyword)
+	}
+	for _, want := range append(append([]string{}, unmanaged...), etc...) {
+		if !strings.Contains(got.text, want) {
+			t.Errorf("the screen must list %q, got:\n%s", want, got.text)
+		}
+	}
+}
+
+// A failed install leaves the host in one of two states and the screen used to name neither.
+// installDaemonService writes the unit file atomically and THEN runs daemon-reload and
+// enable --now, so a failure in either of the last two leaves a unit file on disk while a
+// failure in the first two leaves nothing. The operator saw only the error string and could
+// not tell whether there was something to clean up before retrying.
+//
+// The sentence says exactly what daemonUnitInstalled measures, which is one os.Stat of the
+// unit path, and nothing about enabled or running: the probe cannot see either.
+func TestDashboardDaemonInstallFailureSaysWhetherAUnitWasLeftBehind(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		installed bool
+		want      string
+	}{
+		{"the unit file was written before the failure", true, "Daemon service: the unit file is on disk."},
+		{"the failure came before the unit file was written", false, "Daemon service: no unit file on disk."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installDashboardGates(t, true, true)
+			origShow, origProbe := showDaemonResultScreenFn, daemonInstalledProbe
+			t.Cleanup(func() { showDaemonResultScreenFn, daemonInstalledProbe = origShow, origProbe })
+			daemonInstalledProbe = func() bool { return tc.installed }
+			daemonApplyDaemonMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRemovalOutcome, error) {
+				return cronRemovalOutcome{}, errors.New("systemctl enable --now failed: exit status 1")
+			}
+			ch := make(chan string, 1)
+			showDaemonResultScreenFn = func(_ context.Context, _ *shell.Session, _ string, _ orchestrator.HealthcheckSetupLevel, _ string, explanation string) {
+				ch <- explanation
+			}
+
+			driver := installDashboardSessionSeam(t)
+			res := driver.spawn(&cli.Args{})
+			driver.waitScreen("Dashboard")
+			driver.keys("down down down down down down down down down enter") // Install daemon
+
+			var text string
+			select {
+			case text = <-ch:
+			case <-time.After(uitest.Deadline(60 * time.Second)):
+				t.Fatal("the failed install never reached the result screen")
+			}
+			driver.waitScreen("Dashboard")
+			driver.keys("esc")
+			select {
+			case <-res:
+			case <-time.After(uitest.Deadline(60 * time.Second)):
+				t.Fatal("dashboard did not resolve")
+			}
+
+			// The fact first, then the error indented under it, which is the shape the
+			// revert screen already uses for a teardown error.
+			want := tc.want + "\n  systemctl enable --now failed: exit status 1"
+			if text != want {
+				t.Errorf("the failure screen reads:\n%s\nwant:\n%s", text, want)
+			}
+		})
+	}
+}
+
+// The failure screen the revert renders is the WRONG one for an install. applyDaemonMode's only
+// error return is installDaemonService's, which fires before any cron or config work, so the
+// report it hands back is a zero value: rendering it would tell the operator, on a host where
+// nothing was touched, that the cron entry could not be written and the configuration still
+// records the daemon engine. Both sentences would be inventions.
+//
+// The guard that keeps them apart is one "!install" nobody was checking.
+func TestDashboardDaemonInstallFailureKeepsTheGenericScreen(t *testing.T) {
+	installDashboardGates(t, true, true)
+	origShow := showDaemonResultScreenFn
+	t.Cleanup(func() { showDaemonResultScreenFn = origShow })
+	daemonApplyDaemonMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRemovalOutcome, error) {
+		return cronRemovalOutcome{}, errors.New("systemctl enable --now failed: exit status 1")
+	}
+	type shown struct {
+		level   orchestrator.HealthcheckSetupLevel
+		keyword string
+		text    string
+	}
+	ch := make(chan shown, 1)
+	showDaemonResultScreenFn = func(_ context.Context, _ *shell.Session, _ string, level orchestrator.HealthcheckSetupLevel, kw, explanation string) {
+		ch <- shown{level, kw, explanation}
+	}
+
+	driver := installDashboardSessionSeam(t)
+	res := driver.spawn(&cli.Args{})
+	driver.waitScreen("Dashboard")
+	driver.keys("down down down down down down down down down enter") // Install daemon
+
+	var got shown
+	select {
+	case got = <-ch:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("the failed install never reached the result screen")
+	}
+	driver.waitScreen("Dashboard")
+	driver.keys("esc")
+	select {
+	case <-res:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("dashboard did not resolve")
+	}
+
+	if got.keyword != "FAILED" {
+		t.Errorf("a failed install keeps the generic failure screen, keyword = %q", got.keyword)
+	}
+	if got.level != orchestrator.HealthcheckSetupLevelError {
+		t.Errorf("level = %v, want Error", got.level)
+	}
+	if !strings.Contains(got.text, "systemctl enable --now failed") {
+		t.Errorf("the screen must carry the error it was given, got:\n%s", got.text)
+	}
+	// The revert screen's sentences describe work applyDaemonMode never reached.
+	for _, invented := range []string{"cron entry", "configuration", "daemon service could NOT be removed"} {
+		if strings.Contains(got.text, invented) {
+			t.Errorf("a failed install must not borrow the revert screen's %q, got:\n%s", invented, got.text)
+		}
+	}
+}
+
+// The menu row is decided by the scheduler mode alone. It used to consult a second key,
+// DAEMON_OPT_OUT, purely to tell "reverted from the daemon" apart from "never had it" and
+// label the same command "Re-enable" instead of "Install". Both rows ran ActionDaemonSetup and
+// the distinction was never one the operator could act on differently, so with that key
+// retired the two states collapse into one rather than needing a replacement signal.
+func TestDashboardDaemonStateIsSchedulerModeOnly(t *testing.T) {
+	orig := daemonStatusLoadConfig
+	t.Cleanup(func() { daemonStatusLoadConfig = orig })
+
+	for _, tc := range []struct {
+		name string
+		cfg  *config.Config
+		err  error
+		want menu.DaemonState
+	}{
+		{"daemon", &config.Config{SchedulerMode: "daemon"}, nil, menu.DaemonStateActive},
+		{"cron", &config.Config{SchedulerMode: "cron"}, nil, menu.DaemonStateOnCron},
+		{"unrecognised mode falls back to cron, like the parser", &config.Config{SchedulerMode: ""}, nil, menu.DaemonStateOnCron},
+		{"config unreadable: only Status", nil, errors.New("nope"), menu.DaemonStateUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			daemonStatusLoadConfig = func(string, string) (*config.Config, error) { return tc.cfg, tc.err }
+			if got := dashboardDaemonState(&cli.Args{}); got != tc.want {
+				t.Errorf("dashboardDaemonState() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The /etc advisory used to be recorded and dropped on the TUI: runDashboardDaemonAdmin
+// mutes the global logger and sets the bootstrap console quiet for the whole operation and
+// never flushes it, so a revert on a host that may now be scheduled twice showed a green
+// "REVERTED TO CRON" and nothing else. The CLI said it, the TUI did not. applyCronMode now
+// returns the lines and the result screen carries them.
+//
+// The assertion goes through showDaemonResultScreenFn rather than the rendered screen: what
+// matters is that the advisory reaches the only channel open on this path, and matching the
+// painted text would instead be matching wherever BuildStatusPrompt happened to wrap it.
+func TestDashboardDaemonRevertShowsTheSystemCronAdvisory(t *testing.T) {
+	installDashboardGates(t, true, true)
+	origCfg := daemonStatusLoadConfig
+	origShow := showDaemonResultScreenFn
+	t.Cleanup(func() {
+		daemonStatusLoadConfig = origCfg
+		showDaemonResultScreenFn = origShow
+	})
+	daemonStatusLoadConfig = func(string, string) (*config.Config, error) {
+		return &config.Config{SchedulerMode: "daemon"}, nil
+	}
+	// The stub hands back the advisory the PRODUCT builds, not a hand-written approximation of
+	// it. A fabricated sentence would pin the plumbing and nothing else: it would keep passing
+	// while the real wording drifted, and it would read to the next person as if the text on
+	// the screen were pinned here when no line of it ever came from the product. The wording
+	// itself is pinned where it is produced (cron_indirect_refs_test.go, daemon_cron_reporting_test.go);
+	// what this test owns is that every line of it reaches the only channel open on this path.
+	advisory := systemCronScheduleAdvisory([]indirectCronRef{{
+		Line:    "17 02 * * * root /usr/local/sbin/proxsave-nas-guard",
+		Command: "/usr/local/sbin/proxsave-nas-guard",
+		Source:  "/etc/cron.d/proxsave-guard",
+		Reason:  `command "proxsave-nas-guard" is named after proxsave and could not be read`,
+	}})
+	if len(advisory) == 0 {
+		t.Fatal("the advisory builder returned nothing: this test would then assert on an empty set")
+	}
+	daemonApplyCronMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRevertReport, error) {
+		return cronRevertReport{SystemCronAdvisory: advisory, CronScheduled: true, ModeRecorded: true}, nil
+	}
+	shown := make(chan string, 1)
+	showDaemonResultScreenFn = func(_ context.Context, _ *shell.Session, _ string, _ orchestrator.HealthcheckSetupLevel, kw, explanation string) {
+		shown <- kw + "\n" + explanation
+	}
+
+	driver := installDashboardSessionSeam(t)
+	res := driver.spawn(&cli.Args{})
+	driver.waitScreen("Dashboard")
+	driver.keys("down down down down down down down down down enter") // Disable daemon
+
+	var msg string
+	select {
+	case msg = <-shown:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("the revert never reached the result screen")
+	}
+	// Wait for the menu to be repainted before sending esc: the stub returns immediately,
+	// so without this the key can land while the loop is still between screens.
+	driver.waitScreen("Dashboard")
+	driver.keys("esc")
+	select {
+	case <-res:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("dashboard did not resolve")
+	}
+
+	// The keyword is the duplicate one, not the plain success: an /etc finding raises the level
+	// exactly as a root-crontab wrapper does, which is what the CLI has always done for both.
+	// See TestDashboardDaemonRevertWarnsOnADuplicateSchedule for that rule; what this test owns
+	// is that every line of the advisory reaches the screen.
+	if !strings.Contains(msg, "REVERTED - DUPLICATE SCHEDULE") {
+		t.Fatalf("an /etc finding must carry the duplicate keyword, got:\n%s", msg)
+	}
+	if !strings.Contains(msg, "Daemon service: removed.") {
+		t.Errorf("the existing message must not be replaced, got:\n%s", msg)
+	}
+	// EVERY line, not just the first: the header carries the count, the item carries the cron
+	// line and the file it lives in, and the closing line says what ProxSave did not touch.
+	// Dropping any one of them leaves the operator a different fact.
+	for _, want := range advisory {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the revert result screen must carry %q, got:\n%s", want, msg)
+		}
+	}
+}
+
+// A failed teardown is the ONE revert failure that arrives with a populated report, and the
+// screen used to throw the whole thing away: it showed opErr.Error() on one line and returned,
+// so the duplicate-schedule finding, the /etc advisory and the config-write fact were all lost
+// on the one path where the logger is muted for the whole operation and never flushed.
+//
+// What survives a failed removeDaemonServiceFn, and what does not, is decided by applyCronMode's
+// F09-06 ordering rather than by guesswork. CronScheduled was read back from the crontab BEFORE
+// the teardown; UnmanagedAdvisory is the root-crontab wrapper lines read before it, which ProxSave
+// never edits; ModeRecorded is setBackupEnvKeys' result, before it; SystemCronAdvisory is the /etc
+// scan, deliberately placed after it. All four are still true. Three things are NOT: that the
+// daemon service was removed, cronModeRecordClause's tail "...while no daemon is installed", and
+// "nothing is scheduling the backup" - because the daemon that could not be removed may still be
+// scheduling it. And one fact is new and in no field: with a cron line in place and a daemon that
+// may still be alive, the host now has two schedulers at the same minute.
+func TestCronRevertScreenOnAFailedTeardown(t *testing.T) {
+	teardown := errors.New("remove /etc/systemd/system/proxsave-daemon.service: permission denied")
+	unmanaged := []string{
+		"Reverting to cron: 1 unmanaged crontab line(s) also appear to schedule ProxSave:",
+		"  - 30 02 * * * /usr/local/sbin/nas-guard",
+	}
+	etc := systemCronScheduleAdvisory([]indirectCronRef{{
+		Line:    "17 02 * * * root /usr/local/sbin/proxsave-nas-guard",
+		Command: "/usr/local/sbin/proxsave-nas-guard",
+		Source:  "/etc/cron.d/proxsave-guard",
+		Reason:  `command "proxsave-nas-guard" is named after proxsave and could not be read`,
+	}})
+	if len(etc) == 0 {
+		t.Fatal("the advisory builder returned nothing: this test would then assert on an empty set")
+	}
+
+	for _, tc := range []struct {
+		name        string
+		revert      cronRevertReport
+		err         error
+		wantLevel   orchestrator.HealthcheckSetupLevel
+		wantKeyword string
+		wantSays    []string
+		wantSilent  []string
+	}{
+		{
+			name:        "the cron line landed and the mode was recorded",
+			revert:      cronRevertReport{CronScheduled: true, ModeRecorded: true},
+			err:         teardown,
+			wantLevel:   orchestrator.HealthcheckSetupLevelError,
+			wantKeyword: "DAEMON NOT REMOVED - DUPLICATE SCHEDULE",
+			wantSays: []string{
+				"Daemon service: NOT removed, may still be running.",
+				"permission denied",
+				"Cron entry: in the crontab, so the backup may run twice.",
+				"Configuration: SCHEDULER_MODE=cron recorded.",
+			},
+			wantSilent: []string{"Daemon service: removed.", "nothing is scheduling the backup"},
+		},
+		{
+			name:        "the config write failed too",
+			revert:      cronRevertReport{CronScheduled: true},
+			err:         teardown,
+			wantLevel:   orchestrator.HealthcheckSetupLevelError,
+			wantKeyword: "DAEMON NOT REMOVED - DUPLICATE SCHEDULE",
+			wantSays:    []string{"Configuration: NOT updated", "still records the daemon engine"},
+			// cronModeRecordClause's failure arm ends "...while no daemon is installed", which is
+			// exactly what this failure disproves.
+			wantSilent: []string{"while no daemon is installed"},
+		},
+		{
+			name:        "both habitats still have to be listed",
+			revert:      cronRevertReport{CronScheduled: true, ModeRecorded: true, UnmanagedAdvisory: unmanaged, SystemCronAdvisory: etc},
+			err:         teardown,
+			wantLevel:   orchestrator.HealthcheckSetupLevelError,
+			wantKeyword: "DAEMON NOT REMOVED - DUPLICATE SCHEDULE",
+			wantSays:    append(append([]string{}, unmanaged...), etc...),
+		},
+
+		// CONTROLS: the success path may not move.
+		{
+			name:        "success, scheduled and recorded",
+			revert:      cronRevertReport{CronScheduled: true, ModeRecorded: true},
+			wantLevel:   orchestrator.HealthcheckSetupLevelOk,
+			wantKeyword: "REVERTED TO CRON",
+			wantSays:    []string{"Daemon service: removed.", "Cron entry: in the crontab."},
+			wantSilent:  []string{"NOT removed"},
+		},
+		{
+			name:        "success with an /etc finding",
+			revert:      cronRevertReport{CronScheduled: true, ModeRecorded: true, SystemCronAdvisory: etc},
+			wantLevel:   orchestrator.HealthcheckSetupLevelWarn,
+			wantKeyword: "REVERTED - DUPLICATE SCHEDULE",
+			wantSays:    etc,
+			wantSilent:  []string{"NOT removed"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			level, keyword, msg := buildCronRevertScreen(tc.revert, tc.err)
+			if level != tc.wantLevel {
+				t.Errorf("level = %v, want %v", level, tc.wantLevel)
+			}
+			if keyword != tc.wantKeyword {
+				t.Errorf("keyword = %q, want %q", keyword, tc.wantKeyword)
+			}
+			for _, want := range tc.wantSays {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the screen must state %q, got:\n%s", want, msg)
+				}
+			}
+			for _, absent := range tc.wantSilent {
+				if strings.Contains(msg, absent) {
+					t.Errorf("the screen must NOT claim %q, got:\n%s", absent, msg)
+				}
+			}
+		})
+	}
+}
+
+// A revert abandoned at the cron gate never reached the teardown, so its screen may not borrow the
+// teardown's daemon line, and its cron line states what is known: a write the writer reported as
+// failed is NOT written whatever the crontab shows; a write it believed landed but that could not
+// be read back is unchecked; a readable crontab without the line is NOT written. Nothing past the
+// gate ran, so no advisory and no config record can be on it.
+func TestCronRevertScreenWhenTheCronEntryIsNotWritten(t *testing.T) {
+	const daemonLine = "Daemon service: left in place, it keeps scheduling the backup."
+	const configLine = "Configuration: NOT updated, it still records the daemon engine."
+	for _, tc := range []struct {
+		name     string
+		revert   cronRevertReport
+		wantCron string
+	}{
+		{
+			name:     "the writer reported a failure",
+			revert:   cronRevertReport{CronWritten: false, CronVerified: true},
+			wantCron: "Cron entry: NOT written.",
+		},
+		{
+			name:     "the writer reported a failure and the crontab is unreadable",
+			revert:   cronRevertReport{CronWritten: false, CronVerified: false},
+			wantCron: "Cron entry: NOT written.",
+		},
+		{
+			name:     "the line is not in a readable crontab",
+			revert:   cronRevertReport{CronWritten: true, CronVerified: true},
+			wantCron: "Cron entry: NOT written.",
+		},
+		{
+			name:     "the crontab could not be read back",
+			revert:   cronRevertReport{CronWritten: true, CronVerified: false},
+			wantCron: "Cron entry: could not be checked, the crontab was unreadable.",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			level, keyword, msg := buildCronRevertScreen(tc.revert, errCronRevertCronNotWritten)
+			if level != orchestrator.HealthcheckSetupLevelError {
+				t.Errorf("level = %v, want Error", level)
+			}
+			if keyword != "DAEMON NOT REMOVED" {
+				t.Errorf("keyword = %q, want DAEMON NOT REMOVED", keyword)
+			}
+			want := daemonLine + "\n" + tc.wantCron + "\n" + configLine
+			if msg != want {
+				t.Errorf("the screen must read exactly:\n%s\ngot:\n%s", want, msg)
+			}
+		})
+	}
+}
+
+// The wiring. The renderer above can be perfect and the operator still see one line, because the
+// generic failure arm showed opErr.Error() and returned before the report was ever read. This
+// test drives the real dashboard action and asserts on what reaches the only channel open here.
+func TestDashboardDaemonRevertKeepsTheReportWhenTheTeardownFails(t *testing.T) {
+	installDashboardGates(t, true, true)
+	origCfg := daemonStatusLoadConfig
+	origShow := showDaemonResultScreenFn
+	t.Cleanup(func() {
+		daemonStatusLoadConfig = origCfg
+		showDaemonResultScreenFn = origShow
+	})
+	daemonStatusLoadConfig = func(string, string) (*config.Config, error) {
+		return &config.Config{SchedulerMode: "daemon"}, nil
+	}
+	unmanaged := []string{
+		"Reverting to cron: 1 unmanaged crontab line(s) also appear to schedule ProxSave:",
+		"  - 30 02 * * * /usr/local/sbin/nas-guard",
+	}
+	etc := systemCronScheduleAdvisory([]indirectCronRef{{
+		Line:    "17 02 * * * root /usr/local/sbin/proxsave-nas-guard",
+		Command: "/usr/local/sbin/proxsave-nas-guard",
+		Source:  "/etc/cron.d/proxsave-guard",
+		Reason:  `command "proxsave-nas-guard" is named after proxsave and could not be read`,
+	}})
+	if len(etc) == 0 {
+		t.Fatal("the advisory builder returned nothing: this test would then assert on an empty set")
+	}
+	daemonApplyCronMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRevertReport, error) {
+		return cronRevertReport{
+			UnmanagedAdvisory:  unmanaged,
+			SystemCronAdvisory: etc,
+			CronScheduled:      true,
+		}, errors.New("remove /etc/systemd/system/proxsave-daemon.service: permission denied")
+	}
+	msg := runDashboardRevertAndCaptureScreen(t)
+
+	for _, want := range append(append(append([]string{
+		"Daemon service: NOT removed, may still be running.",
+		"permission denied",
+		"Cron entry: in the crontab, so the backup may run twice.",
+		"Configuration: NOT updated",
+	}, unmanaged...), etc...), "DAEMON NOT REMOVED - DUPLICATE SCHEDULE") {
+		if !strings.Contains(msg, want) {
+			t.Errorf("a failed teardown must still state %q, got:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "removed the daemon service") {
+		t.Errorf("the screen must not claim a removal that failed, got:\n%s", msg)
+	}
+}
+
+// The two sentinels abort BEFORE anything is written and hand back a zero report, so none of its
+// fields is a measurement - they are defaults. Routing them through the revert renderer would
+// state "the cron entry could NOT be written either" and "it still records the daemon engine"
+// about a host where neither was attempted, which is why the guard keys on the sentinel and not
+// on the report looking empty: a teardown failure on a host with no cron line, no config write
+// and no findings produces a report byte-identical to this one.
+func TestDashboardDaemonRevertSentinelsKeepTheirOwnScreens(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"config unreadable", errDaemonTeardownConfigUnreadable},
+		{"backup running", errDaemonTeardownBackupRunning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installDashboardGates(t, true, true)
+			origCfg := daemonStatusLoadConfig
+			origShow := showDaemonResultScreenFn
+			t.Cleanup(func() {
+				daemonStatusLoadConfig = origCfg
+				showDaemonResultScreenFn = origShow
+			})
+			daemonStatusLoadConfig = func(string, string) (*config.Config, error) {
+				return &config.Config{SchedulerMode: "daemon"}, nil
+			}
+			daemonApplyCronMode = func(context.Context, *config.Config, string, string, *logging.BootstrapLogger) (cronRevertReport, error) {
+				return cronRevertReport{}, tc.err
+			}
+			msg := runDashboardRevertAndCaptureScreen(t)
+
+			// Case-folded: the deferred screen writes "was NOT removed" and the sentinel string
+			// writes "was not removed". Both say the same fact and neither is this test's to pin.
+			if !strings.Contains(strings.ToLower(msg), "not removed") {
+				t.Errorf("the sentinel must still say the daemon was not removed, got:\n%s", msg)
+			}
+			for _, absent := range []string{"Cron entry: NOT written.", "still records the daemon engine", "may run twice", "may still be running"} {
+				if strings.Contains(msg, absent) {
+					t.Errorf("a zero report must not be reported as a measurement (%q), got:\n%s", absent, msg)
+				}
+			}
+		})
+	}
+}
+
+// runDashboardRevertAndCaptureScreen drives the dashboard's "Disable daemon" action with whatever
+// daemonApplyCronMode the caller installed, and returns the keyword and text the result screen
+// received. It follows TestDashboardDaemonRevertShowsTheSystemCronAdvisory: the caller installs
+// the gates, the config seam and the op seam; this only owns the key sequence and the deadlines.
+func runDashboardRevertAndCaptureScreen(t *testing.T) string {
+	t.Helper()
+	shown := make(chan string, 1)
+	showDaemonResultScreenFn = func(_ context.Context, _ *shell.Session, _ string, _ orchestrator.HealthcheckSetupLevel, kw, explanation string) {
+		shown <- kw + "\n" + explanation
+	}
+	driver := installDashboardSessionSeam(t)
+	res := driver.spawn(&cli.Args{})
+	driver.waitScreen("Dashboard")
+	driver.keys("down down down down down down down down down enter") // Disable daemon
+
+	var msg string
+	select {
+	case msg = <-shown:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("the revert never reached the result screen")
+	}
+	// Wait for the menu to be repainted before sending esc: the stub returns immediately, so
+	// without this the key can land while the loop is still between screens.
+	driver.waitScreen("Dashboard")
+	driver.keys("esc")
+	select {
+	case <-res:
+	case <-time.After(uitest.Deadline(60 * time.Second)):
+		t.Fatal("dashboard did not resolve")
+	}
+	return msg
 }

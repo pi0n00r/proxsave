@@ -28,6 +28,9 @@ const (
 	// Filesystems that do NOT support Unix ownership
 	FilesystemFAT32 FilesystemType = "vfat"
 	FilesystemFAT   FilesystemType = "fat"
+	// FilesystemMSDOS is the kernel's FAT driver without long names: FAT-family, treated
+	// like FilesystemFAT everywhere.
+	FilesystemMSDOS FilesystemType = "msdos"
 	FilesystemExFAT FilesystemType = "exfat"
 	FilesystemNTFS  FilesystemType = "ntfs"
 	FilesystemFUSE  FilesystemType = "fuse"
@@ -35,6 +38,9 @@ const (
 	// Network filesystems (need testing)
 	FilesystemNFS  FilesystemType = "nfs"
 	FilesystemNFS4 FilesystemType = "nfs4"
+	// FilesystemCeph is CephFS, kernel client or ceph-fuse: POSIX ownership unless the
+	// client cap carries root_squash, so the network probe decides.
+	FilesystemCeph FilesystemType = "ceph"
 	FilesystemCIFS FilesystemType = "cifs"
 	FilesystemSMB  FilesystemType = "smb"
 
@@ -50,6 +56,8 @@ type FilesystemInfo struct {
 	IsNetworkFS       bool
 	MountPoint        string
 	Device            string
+	// LinkTarget is where Path resolves when a symlink is on the way, "" otherwise.
+	LinkTarget string
 }
 
 // BackupLocation represents a location where backups are stored
@@ -110,18 +118,136 @@ type RetentionSummary struct {
 	LogsDeleted      int
 	LogsRemaining    int
 	HasLogInfo       bool
+
+	// ScopeValid separates "this host owns nothing here" from "retention never ran",
+	// which a count alone cannot express. Retention is skipped entirely when no limit
+	// is configured, and reporting 0 backups on a healthy host would be a worse lie
+	// than the unscoped total it replaces, so a consumer falls back to that total
+	// unless this is set.
+	ScopeValid bool
+	// Owned is how many archives at this location this host owns, by the rule
+	// retention prunes by (owned by name or adopted by server identity), taken after
+	// applyRetentionHostScope and net of whatever the pass then deleted. Other hosts'
+	// archives, archives nothing names and archives under another spelling of this
+	// host's name are not counted. It is the same number the statistics print for
+	// the location (StorageStats.TotalBackups), so one destination shows one count.
+	Owned int
+
+	// PassCompleted reports whether a retention pass RAN AND RETURNED WITHOUT ERROR.
+	// It does NOT certify the counts, and reading it that way would produce exactly
+	// the false report discussion #292 opened with.
+	//
+	// BackupsDeleted, BackupsRemaining, LogsDeleted, LogsRemaining and HasLogInfo are
+	// assigned only on the paths that actually DELETE something. The most common
+	// healthy pass, the steady state where everything is already within the limit,
+	// deletes nothing and therefore publishes zeros, while the location still holds
+	// however many archives this host owns. A caller printing BackupsRemaining on the
+	// strength of this flag would tell the operator the location is empty when it is
+	// full. Owned is the field that answers "how many are there", and ScopeValid is
+	// the field that says whether Owned is worth anything.
+	//
+	// What false means: no pass has run, or the last one bailed.
+	//
+	// The outcome counts below (Planned ... LogsNotDeleted) follow the same rule: they
+	// describe this pass and are zero before it ran. The counts are then
+	// the zero value even if the pass deleted archives before it failed, because
+	// ApplyRetention clears them on entry and only fills them once the delete loop
+	// finishes.
+	//
+	// What true does NOT mean: that anything was examined. A pass with no limit
+	// configured, and a pass over a location whose directory has vanished, both
+	// return without error and both stamp this true. It answers one question only,
+	// and it is the question a reader of this struct can act on.
+	//
+	// It exists because nothing else here can answer "has a pass run". The counts
+	// cannot: a healthy pass that finds everything within the limit publishes zeros,
+	// which is byte for byte what a backend that has never run reports. ScopeValid
+	// cannot either, and reusing it would be wrong rather than merely imprecise. It
+	// answers "did the scope account for the listing", so it stays true on a pass
+	// that scoped the listing and then failed (a context cancelled during the
+	// deletions), and a caller reading it as "a pass completed" would mis-report
+	// exactly that pass. A host that cannot name itself publishes both false: its
+	// pass does not start (applyRetentionHostScope returns an error there).
+	//
+	// False deliberately does NOT separate "no pass has run" from "the last pass
+	// failed". The only question a reader of this struct can act on is whether the
+	// numbers describe a finished pass, and whoever ran the pass already knows which
+	// of the two it is, because it is holding the error.
+	PassCompleted bool
+
+	// Planned is how many archives this pass selected for deletion. BackupsDeleted is
+	// how many of them are gone; the difference is NotDeleted.
+	Planned int
+	// NotDeleted counts the selected archives that are still in place.
+	NotDeleted int
+	// LeftBehind counts the deleted archives whose associated files stayed behind.
+	LeftBehind int
+	// Skipped counts the archives retention could not date and left alone.
+	Skipped int
+	// NotListed counts the archives the listing could not read, so retention never saw them.
+	NotListed int
+	// NoMetadata counts the archives retention described from their file name alone.
+	NoMetadata int
+	// LogsNotDeleted counts the logs whose removal failed: the logs of the deleted
+	// archives and the logs no archive answers to (pruneOrphanLogs).
+	LogsNotDeleted int
+	// HasLogPath says this destination keeps logs: its log folder is configured, so the
+	// outcome reports how many logs went even when the answer is 0.
+	HasLogPath bool
+	// LogsNotListed says the log folder could not be listed, so the logs no archive
+	// answers to were not checked. LogsNotListedCause is the short cause for the fact
+	// line ("timed out after 30s").
+	LogsNotListed      bool
+	LogsNotListedCause string
+	// NotRotated counts the archives named under this host's short name in a spelling
+	// it does not answer to, which retention left alone.
+	NotRotated int
+	// NotRotatedNames are the names those archives carry, in the order first met,
+	// joined for the outcome line: "a", "a and b", "a, b and c". A string rather than
+	// a slice so the summary stays comparable.
+	NotRotatedNames string
+	// SharedIdentityNames are the names under which a second machine carrying this
+	// host's server identity is still writing here: an adopted archive under that name
+	// is newer than this host's previous own backup (retentionSharedIdentity). Joined
+	// like NotRotatedNames, "" when there is none. Those archives were rotated.
+	SharedIdentityNames string
 }
 
 // RetentionReporter can be implemented by storage backends that expose details
 // about the most recent retention run (e.g., log counts).
+//
+// The contract, which this interface used to leave unsaid:
+//
+// LastRetentionSummary describes the most recent ApplyRetention call on THIS
+// backend and nothing else. It never fails and may be called at any time, which is
+// precisely why the value has to say how much it is worth: read PassCompleted
+// first and treat the counts as absent while it is false. Read it as a statement
+// about the PASS, never about the location: see PassCompleted for why a completed
+// pass routinely reports zero remaining on a location that is full. Counts do not
+// accumulate and do not survive into the next pass either, because ApplyRetention
+// clears them before its first return, so a pass that bails reports zeros rather
+// than the previous pass's counts standing as if they were current.
+//
+// It carries no locking, and adding some would be pretending. Every implementation
+// in this package writes these fields from ApplyRetention and reads them here, so
+// calling the two concurrently on ONE backend is a data race. Nothing does today:
+// StorageAdapter.Sync (internal/orchestrator/storage_adapter.go) is the only
+// caller, it reads the summary a few lines below its own ApplyRetention call on the
+// same goroutine, and syncStorageTargets runs the adapters one after another, each
+// over a backend of its own. An implementation that means to be read from another
+// goroutine has to provide its own synchronisation.
 type RetentionReporter interface {
 	LastRetentionSummary() RetentionSummary
 }
 
 // StorageStats contains statistics about a storage location
 type StorageStats struct {
-	TotalBackups   int
-	TotalSize      int64
+	// TotalBackups and TotalSize cover ONLY the archives this host owns, by the rule
+	// retention prunes by (ownedStorageStats). OldestBackup and NewestBackup too.
+	TotalBackups int
+	TotalSize    int64
+	// ListedBackups is every archive the listing returned, whoever owns it.
+	ListedBackups  int
 	OldestBackup   *time.Time
 	NewestBackup   *time.Time
 	AvailableSpace int64
@@ -146,18 +272,44 @@ type StorageError struct {
 }
 
 func (e *StorageError) Error() string {
-	criticality := "WARNING"
-	if e.IsCritical {
-		criticality = "CRITICAL"
-	}
-
+	// No severity word here. Every caller that prints this text prints it through a
+	// logger whose column already carries the level, so the prefix said it twice - and
+	// three times where the caller's own literal opened with it too. It also said
+	// nothing Location did not: IsCritical is set true at five sites, all of them
+	// LocationPrimary (local.go:111, :122, :153, :211, :539), so "CRITICAL" was a
+	// second spelling of "primary". The critical PATHS keep their marker at their own
+	// call sites, which append a literal "(CRITICAL)" and log in the ERROR column
+	// (internal/orchestrator/storage_adapter.go:76, :103, :142).
 	recoverable := ""
 	if e.Recoverable {
 		recoverable = " (recoverable)"
 	}
 
-	return criticality + ": " + string(e.Location) + " storage " + e.Operation +
-		" operation failed for " + e.Path + recoverable + ": " + e.Err.Error()
+	return string(e.Location) + " storage " + e.Operation +
+		" operation failed for " + e.Path + recoverable + ": " + e.causeText()
+}
+
+// causeText renders the wrapped cause. When that cause is DIRECTLY another StorageError
+// for the same location and the same path, only its operation and its own cause are
+// added: everything else it would print - the location, the path, the recoverable note -
+// is a second copy of what this sentence has already said. Recoverable is part of the
+// test: with the two disagreeing, collapsing would either drop the note or assert it
+// over a cause explicitly flagged the other way.
+//
+// That nesting is not hypothetical. ApplyRetention wraps a failed List in all three
+// backends (internal/storage/secondary.go:700, local.go:536, cloud.go:1940), always with
+// its own basePath, so location and path are identical inside and out. What the outer
+// error alone contributes is WHICH operation was running, and that is what survives.
+//
+// The check is a direct type assertion, not errors.As: a StorageError reached through
+// some other wrapper in between has that wrapper's text to print, and skipping it would
+// lose it.
+func (e *StorageError) causeText() string {
+	if inner, ok := e.Err.(*StorageError); ok && inner.Location == e.Location &&
+		inner.Path == e.Path && inner.Recoverable == e.Recoverable {
+		return inner.Operation + ": " + inner.causeText()
+	}
+	return e.Err.Error()
 }
 
 // Unwrap exposes the wrapped cause so callers can classify it with errors.Is/As
@@ -171,12 +323,24 @@ func (f FilesystemType) SupportsUnixOwnership() bool {
 		FilesystemXFS, FilesystemBtrfs, FilesystemZFS,
 		FilesystemJFS, FilesystemReiserFS, FilesystemOverlay, FilesystemTmpfs:
 		return true
-	case FilesystemFAT32, FilesystemFAT, FilesystemExFAT,
+	case FilesystemFAT32, FilesystemFAT, FilesystemMSDOS, FilesystemExFAT,
 		FilesystemNTFS, FilesystemFUSE:
 		return false
-	case FilesystemNFS, FilesystemNFS4, FilesystemCIFS, FilesystemSMB:
+	case FilesystemNFS, FilesystemNFS4, FilesystemCIFS, FilesystemSMB, FilesystemCeph:
 		// Network filesystems need runtime testing
 		return false
+	default:
+		return false
+	}
+}
+
+// hasNoUnixModes reports a FAT-family filesystem (vfat, fat, msdos, exfat): it has no Unix
+// permissions, the mount options give every file its mode, so there is no mode for a
+// chmod to set on a copy.
+func (f FilesystemType) hasNoUnixModes() bool {
+	switch f {
+	case FilesystemFAT32, FilesystemFAT, FilesystemMSDOS, FilesystemExFAT:
+		return true
 	default:
 		return false
 	}
@@ -185,7 +349,7 @@ func (f FilesystemType) SupportsUnixOwnership() bool {
 // IsNetworkFilesystem returns true if the filesystem is network-based
 func (f FilesystemType) IsNetworkFilesystem() bool {
 	switch f {
-	case FilesystemNFS, FilesystemNFS4, FilesystemCIFS, FilesystemSMB:
+	case FilesystemNFS, FilesystemNFS4, FilesystemCIFS, FilesystemSMB, FilesystemCeph:
 		return true
 	default:
 		return false
@@ -196,7 +360,7 @@ func (f FilesystemType) IsNetworkFilesystem() bool {
 // from ownership operations (incompatible filesystems like FAT32/CIFS)
 func (f FilesystemType) ShouldAutoExclude() bool {
 	switch f {
-	case FilesystemFAT32, FilesystemFAT, FilesystemExFAT, FilesystemNTFS, FilesystemFUSE, FilesystemCIFS, FilesystemSMB:
+	case FilesystemFAT32, FilesystemFAT, FilesystemMSDOS, FilesystemExFAT, FilesystemNTFS, FilesystemFUSE, FilesystemCIFS, FilesystemSMB:
 		return true
 	default:
 		return false

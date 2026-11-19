@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"cmp"
 	"errors"
 
 	"github.com/tis24dev/proxsave/internal/health"
@@ -43,8 +44,13 @@ type HealthcheckSetupState struct {
 	// clear TrustedLoginURL, the identity SanitizePortalLogin.
 	PortalURL   string
 	PortalLogin string
-	Verified    bool // provisioning ready AND monitor reachable -> Continue/return allowed
-	Fatal       bool // another check cannot help -> do NOT offer Check again
+	// LoginIsPortalPage says LoginURL is the portal's sign-in page, not a single-use link: the
+	// operator owns the project and signs in with their email (issue 347). LoginPasswordSet says
+	// the server confirmed they also have a password. Both false for a magic-link.
+	LoginIsPortalPage bool
+	LoginPasswordSet  bool
+	Verified          bool // provisioning ready AND monitor reachable -> Continue/return allowed
+	Fatal             bool // another check cannot help -> do NOT offer Check again
 }
 
 // ClassifyHealthcheckSetupResult maps a HealthcheckCheckResult to display state. The
@@ -60,6 +66,10 @@ func ClassifyHealthcheckSetupResult(res HealthcheckCheckResult) HealthcheckSetup
 	// trust/sanitize gates) lives in serverbot.TrustedPortalFallback, shared with the
 	// run epilogue's storePortalFallback so the two surfaces cannot drift.
 	st.PortalURL, st.PortalLogin = serverbot.TrustedPortalFallback(res.PortalURL, res.PortalLogin, res.PasswordSet, defaultServerAPIHost)
+	if st.LoginURL != "" && res.LoginKind == health.LoginKindPortal {
+		st.LoginIsPortalPage = true
+		st.LoginPasswordSet = res.PasswordSet != nil && *res.PasswordSet
+	}
 
 	// 1) Hard provisioning blockers: monitoring cannot operate until fixed -> override.
 	switch {
@@ -118,9 +128,7 @@ func ClassifyHealthcheckSetupResult(res HealthcheckCheckResult) HealthcheckSetup
 	if res.DaemonAlignChecked && !res.DaemonAligned {
 		st.Level, st.Keyword = HealthcheckSetupLevelWarn, "BEHIND"
 		reason := res.DaemonStale
-		if reason == "" {
-			reason = "it is running an older binary than the one now on disk"
-		}
+		reason = cmp.Or(reason, "it is running an older binary than the one now on disk")
 		ver := ""
 		if res.DaemonVersion != "" {
 			ver = " (v" + res.DaemonVersion + ")"
@@ -219,7 +227,7 @@ func ClassifyHealthcheckSetupSkip(res HealthcheckSetupBootstrap) HealthcheckSetu
 		st.Message = "The configuration could not be loaded, so backup monitoring could not be checked. Re-run the installer to repair it."
 	case HealthcheckSetupSkipSelfMode:
 		st.Keyword = "NOT CONFIGURED"
-		st.Message = "Self-mode monitoring is selected but no service-alive ping URL is configured yet. Enter the healthchecks parameters to finish setup."
+		st.Message = "Self-mode monitoring is selected but no service-alive check is configured yet: set a ping URL, or a check id with a ping endpoint. Enter the healthchecks parameters to finish setup."
 	case HealthcheckSetupSkipIdentityUnavailable:
 		// Two distinct causes collapse into this eligibility upstream: no ServerID at all,
 		// or a ServerID with no relay secret on disk yet. res.ServerID splits them (a
@@ -242,4 +250,14 @@ func ClassifyHealthcheckSetupSkip(res HealthcheckSetupBootstrap) HealthcheckSetu
 		st.Message = "Backup monitoring is not configured on this host."
 	}
 	return st
+}
+
+// HealthcheckPortalPageSignIn is the line under the portal's sign-in page when the operator owns the
+// project (HealthcheckSetupState.LoginIsPortalPage, issue 347): sign in with the email, with the
+// password when there is one, else with an emailed link. Shared by the TUI and --install --cli.
+func HealthcheckPortalPageSignIn(passwordSet bool) string {
+	if passwordSet {
+		return "Sign in: your email and password"
+	}
+	return `Sign in: your email, then "Email Me a Link"`
 }

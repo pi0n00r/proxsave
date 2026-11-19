@@ -7,10 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tis24dev/proxsave/internal/block"
 	"github.com/tis24dev/proxsave/internal/config"
 	"github.com/tis24dev/proxsave/internal/health"
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/notify"
+	"github.com/tis24dev/proxsave/internal/notifyfilter"
 	"github.com/tis24dev/proxsave/internal/orchestrator"
 )
 
@@ -27,7 +29,8 @@ func initializeBackupNotifications(opts backupModeOptions, orch *orchestrator.Or
 	initializeTelegramNotification(opts, orch)
 	initializeGotifyNotification(opts, orch)
 	initializeWebhookNotification(opts, orch)
-	initializeHealthcheckSection(opts, orch)
+	section := initializeHealthcheckSection(opts, orch)
+	logNotifyFilterInit(opts, orch, section)
 	notifyDone(nil)
 
 	fmt.Println()
@@ -72,8 +75,8 @@ func initializeEmailNotification(opts backupModeOptions, orch *orchestrator.Orch
 		From:             cfg.EmailFrom,
 		CloudRelayConfig: notify.CloudRelayConfig{
 			WorkerURL:   cfg.CloudflareWorkerURL,
-			WorkerToken: cfg.CloudflareWorkerToken,
-			HMACSecret:  cfg.CloudflareHMACSecret,
+			WorkerToken: notify.DefaultCloudRelayConfig.WorkerToken,
+			HMACSecret:  notify.DefaultCloudRelayConfig.HMACSecret,
 			Timeout:     cfg.WorkerTimeout,
 			MaxRetries:  cfg.WorkerMaxRetries,
 			RetryDelay:  cfg.WorkerRetryDelay,
@@ -86,40 +89,86 @@ func initializeEmailNotification(opts backupModeOptions, orch *orchestrator.Orch
 	}
 	emailAdapter := orchestrator.NewNotificationAdapter(emailNotifier, logger)
 	orch.RegisterNotificationChannel(emailAdapter)
-	logging.Info("✓ Email initialized (method: %s)", cfg.EmailDeliveryMethod)
+	logging.Info("✓ Email initialized (mode: %s)", cfg.EmailDeliveryMethod)
 }
 
 // initializeHealthcheckSection verifies the healthchecks config at run start and
 // registers the Phase-7 section, EXACTLY like the other notification channels: it prints
-// a real init line (SKIP when disabled, a WARNING that disables the section on a config
-// problem, or a "✓ initialized" when usable) instead of being silent. This is a
+// a real init line (SKIP when disabled, a report that disables the section on a config or
+// daemon problem, or a "✓ initialized" when usable) instead of being silent. This is a
 // CONFIG-only check (no network); the REAL transmission state is reported later by the
 // Phase-7 section from the daemon status file. Registering only when usable keeps a
 // disabled/broken section out of the dispatch, and the Phase-7 entries loop renders the
 // matching "disabled" / "enabled but not initialized" line just as it does for the others.
-func initializeHealthcheckSection(opts backupModeOptions, orch *orchestrator.Orchestrator) {
+//
+// That problem report is a WARNING on BOTH engines, and it costs the run the same exit code
+// on both. reportHealthchecksUnusable only adds the ENGINE to the reason, because "the daemon
+// is not there" reads differently on a host that was never meant to have one.
+// initializeHealthcheckSection returns how the section ended (notifyfilter.Section*),
+// which the NOTIFY_ON decision reads right after it.
+func initializeHealthcheckSection(opts backupModeOptions, orch *orchestrator.Orchestrator) string {
 	cfg := opts.cfg
 	logger := opts.logger
 	if cfg == nil || !cfg.HealthcheckEnabled {
 		logging.DebugStep(logger, "notifications init", "healthchecks disabled")
 		logging.Skip("Healthchecks: disabled")
-		return
+		return notifyfilter.SectionDisabled
 	}
 	// Verify config, then that the monitoring daemon (the ONLY pinger) is actually alive -
 	// a valid config is worthless if the daemon is down. On ANY problem, switch the
 	// channel to disabled EXACTLY like checkTelegramServerStatus does for a failed
 	// centralized handshake (main_identity.go): so the whole flow treats it as disabled.
+	// reportHealthchecksUnusable warns either way and names the engine in the reason when the
+	// host is on cron. Both probes still RUN in cron mode: their verdict is what fills in that
+	// reason, and a cron host that really does have a live daemon returns no problem here at
+	// all and initializes normally.
 	if problem := healthcheckConfigProblem(cfg); problem != "" {
-		disableHealthchecks(cfg, logger, problem)
-		return
+		reportHealthchecksUnusable(cfg, logger, problem)
+		return notifyfilter.SectionDisabled
 	}
 	if problem := healthcheckDaemonProblem(opts.ctx, cfg, logger); problem != "" {
-		disableHealthchecks(cfg, logger, problem)
-		return
+		reportHealthchecksUnusable(cfg, logger, problem)
+		return notifyfilter.SectionNotTransmitting
 	}
 	logging.DebugStep(logger, "notifications init", "healthchecks enabled (mode=%s, daemon up)", cfg.HealthcheckMode)
 	orch.RegisterNotificationChannel(orchestrator.NewHealthchecksChannel(cfg, logger))
 	logging.Info("✓ Healthchecks initialized (mode: %s)", cfg.HealthcheckMode)
+	if cfg.HealthcheckMode == config.HealthcheckModeSelf && !selfMonitorConfirmed(cfg, logger) {
+		return notifyfilter.SectionSelfUnconfirmed
+	}
+	return notifyfilter.SectionInitialized
+}
+
+// selfMonitorConfirmed reports whether, in self mode, the operator's own monitor is
+// known to receive: a backup check is configured and the last heartbeat reached it.
+// NOTIFY_ON filters the other channels only then (docs/HEALTHCHECKS.md): a fresh
+// heartbeat that failed (TxUnreachable: the monitor is down, or the check was
+// deleted) or never had a URL (TxNotProvisioned) used to count as transmitting, and
+// the run that knew the monitor was down was itself filtered.
+//
+// The backup check counts only as the URL the daemon pings (HealthcheckSelfPingURL):
+// an ID without a ping endpoint resolves to none, and no backup ping was ever sent.
+// A last backup ping answered HTTP 404 means the check does not exist on the monitor.
+func selfMonitorConfirmed(cfg *config.Config, logger *logging.Logger) bool {
+	if strings.TrimSpace(cfg.HealthcheckSelfPingURL(cfg.HealthcheckBackupURL, cfg.HealthcheckBackupID)) == "" {
+		logging.DebugStep(logger, "notifications init", "self monitor unconfirmed: no backup check ping URL, NOTIFY_ON not applied")
+		return false
+	}
+	st, err := health.LoadStatus(cfg.BaseDir)
+	if err != nil {
+		logging.DebugStep(logger, "notifications init", "self monitor unconfirmed: status unreadable (%v), NOTIFY_ON not applied", err)
+		return false
+	}
+	d := health.Diagnose(st, cfg.HealthcheckHeartbeatInterval, time.Now())
+	if d.State == health.TxUnreachable || d.State == health.TxNotProvisioned {
+		logging.DebugStep(logger, "notifications init", "self monitor unconfirmed: heartbeat state=%s, NOTIFY_ON not applied", d.State)
+		return false
+	}
+	if d.BackupCheckMissing() {
+		logging.DebugStep(logger, "notifications init", "self monitor unconfirmed: the last backup ping got HTTP 404 (no such check), NOTIFY_ON not applied")
+		return false
+	}
+	return true
 }
 
 // disableHealthchecks switches the section to disabled with a reason, mirroring
@@ -132,6 +181,72 @@ func disableHealthchecks(cfg *config.Config, logger *logging.Logger, reason stri
 	logging.Warning("Healthchecks: %s", reason)
 	logging.Skip("Healthchecks: disabled")
 	cfg.HealthcheckEnabled = false
+}
+
+// reportHealthchecksUnusable switches the section off with a reason, WARNS, and adds the
+// scheduler engine to that reason when the host is on cron.
+//
+// The SEVERITY is the same on both engines, and that is deliberate. A WARNING is counted off
+// the log file and promotes a clean run to exit 1 (applyIssueExitCode,
+// internal/orchestrator/extensions.go), which is the entire point of reporting it:
+// HEALTHCHECK_ENABLED=true is a statement that the operator WANTS monitoring, and monitoring
+// that silently does nothing is worth an exit code whichever scheduler is running.
+//
+// What the cron arm adds is the ENGINE, because the same reason means something else there.
+// On the daemon engine the daemon IS the scheduler, so "daemon not installed" / "daemon not
+// running" is a regression: the host believes it is monitored and is not. On the cron engine
+// there is no daemon BY CONSTRUCTION. The two engines are mutually exclusive and every
+// reconciler enforces it: reconcileSchedulerAfterInstall tears down a leftover unit whenever
+// the mode is cron, and applyCronMode removes the unit on the way back. Only the resident
+// daemon ever pings (docs/HEALTHCHECKS.md: "A host still on the cron scheduler reports
+// nothing, no matter how the keys below are set"). So the reason names the engine: the key is
+// on, and on this engine nothing will ever transmit, whatever the keys say.
+//
+// This is NOT issue #298 coming back. There the key was left at true by --daemon-remove
+// ITSELF, so hosts that had never asked for monitoring warned and exited 1 on every
+// successful backup. That loop is closed by the WRITER, not by muting anything here:
+// applyCronMode now rolls HEALTHCHECK_ENABLED back on the way out. A host that reverted with
+// an OLDER build still carries the stale true and nothing rewrites it for them, so they reach
+// this line and see the warning; that is the price of not deciding a monitoring setting on
+// evidence that cannot tell "the old revert left it" from "the operator wants it".
+//
+// A cron host whose daemon is genuinely alive never arrives here at all
+// (healthcheckDaemonProblem returns "" and the channel registers as usual), so the one state
+// where cron mode really is transmitting keeps its section. That state is not hypothetical:
+// applyCronMode persists SCHEDULER_MODE=cron BEFORE it tears the unit down (F09-06), so a
+// failed teardown leaves a live, transmitting daemon on a host whose config already reads
+// cron.
+//
+// The cron arm requires a POSITIVE "cron" reading and never an unknown or empty
+// SchedulerMode. config.normalizeSchedulerMode already collapses every unrecognised value to
+// "cron" before a parsed config reaches here, so the only way to arrive with an empty mode is
+// a hand-built Config. That host gets the plain reason without the engine clause, which is
+// the right way round: the clause is a claim about how this host is scheduled, and nobody
+// stated it.
+//
+// Both arms flip cfg.HealthcheckEnabled, unchanged from before: the Phase-7 entries loop
+// (dispatchNotifications), the effective-state summary (logBackupNotificationSummary) and the
+// standalone-run handoff (maybeHandoffManualBackup) all read that one flag, and cfg is the
+// same pointer they see.
+func reportHealthchecksUnusable(cfg *config.Config, logger *logging.Logger, reason string) {
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.SchedulerMode), "cron") {
+		logging.DebugStep(logger, "notifications init", "healthchecks inert on the cron engine: %s", reason)
+		// Two lines, like every other channel: the reason, then a bare "disabled". The reason
+		// used to be stuffed into the SKIP itself, which left this the one entry in the
+		// notification block reading "Healthchecks: disabled (cron mode: ...; daemon not
+		// installed)" while Email, Telegram, Gotify and Webhook all read "<channel>: disabled".
+		// Telegram sets the shape: "Telegram: 409 - Registration missing on the bot" followed by
+		// "Telegram: disabled".
+		//
+		//
+		// The level is WARNING, exactly like the daemon arm; see the doc comment above for why
+		// this arm changes the wording and not the severity.
+		logging.Warning("Healthchecks: %s (cron mode: only the resident daemon transmits)", reason)
+		logging.Skip("Healthchecks: disabled")
+		cfg.HealthcheckEnabled = false
+		return
+	}
+	disableHealthchecks(cfg, logger, reason)
 }
 
 // healthcheckDaemonProblem verifies the monitoring daemon is actually alive by reading
@@ -150,7 +265,7 @@ func healthcheckDaemonProblem(ctx context.Context, cfg *config.Config, logger *l
 			d := health.RefineWithPresence(health.Diagnosis{State: health.TxNoHeartbeat}, presence)
 			logging.DebugStep(logger, "notifications init",
 				"healthchecks status unreadable, presence state=%s installed=%t active=%t", d.State, presence.Installed, presence.Active)
-			return daemonProblemForState(d)
+			return health.DaemonProblem(d)
 		}
 		logging.DebugStep(logger, "notifications init", "healthchecks status unreadable: %v", err)
 		return "status file unreadable"
@@ -162,27 +277,7 @@ func healthcheckDaemonProblem(ctx context.Context, cfg *config.Config, logger *l
 	logging.DebugStep(logger, "notifications init",
 		"healthchecks daemon diagnose state=%s daemon_up=%t hb_age=%s installed=%t active=%t",
 		d.State, d.DaemonUp, d.HbAge, presence.Installed, presence.Active)
-	return daemonProblemForState(d)
-}
-
-// daemonProblemForState maps a presence-refined diagnosis to a terse SYNTHETIC reason
-// (bare fact, never an instruction) or "" when the daemon is up. Shares the exact state
-// vocabulary the Phase-7 section renders so the init verdict and the section never drift.
-func daemonProblemForState(d health.Diagnosis) string {
-	switch d.State {
-	case health.TxNotInstalled:
-		return "daemon not installed"
-	case health.TxNotActive:
-		return "daemon not running"
-	case health.TxRunningNoReport:
-		return "daemon running, not reporting"
-	case health.TxStale:
-		return "daemon stale (last beat " + health.HumanizeAge(d.HbAge) + ")"
-	}
-	if d.DaemonUp {
-		return ""
-	}
-	return "daemon not running"
+	return health.DaemonProblem(d)
 }
 
 // healthcheckConfigProblem returns a short reason when the healthcheck config is
@@ -299,7 +394,7 @@ func initializeWebhookNotification(opts backupModeOptions, orch *orchestrator.Or
 
 func logBackupRuntimeSummary(cfg *config.Config, logger *logging.Logger, storageState backupStorageState) {
 	logBackupStorageSummary(cfg, storageState)
-	logBackupLogSummary(cfg)
+	logBackupLogSummary(cfg, storageState.pbs)
 	logBackupNotificationSummary(cfg, logger)
 }
 
@@ -316,10 +411,11 @@ func logBackupStorageSummary(cfg *config.Config, storageState backupStorageState
 	} else {
 		logging.Skip("  Cloud storage: disabled")
 	}
+	logPBSStorageSummary(cfg, storageState.pbs)
 	fmt.Println()
 }
 
-func logBackupLogSummary(cfg *config.Config) {
+func logBackupLogSummary(cfg *config.Config, pbs *block.PBS) {
 	logging.Info("Log configuration:")
 	logging.Info("  Primary: %s", cfg.LogPath)
 	if cfg.SecondaryEnabled {
@@ -340,6 +436,7 @@ func logBackupLogSummary(cfg *config.Config) {
 	} else {
 		logging.Skip("  Cloud: disabled")
 	}
+	logPBSLogSummary(cfg, pbs)
 	fmt.Println()
 }
 

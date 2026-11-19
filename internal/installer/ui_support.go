@@ -1,11 +1,12 @@
 package installer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/tis24dev/proxsave/internal/orchestrator"
@@ -48,6 +49,12 @@ type TelegramSetupResult struct {
 	SkippedVerification bool
 }
 
+// HealthcheckSetupOptions supplies install-only preparation before monitoring bootstrap.
+// Omit it for diagnostics. Callers may supply zero or one options value.
+type HealthcheckSetupOptions struct {
+	BeforeBootstrap func(context.Context) error
+}
+
 // HealthcheckSetupResult reports the outcome of the interactive healthchecks
 // setup step (log-only downstream, like TelegramSetupResult).
 type HealthcheckSetupResult struct {
@@ -78,7 +85,7 @@ func ApplyAuditDisables(configPath string, keys []string) error {
 			normalized = append(normalized, key)
 		}
 	}
-	sort.Strings(normalized)
+	slices.Sort(normalized)
 	if len(normalized) == 0 {
 		return nil
 	}
@@ -131,7 +138,7 @@ func WriteConfigFileAtomic(configPath, tmpPath, content string) error {
 // the confirmation both front-ends show before wiping the base directory.
 //
 // Every entry gets exactly one trailing slash. The list is the compile-time set
-// returned by the caller (build, env, identity), all of them BASE_DIR
+// returned by the caller (build, env, guards, identity, restore), all of them BASE_DIR
 // subdirectories, so there is nothing to detect: the Charm copy this replaces
 // stat'ed each path and omitted the slash for a directory that did not exist
 // yet, which made a destructive confirmation prompt render differently

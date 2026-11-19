@@ -44,7 +44,6 @@ type Confirm struct {
 	defaultYes      bool
 	focusYes        bool
 	danger          bool
-	abortErr        error
 	countdownPrefix string
 	timeout         time.Duration
 	deadline        time.Time
@@ -95,13 +94,6 @@ func WithCountdown(timeout time.Duration) ConfirmOption {
 // e.g. "Rollback" for the network-commit prompt where inaction rolls back).
 func WithCountdownPrefix(prefix string) ConfirmOption {
 	return func(c *Confirm) { c.countdownPrefix = sanitizeLine(prefix) }
-}
-
-// WithConfirmAbort makes Esc resolve with err (e.g. a wizard-cancel
-// sentinel) instead of answering No. Default (esc = No) matches the tview
-// yes/no prompts; wizard-style steps opt in.
-func WithConfirmAbort(err error) ConfirmOption {
-	return func(c *Confirm) { c.abortErr = err }
 }
 
 // WithDanger marks a destructive confirmation: the message is rendered in
@@ -199,9 +191,6 @@ func (c *Confirm) Update(msg tea.Msg) (shell.Screen, tea.Cmd) {
 		case "enter":
 			return c, c.Resolve(ConfirmResult{Answer: c.focusYes}, nil)
 		case "esc":
-			if c.abortErr != nil {
-				return c, c.Resolve(ConfirmResult{}, c.abortErr)
-			}
 			return c, c.Resolve(ConfirmResult{Answer: false}, nil)
 		}
 	}
@@ -224,10 +213,7 @@ func (c *Confirm) View(width, height int) string {
 	// rows for the same reason.
 	tail := []string{}
 	if c.timeout > 0 {
-		left := c.deadline.Sub(c.now)
-		if left < 0 {
-			left = 0
-		}
+		left := max(c.deadline.Sub(c.now), 0)
 		// The countdown advertises the TIMEOUT outcome, which always resolves to No
 		// (c.noLabel), never the Enter default: a countdown-armed defaultYes prompt
 		// would otherwise read "default: Apply" while an expiry picks Skip. The Enter

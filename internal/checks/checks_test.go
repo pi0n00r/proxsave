@@ -1,6 +1,7 @@
 package checks
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -309,9 +310,9 @@ func TestCheckLockFile_WritesExpectedContent(t *testing.T) {
 	}
 
 	var ts string
-	for _, line := range strings.Split(text, "\n") {
-		if strings.HasPrefix(line, "time=") {
-			ts = strings.TrimPrefix(line, "time=")
+	for line := range strings.SplitSeq(text, "\n") {
+		if after, ok := strings.CutPrefix(line, "time="); ok {
+			ts = after
 			break
 		}
 	}
@@ -347,7 +348,7 @@ func TestCheckLockFile_ConcurrentCalls_OnlyOnePasses(t *testing.T) {
 
 	passed := make(chan bool, workers)
 
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wg.Done()
 			<-start
@@ -531,7 +532,6 @@ func TestCheckerConfigValidate(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.cfg.Validate()
 			if err == nil {
@@ -568,7 +568,8 @@ func TestCheckerDisableCloud(t *testing.T) {
 
 func TestCheckDiskSpace_WarnsOnNonCriticalDestinations(t *testing.T) {
 	logger := logging.New(types.LogLevelInfo, false)
-	logger.SetOutput(io.Discard)
+	var out bytes.Buffer
+	logger.SetOutput(&out)
 
 	tmpDir := t.TempDir()
 	config := &CheckerConfig{
@@ -591,8 +592,89 @@ func TestCheckDiskSpace_WarnsOnNonCriticalDestinations(t *testing.T) {
 	if !result.Passed {
 		t.Fatalf("CheckDiskSpace should pass with warnings, got: %s", result.Message)
 	}
-	if !strings.Contains(strings.ToLower(result.Message), "warning") {
-		t.Fatalf("expected warning message, got: %q", result.Message)
+	// The destinations that warned are named on their own line before the result,
+	// which then speaks of the Primary only.
+	if result.Message != "Primary disk space OK" {
+		t.Fatalf("expected the Primary-only result message, got: %q", result.Message)
+	}
+	log := out.String()
+	for _, want := range []string{
+		"INFO     Secondary disk space: " + tmpDir + "\n",
+		"INFO       Available: ",
+		"INFO       Required: 999999.00 GB\n",
+		"WARNING  ⚠ Secondary disk space: insufficient, copy may fail\n",
+		"INFO     Disk space warnings: Secondary\n",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("expected %q in the disk space block, got:\n%s", want, log)
+		}
+	}
+	if strings.Index(log, "Required:") > strings.Index(log, "⚠ Secondary disk space") {
+		t.Fatalf("the facts must precede the outcome:\n%s", log)
+	}
+}
+
+// A copy destination whose free space cannot be read is reported as not checked: the
+// path, the mount's system error without the path, then the outcome. The Primary still
+// passes, and the summary names the destination. The second check (after collection)
+// prints the same block plus the rule behind the requirement.
+func TestCheckDiskSpace_NotCheckedAndRuleBlocks(t *testing.T) {
+	logger := logging.New(types.LogLevelInfo, false)
+	var out bytes.Buffer
+	logger.SetOutput(&out)
+
+	tmpDir := t.TempDir()
+	missing := filepath.Join(tmpDir, "missing")
+	checker := NewChecker(logger, &CheckerConfig{
+		BackupPath:         tmpDir,
+		LogPath:            tmpDir,
+		LockDirPath:        tmpDir,
+		CloudEnabled:       true,
+		CloudPath:          missing,
+		SecondaryEnabled:   true,
+		SecondaryPath:      tmpDir,
+		MinDiskPrimaryGB:   0.001,
+		MinDiskSecondaryGB: 0.001,
+		MinDiskCloudGB:     0.001,
+		SafetyFactor:       1.5,
+		MaxLockAge:         time.Minute,
+	})
+
+	if result := checker.CheckDiskSpace(); !result.Passed || result.Message != "Primary disk space OK" {
+		t.Fatalf("CheckDiskSpace = %+v, want a pass on the Primary only", result)
+	}
+	log := out.String()
+	for _, want := range []string{
+		"INFO     Cloud disk space: " + missing + "\n",
+		"INFO       Mount: no such file or directory\n",
+		"WARNING  ⚠ Cloud disk space: not checked\n",
+		"INFO     Disk space warnings: Cloud\n",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("expected %q, got:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "Secondary disk space") {
+		t.Fatalf("a destination that did not warn must not be listed:\n%s", log)
+	}
+
+	out.Reset()
+	checker.config.MinDiskSecondaryGB = 999999.0
+	// A tiny estimate keeps the Primary requirement at its 0.001 GB minimum, so the
+	// Primary passes whatever this machine has free; only the Secondary fails.
+	if result := checker.CheckDiskSpaceForEstimate(0.0005); !result.Passed {
+		t.Fatalf("CheckDiskSpaceForEstimate = %+v, want a pass", result)
+	}
+	log = out.String()
+	for _, want := range []string{
+		"INFO       Required: 999999.00 GB\n",
+		"INFO       Rule: larger of 999999.00 GB minimum and 0.00 GB collected x 1.5\n",
+		"WARNING  ⚠ Secondary disk space: insufficient, copy may fail\n",
+		"WARNING  ⚠ Cloud disk space: not checked\n",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("expected %q, got:\n%s", want, log)
+		}
 	}
 }
 

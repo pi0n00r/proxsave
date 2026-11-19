@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/tis24dev/proxsave/internal/installer"
@@ -74,7 +74,7 @@ func RunPostInstallAudit(ctx context.Context, session *shell.Session, execPath, 
 
 	var suggestions []installer.PostInstallAuditSuggestion
 	collectErr := components.RunTask(ctx, session, "Post-install check", "Running dry-run...", func(taskCtx context.Context, report func(string)) error {
-		report("Running proxsave --dry-run (this may take a minute)...")
+		report("Running a dry-run backup (this may take a minute)...")
 		found, err := auditCollect(taskCtx, execPath, configPath)
 		if err != nil {
 			return err
@@ -82,6 +82,13 @@ func RunPostInstallAudit(ctx context.Context, session *shell.Session, execPath, 
 		suggestions = found
 		return nil
 	})
+	if errors.Is(collectErr, context.Canceled) {
+		// The operator stopped the dry-run: nothing was checked, nothing failed.
+		result.CollectErr = collectErr
+		showAuditResult(ctx, session, "Post-install check", orchestrator.HealthcheckSetupLevelNeutral,
+			"NOT CHECKED", "The dry-run was cancelled before it finished.", backToMenu)
+		return result, nil
+	}
 	if collectErr != nil {
 		result.CollectErr = collectErr
 		showAuditResult(ctx, session, "Post-install check", orchestrator.HealthcheckSetupLevelWarn,
@@ -214,6 +221,6 @@ func normalizeAuditKeys(keys []string) []string {
 			out = append(out, key)
 		}
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }

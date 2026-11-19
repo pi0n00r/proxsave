@@ -52,7 +52,7 @@ func TestIsClusteredPVEFallbackToPvecm(t *testing.T) {
 	}
 }
 
-func TestIsClusteredPVEMissingCorosyncConfigIsStandalone(t *testing.T) {
+func TestIsClusteredPVEMissingCorosyncConfigNeedsRuntimeEvidence(t *testing.T) {
 	collector := newPVECollectorWithDeps(t, CollectorDeps{
 		LookPath: func(cmd string) (string, error) {
 			switch cmd {
@@ -82,8 +82,8 @@ func TestIsClusteredPVEMissingCorosyncConfigIsStandalone(t *testing.T) {
 	}
 
 	clustered, err := collector.isClusteredPVE(context.Background())
-	if err != nil {
-		t.Fatalf("isClusteredPVE returned error: %v", err)
+	if err == nil {
+		t.Fatal("missing Corosync configuration without runtime evidence must remain unknown")
 	}
 	if clustered {
 		t.Fatal("expected clustered=false when pvecm reports missing corosync config")
@@ -303,9 +303,6 @@ func newPVECollectorWithDeps(t *testing.T, override CollectorDeps) *Collector {
 	if override.RunCommand != nil {
 		deps.RunCommand = override.RunCommand
 	}
-	if override.RunCommandWithEnv != nil {
-		deps.RunCommandWithEnv = override.RunCommandWithEnv
-	}
 	if override.Stat != nil {
 		deps.Stat = override.Stat
 	}
@@ -396,129 +393,6 @@ func TestCollectPVEConfigsPopulatesManifestSkippedForExcludedACL(t *testing.T) {
 	if entry.Status != StatusSkipped {
 		t.Fatalf("expected %s status, got %s", StatusSkipped, entry.Status)
 	}
-}
-
-// Test collectVMConfigs function
-func TestCollectVMConfigs(t *testing.T) {
-	collector := newPVECollector(t)
-
-	// Create VM config structure
-	pveConfigPath := collector.config.PVEConfigPath
-	nodesDir := filepath.Join(pveConfigPath, "nodes")
-	nodeDir := filepath.Join(nodesDir, "test-node")
-	qemuDir := filepath.Join(nodeDir, "qemu-server")
-	lxcDir := filepath.Join(nodeDir, "lxc")
-
-	for _, dir := range []string{qemuDir, lxcDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatalf("failed to create dir %s: %v", dir, err)
-		}
-	}
-
-	// Create sample VM configs
-	vmConfig := "cores: 2\nmemory: 4096\n"
-	if err := os.WriteFile(filepath.Join(qemuDir, "100.conf"), []byte(vmConfig), 0o644); err != nil {
-		t.Fatalf("failed to write VM config: %v", err)
-	}
-
-	ctConfig := "cores: 1\nmemory: 512\n"
-	if err := os.WriteFile(filepath.Join(lxcDir, "101.conf"), []byte(ctConfig), 0o644); err != nil {
-		t.Fatalf("failed to write CT config: %v", err)
-	}
-
-	ctx := context.Background()
-	err := collector.collectVMConfigs(ctx)
-	if err != nil {
-		t.Fatalf("collectVMConfigs failed: %v", err)
-	}
-}
-
-// TestCollectVMConfigsComprehensive tests VM config collection edge cases
-func TestCollectVMConfigsComprehensive(t *testing.T) {
-	t.Run("collects qemu-server directory", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		pveDir := filepath.Join(tmpDir, "etc", "pve")
-		qemuDir := filepath.Join(pveDir, "qemu-server")
-		if err := os.MkdirAll(qemuDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(qemuDir, "100.conf"), []byte("cores: 2"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-
-		logger := newTestLogger()
-		cfg := GetDefaultCollectorConfig()
-		cfg.PVEConfigPath = pveDir
-		collector := NewCollector(logger, cfg, t.TempDir(), "pve", false)
-
-		err := collector.collectVMConfigs(context.Background())
-		if err != nil {
-			t.Fatalf("collectVMConfigs failed: %v", err)
-		}
-	})
-
-	t.Run("collects lxc directory", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		pveDir := filepath.Join(tmpDir, "etc", "pve")
-		lxcDir := filepath.Join(pveDir, "lxc")
-		if err := os.MkdirAll(lxcDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(lxcDir, "101.conf"), []byte("memory: 512"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-
-		logger := newTestLogger()
-		cfg := GetDefaultCollectorConfig()
-		cfg.PVEConfigPath = pveDir
-		collector := NewCollector(logger, cfg, t.TempDir(), "pve", false)
-
-		err := collector.collectVMConfigs(context.Background())
-		if err != nil {
-			t.Fatalf("collectVMConfigs failed: %v", err)
-		}
-	})
-
-	t.Run("handles missing directories gracefully", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		pveDir := filepath.Join(tmpDir, "etc", "pve")
-		if err := os.MkdirAll(pveDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		// Note: no qemu-server or lxc directories created
-
-		logger := newTestLogger()
-		cfg := GetDefaultCollectorConfig()
-		cfg.PVEConfigPath = pveDir
-		collector := NewCollector(logger, cfg, t.TempDir(), "pve", false)
-
-		err := collector.collectVMConfigs(context.Background())
-		if err != nil {
-			t.Fatalf("collectVMConfigs failed: %v", err)
-		}
-	})
-
-	t.Run("handles qemu-server as file not directory", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		pveDir := filepath.Join(tmpDir, "etc", "pve")
-		if err := os.MkdirAll(pveDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		// Create qemu-server as file (not directory)
-		if err := os.WriteFile(filepath.Join(pveDir, "qemu-server"), []byte("not a dir"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-
-		logger := newTestLogger()
-		cfg := GetDefaultCollectorConfig()
-		cfg.PVEConfigPath = pveDir
-		collector := NewCollector(logger, cfg, t.TempDir(), "pve", false)
-
-		err := collector.collectVMConfigs(context.Background())
-		if err != nil {
-			t.Fatalf("collectVMConfigs failed: %v", err)
-		}
-	})
 }
 
 // TestCollectPVESnapshotBricks collects the PVE snapshot bricks used by the real recipe.
@@ -843,8 +717,8 @@ func TestCollectPVEDirectoriesExcludesDisabledPVEConfigFiles(t *testing.T) {
 	}
 
 	destDB := collector.targetPathFor(filepath.Join(clusterPath, "config.db"))
-	if _, err := os.Stat(destDB); err == nil {
-		t.Fatalf("expected config.db excluded when BACKUP_CLUSTER_CONFIG=false")
+	if _, err := os.Stat(destDB); err != nil {
+		t.Fatalf("core config.db must be captured when BACKUP_CLUSTER_CONFIG=false: %v", err)
 	}
 }
 

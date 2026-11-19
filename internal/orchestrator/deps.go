@@ -1,12 +1,15 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 
@@ -138,7 +141,12 @@ func (realTimeProvider) Now() time.Time { return time.Now() }
 
 type osCommandRunner struct{}
 
-const defaultCommandWaitDelay = 3 * time.Second
+// defaultCommandWaitDelay is INITIALISED FROM safeexec.CommandWaitDelay, which is a
+// copy taken once at package init and not a link: changing safeexec.CommandWaitDelay
+// at runtime does not move this one, and a test that means to shrink both has to set
+// both. What the initialiser buys is that the number lives in one place in the source.
+// internal/storage/cloud.go still carries its own, for rclone, and says why there.
+var defaultCommandWaitDelay = safeexec.CommandWaitDelay
 
 func (osCommandRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd, err := safeexec.CommandContext(ctx, name, args...)
@@ -147,10 +155,71 @@ func (osCommandRunner) Run(ctx context.Context, name string, args ...string) ([]
 	}
 	cmd.WaitDelay = defaultCommandWaitDelay
 	out, err := cmd.CombinedOutput()
+	// The translation is correct HERE and only because of the sink. CombinedOutput
+	// drains into a bytes.Buffer, which never blocks, so every byte the child wrote is
+	// already in it before the timer can start; what the budget interrupts is the wait
+	// for an EOF a surviving descendant is withholding. Measured on this path at 16
+	// bytes, 64 KiB and 5 MiB: the output is byte for byte complete alongside the
+	// error. So ErrWaitDelay means "something is still holding a descriptor", not
+	// "your answer is short".
+	//
+	// Returning the error instead was tried and reverted. This []byte reaches nine bare
+	// availability gates ("which pvesh", "which systemctl") and the systemd-run
+	// rollback arming: each reads a non-nil error as "the tool is missing" or "arming
+	// failed". A complete, correct answer turned into a failure made a restore skip
+	// applying datacenter.cfg and report success, and made the network rollback arm a
+	// SECOND timer on top of one it could no longer disarm.
+	//
+	// This is NOT the rule for every sink. internal/storage/cloud.go refuses the same
+	// translation for rclone and is right to: an operation, not a capture, really is
+	// incomplete when it is cut short. Do not generalise either way without checking
+	// what the command's output is being copied INTO.
 	if err != nil && errors.Is(err, exec.ErrWaitDelay) {
 		return out, nil
 	}
 	return out, err
+}
+
+// RunStdout captures ONLY stdout, for a command whose output is DATA a caller
+// parses rather than a transcript a caller logs.
+//
+// Measured on a live PVE 9.1.9 node (2026-09-05): with a locale the host does not
+// have, `pvesh get /cluster/resources --output-format=json` exits 0 and writes
+// perfectly valid JSON to stdout while Perl writes "perl: warning: Setting locale
+// failed." to stderr. CombinedOutput merges the two, the merged bytes start with
+// 'p', and every json.Unmarshal on them fails. That is not exotic: the stock
+// sshd_config on that node carries `AcceptEnv LANG LC_*`, and macOS Terminal
+// forwards LC_CTYPE=UTF-8 by default, so an operator running a restore over ssh
+// from a Mac is enough to reach it.
+//
+// On failure stderr is folded into the error, because that is where pvesh puts
+// its reason and dropping it would trade one silent loss for another. On success
+// stderr is discarded on purpose: those are exactly the bytes that must not reach
+// the parser, and no caller of this method has ever consumed them - today they
+// silently corrupt the parse instead. Use Run for anything whose output is meant
+// to be read by a human.
+func (osCommandRunner) RunStdout(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd, err := safeexec.CommandContext(ctx, name, args...)
+	if err != nil {
+		return nil, err
+	}
+	cmd.WaitDelay = defaultCommandWaitDelay
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	// Same translation Run documents at length, and for the same reason: both
+	// sinks are bytes.Buffer, so every byte the child wrote is already captured
+	// before the timer can start.
+	if runErr != nil && errors.Is(runErr, exec.ErrWaitDelay) {
+		runErr = nil
+	}
+	if runErr != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return stdout.Bytes(), fmt.Errorf("%w: %s", runErr, msg)
+		}
+	}
+	return stdout.Bytes(), runErr
 }
 
 // RunStream returns a stdout pipe for streaming commands that read from stdin.
@@ -197,44 +266,4 @@ func defaultDeps(logger *logging.Logger, dryRun bool) Deps {
 		Command:  osCommandRunner{},
 		DryRun:   dryRun,
 	}
-}
-
-// NewWithDeps builds an orchestrator using custom dependencies while preserving defaults.
-func NewWithDeps(deps Deps) *Orchestrator {
-	logger := deps.Logger
-	if logger == nil {
-		logger = logging.New(logging.GetDefaultLogger().GetLevel(), false)
-	}
-	base := defaultDeps(logger, deps.DryRun)
-
-	if deps.FS != nil {
-		base.FS = deps.FS
-	}
-	if deps.Command != nil {
-		base.Command = deps.Command
-	}
-	if deps.Prompter != nil {
-		base.Prompter = deps.Prompter
-	}
-	if deps.System != nil {
-		base.System = deps.System
-	}
-	if deps.Time != nil {
-		base.Time = deps.Time
-	}
-	if deps.Config != nil {
-		base.DryRun = deps.Config.DryRun
-	}
-
-	o := New(logger, base.DryRun)
-	o.fs = base.FS
-	o.prompter = base.Prompter
-	o.system = base.System
-	o.clock = base.Time
-	o.cmdRunner = base.Command
-	setRestoreDeps(base.FS, base.Time, base.Prompter, base.Command, base.System)
-	if deps.Config != nil {
-		o.SetConfig(deps.Config)
-	}
-	return o
 }

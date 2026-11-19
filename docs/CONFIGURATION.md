@@ -1,12 +1,21 @@
 # Configuration Reference
 
-Complete reference for all 200+ configuration variables in `configs/backup.env`.
+Reference for configuration keys, accepted values, defaults and constraints in `configs/backup.env`. Template examples and compiled fallbacks are distinguished where they differ.
+
+Most installs never need to open this file. Run `proxsave` with no arguments on a terminal
+and the dashboard's configuration form covers the settings a typical host changes; the
+[map below](#editing-the-configuration-from-the-dashboard) says which block it owns and
+which blocks are hand-edited. Reach for the file itself for everything the form does not
+ask about, and for hosts with no terminal.
 
 ## Table of Contents
 
+- [Editing the configuration from the dashboard](#editing-the-configuration-from-the-dashboard)
 - [Configuration File Location](#configuration-file-location)
+- [Configuration integrity check](#configuration-integrity-check)
 - [General Settings](#general-settings)
 - [Scheduler engine](#scheduler-engine)
+- [Personal scripts (daemon)](#personal-scripts-daemon)
 - [Healthchecks connector (daemon)](#healthchecks-connector-daemon)
 - [Restore Behavior & Dual-Role Hosts](#restore-behavior--dual-role-hosts)
 - [Security Settings](#security-settings)
@@ -30,15 +39,176 @@ Complete reference for all 200+ configuration variables in `configs/backup.env`.
 
 ---
 
+<!-- site-region: configure-proxsave:start -->
+
+## Editing the configuration from the dashboard
+
+`proxsave`, typed bare on a terminal, opens the dashboard. `Maintenance` -> `Install` ->
+`Edit install` runs the installer against the current file: answer `Edit existing` at the
+first question and the configuration form comes up pre-filled from `backup.env`, so a pass
+that changes no field keeps every value you had. (`Overwrite` starts from the shipped
+template instead, and `Keep existing & continue` skips the form altogether.) The dashboard
+opens before the configuration is loaded, so this route also works on a host whose
+`backup.env` is missing or broken.
+
+An `Edit existing` pass is not byte-for-byte identical, though, and two of its
+normalizations are worth knowing: it removes any `BASE_DIR`, `CRON_SCHEDULE`, `CRON_HOUR`
+and `CRON_MINUTE` lines, which are derived at runtime and deprecated in the file (see
+[Storage Paths](#storage-paths)), and it renames any variable still written under a
+name of the Bash version to its current name, keeping the value in effect.
+
+The form has eighteen fields and writes exactly the variables below. Everything else in
+this reference is hand-edited.
+
+| Form field | Variables it writes | Section here |
+|---|---|---|
+| Secondary storage | `SECONDARY_ENABLED` | [Secondary Storage](#secondary-storage) |
+| Secondary backup path | `SECONDARY_PATH` | [Secondary Storage](#secondary-storage) |
+| Secondary log path | `SECONDARY_LOG_PATH` | [Secondary Storage](#secondary-storage) |
+| Cloud backups (rclone) | `CLOUD_ENABLED` | [Cloud Storage](#cloud-storage-rclone) |
+| Rclone backup remote | `CLOUD_REMOTE` | [Cloud Storage](#cloud-storage-rclone) |
+| Rclone log remote | `CLOUD_LOG_PATH` | [Cloud Storage](#cloud-storage-rclone) |
+| Backup firewall rules | `BACKUP_FIREWALL_RULES` | [System Collectors](#system-collectors) |
+| Telegram notifications | `TELEGRAM_ENABLED`, plus `BOT_TELEGRAM_TYPE` unless the edited file already sets it | [Telegram](#telegram) |
+| Email notifications | `EMAIL_ENABLED` | [Email](#email) |
+| Email delivery mode | `EMAIL_DELIVERY_METHOD` (and `EMAIL_FALLBACK_SENDMAIL`, preserved when already set) | [Email](#email) |
+| Backup encryption (AGE) | `ENCRYPT_ARCHIVE` | [Encryption & Bundling](#encryption--bundling) |
+| Scheduler engine | `SCHEDULER_MODE` | [Scheduler engine](#scheduler-engine) |
+| Healthchecks | `HEALTHCHECK_ENABLED`, `HEALTHCHECK_MODE` | [Healthchecks connector](#healthchecks-connector-daemon) |
+| Notify level | `NOTIFY_ON` (`always` when Healthchecks is off) | [Which runs get notified](#which-runs-get-notified-notify_on) |
+| Frequency | `SCHEDULER_FREQUENCY` | [Scheduler engine](#scheduler-engine) |
+| Weekday | `SCHEDULER_WEEKDAY` | [Scheduler engine](#scheduler-engine) |
+| Day of month (1-28) | `SCHEDULER_MONTHDAY` | [Scheduler engine](#scheduler-engine) |
+| Run at (HH:MM) | `SCHEDULER_TIME` | [Scheduler engine](#scheduler-engine) |
+
+Note what the form does **not** write, because it is easy to assume otherwise:
+`CLOUD_REMOTE_PATH` is not one of its fields (only `CLOUD_REMOTE` and `CLOUD_LOG_PATH`
+are), and no retention, compression, security, collector, metrics or custom-path variable
+is on it.
+
+Four other dashboard rows change configuration or configuration-adjacent state:
+
+| Dashboard row | What it does |
+|---|---|
+| `Maintenance` -> `Upgrade` -> `Check config` | reviews and applies the embedded template merge, including added and retired keys |
+| `Maintenance` -> `New key` | generates the AGE recipient that `AGE_RECIPIENT_FILE` points at |
+| `Daemon` -> `Install` / `Disable` | switches `SCHEDULER_MODE` between `daemon` and `cron`, and turns `HEALTHCHECK_ENABLED` on and back off with it |
+| `Diagnostic Checks` -> `Telegram` / `Healthchecks` | verifies what the notification and monitoring variables above actually do, without running a backup |
+
+Everything else in this file is edited with a text editor. Two rules that apply whichever
+way you edit: an assignment that repeats later in the file wins over the earlier one, the
+four concatenating variables aside (see
+[Configuration integrity check](#configuration-integrity-check)), and values are read as
+plain text, not shell (see [Personal scripts](#personal-scripts-daemon) for what `#` and
+`$` do to a value).
+
+---
+
 ## Configuration File Location
 
 **Default**: `configs/backup.env`, resolved under the detected install directory (`BASE_DIR`), so typically `/opt/proxsave/configs/backup.env`.
-**Custom**: specify with `--config`. An absolute path is used as-is; a relative path is joined onto the install directory, not the current working directory.
+**Custom profiles**: use the configuration flag described in the [CLI reference](CLI_REFERENCE.md#run-backup). An absolute path is used as-is; a relative path resolves against the installation directory. Passing this flag bypasses the dashboard and selects the normal backup path unless another operation is explicitly selected. Interactive prompts may still occur in operations that require them.
+
+---
+
+
+### Verify a configuration change
+
+Save an independent copy before manual editing. The file is parsed as data, not executed as shell: do not source it to test it. Ordinary duplicate assignments use the last value; the four list/recipient keys named in the integrity reference concatenate. Environment overrides apply only to the fixed allowlist, and `BASE_DIR` is detected from the executable. See the [environment reference](CLI_REFERENCE.md#environment-variables) before relying on a per-run override.
+
+Open **Post-install > Check** to review diagnostics and optional collectors. This simulation writes logs but does not create or upload archives. Review warnings and then follow the [first backup verification](BACKUP_GUIDE.md#run-and-verify-your-first-backup) using **Backup**. A check can reveal configuration problems; it does not verify recoverability.
+
+If loading fails, the dashboard opens before configuration is loaded, so **Install > Edit install** remains available. Keep configuration in a regular file: template merges replace a symlink rather than writing through to its target. Review the [upgrade effects](INSTALL.md#what-gets-updated) before applying Check config.
+
+The remaining sections are the complete key reference. Use [storage](STORAGE.md), [cloud setup](CLOUD_STORAGE.md), [encryption](ENCRYPTION.md), [scheduling](DAEMON.md) and [notifications](NOTIFICATIONS.md) for operational procedures.
+
+<!-- site-region: configure-proxsave:end -->
+
+## Configuration integrity check
+
+Every run audits `backup.env` against the template embedded in the binary, right after loading
+it and before the effective settings are printed:
+
+```text
+INFO     Configuration integrity check:
+DEBUG    Configuration integrity: file=/opt/proxsave/configs/backup.env lines=475 assignments=182 distinct=182 template=182
+DEBUG    Configuration integrity: template assigns 182 variables and documents 33 more as commented examples
+DEBUG    Configuration integrity: variables that may repeat without discarding: AGE_RECIPIENT, BACKUP_BLACKLIST, BACKUP_EXCLUDE_PATTERNS, CUSTOM_BACKUP_PATHS
+DEBUG    Configuration integrity: 0 duplicated, 0 absent, 0 unknown (duration=3.1ms)
+INFO     Configuration file ok
+```
+
+It reports three things, one line each, and their levels differ because the facts differ:
+
+| Finding | Level | Meaning |
+|---------|-------|---------|
+| duplicated | `WARNING` | the variable is assigned more than once, so a value you wrote is discarded |
+| absent | `WARNING` | the binary carries the variable in its embedded template, the file does not |
+| unknown | `INFO` | the file assigns a variable the binary does not read at all: a misspelling |
+
+```text
+WARNING    PERSONAL_SCRIPT_PRE_RUN is set twice; line 456 wins and the value on line 120 is discarded
+WARNING    HEALTHCHECK_UPDATES_ID is absent and falls back to its default
+INFO       PERSONAL_SCRIPTS_PRERUN is not a known variable and is ignored
+WARNING  Configuration file: 1 duplicated, 1 absent, 1 unknown
+```
+
+### Duplicated: the one that loses data
+
+A repeated variable is resolved **last-wins**. The last assignment in the file is kept and every
+earlier one is discarded, silently, whatever it held. Thirty-six of the template's 182 variables
+ship as an empty line, the personal scripts among them, so adding your own line **above** one of
+them loses it, while the same file with the two lines swapped works:
 
 ```bash
-# Use custom config file
-proxsave --config /path/to/my-backup.env
+PERSONAL_SCRIPT_PRE_RUN=/home/me/mount-pbs   # discarded: an assignment below wins
+...
+PERSONAL_SCRIPT_PRE_RUN=                     # the template line, empty, and it wins
 ```
+
+Four variables can be repeated without losing anything, because a second `KEY=value` line
+**concatenates** instead of overwriting: `AGE_RECIPIENT`, `BACKUP_BLACKLIST`,
+`BACKUP_EXCLUDE_PATTERNS` and `CUSTOM_BACKUP_PATHS`.
+
+The exemption is the FORM, not the name. `BACKUP_BLACKLIST` and `CUSTOM_BACKUP_PATHS` also accept
+the multi-line block form the template ships them in, and a block does **not** concatenate: it
+replaces everything set before it. Writing your own line above the template's block therefore
+loses it, exactly like an ordinary duplicate, and the audit reports it:
+
+```bash
+CUSTOM_BACKUP_PATHS=/srv/important   # discarded: the block below replaces it
+CUSTOM_BACKUP_PATHS="                # the template's block, and it wins
+# /srv/custom-config.yaml
+"
+```
+
+A line written **after** the block concatenates onto it and loses nothing.
+
+### Absent: the merge never ran
+
+The template is compiled into the binary, so a host that has not upgraded carries an older
+binary with an older template and never sees this finding. Seeing it means the binary is new and
+`backup.env` was not merged.
+
+Fix it from the dashboard with `Maintenance` -> `Upgrade` -> `Check config`: the check lists
+the variables it would add and only offers `Apply` when there is something to add, and the
+apply takes a backup it can roll back to. For automation, use the separate
+[configuration upgrade reference](CLI_REFERENCE.md#configuration-upgrade).
+
+A missing variable uses the parser's fallback for that setting. Review the default and
+the proposed merge before relying on the resulting behavior. The finding is still a `WARNING`, and like every other warning it promotes the run
+to exit 1: a host that upgraded the binary without merging its `backup.env` exits 1 on every run,
+and the Healthchecks backup check goes down with it, until the merge is run. Merge the
+file, either way, or expect that state until you do.
+
+### What the block does not do
+
+Values are never printed, not even at debug level: a duplicated `TELEGRAM_BOT_TOKEN` would put a
+secret in the log, and the line number locates it just as well. Nothing is rewritten and the
+last-wins rule is unchanged; the audit only stops it from being silent.
+
+The `WARNING` lines count towards the run's warning total and its exit code, like every other
+warning. The same block runs under `proxsave --daemon-status`.
 
 ---
 
@@ -57,7 +227,8 @@ COLORIZE_STEP_LOGS=true            # true | false (requires USE_COLOR=true)
 # Debug level
 DEBUG_LEVEL=standard               # standard | advanced | extreme
 
-# Dry-run mode (test without changes)
+# Diagnostic simulation: writes logs, skips archive creation and upload
+# A restore is refused while this is true: it cannot run without modifying the system
 DRY_RUN=false                      # true | false
 
 # Enable/disable always-on pprof profiling (CPU + heap)
@@ -78,26 +249,111 @@ At the config layer `standard` resolves to the `info` log level and both `advanc
 
 ## Scheduler engine
 
-ProxSave runs the backup either from a cron entry or from a resident systemd daemon. The behavior is documented in [DAEMON.md](DAEMON.md); the keys are:
+ProxSave runs the backup either from a resident systemd daemon or from a cron entry. The
+daemon is the normal engine and a fresh install selects it; cron is the legacy opt-out. The
+behavior is documented in [DAEMON.md](DAEMON.md).
+
+**From the dashboard**: the `Daemon` group offers the one command that fits the current
+state (`Install` on a cron host, `Disable` and `Restart` on a daemon host) plus a read-only
+`Status`. The schedule and the engine are also on the configuration form, as
+**Frequency**, **Weekday**, **Day of month (1-28)**, **Run at (HH:MM)** and **Scheduler
+engine**. The keys behind all of that are:
 
 ```bash
 SCHEDULER_MODE=cron            # cron | daemon (any unrecognized value normalizes to cron)
-SCHEDULER_TIME=02:00           # daily HH:MM "Run at" time
+SCHEDULER_FREQUENCY=daily      # daily, weekly or monthly
+SCHEDULER_WEEKDAY=mon          # weekly only: mon, tue, wed, thu, fri, sat or sun
+SCHEDULER_MONTHDAY=1           # monthly only: 1-28
+SCHEDULER_TIME=02:00           # HH:MM ("Run at")
 MAX_RUN_DURATION=1h            # daemon watchdog: hard timeout for one backup
-DAEMON_OPT_OUT=false           # set true by --daemon-remove; --upgrade won't re-migrate to the daemon
 ```
 
+The backup runs daily, weekly on `SCHEDULER_WEEKDAY`, or monthly on `SCHEDULER_MONTHDAY`, at
+`SCHEDULER_TIME`. A monthly backup takes days 1-28 only, so no month is skipped. A variable
+that is missing or empty takes its default (`daily`, `mon`, `1`, `02:00`), and the day the
+frequency does not use is ignored.
+
+When they take effect depends on the engine:
+
+- **Daemon**: it reads them when it starts, so an edit applies at the next daemon restart
+  (`--daemon-status` says `OUT OF SYNC` until then). With the centralized monitor a new
+  frequency applies once ProxSave HC Server confirms it, and the daemon says `pending` until
+  then. An invalid value is reported before every backup, which then runs daily. Details in
+  [DAEMON.md](DAEMON.md#backup-schedule).
+- **Cron**: the crontab entry runs the backup, and `--install` writes these values into it. A
+  hand edit of `backup.env` changes nothing until the next `--install`.
+
+`--upgrade-config` and `--upgrade` add a missing variable with its default but not the
+template comment above it: an existing `backup.env` gains the lines without that block.
+Where the file records no schedule yet, they take it from the proxsave crontab line instead;
+see [DAEMON.md](DAEMON.md#the-schedule-is-inherited-not-reset).
+
 The compiled default for `SCHEDULER_MODE` is `cron`, but a fresh install defaults to the daemon and writes `SCHEDULER_MODE=daemon`.
+
+The key's **presence** matters as much as its value. `--upgrade` installs the daemon only on a host where that same upgrade's config merge had to add `SCHEDULER_MODE`, i.e. one that has never recorded an engine. Once the line is in the file the value is honoured and no upgrade revisits the host.
+
+`MAX_RUN_DURATION` and the personal-script keys below are daemon-only and are on no form;
+edit them here.
+
+---
+
+## Personal scripts (daemon)
+
+Two scripts of your own, started by the resident daemon around each supervised run. Empty by
+default, which means nothing is started. The full contract is in [DAEMON.md](DAEMON.md); the
+keys are:
+
+```bash
+PERSONAL_SCRIPT_PRE_RUN=       # path to a script started before the run (works only with the daemon)
+PERSONAL_SCRIPT_POST_RUN=      # path to a script started after the run, whatever the outcome (works only with the daemon)
+```
+
+Both take a filesystem path and nothing else: the path is executed directly, with no shell, so
+arguments, pipes and redirections in the value are not interpreted. Two characters need care,
+as in every other value in this file. An unquoted `#` truncates the value, so quote a path that
+contains one. A `$` is expanded and no form of quoting suppresses it, not double quotes, not
+single quotes, not a backslash: the name is looked up in this file first, then in the daemon's
+own environment, and a name neither defines is replaced by nothing, silently. `$$` is a literal
+`$`. `$@`, `$*`, `$!`, `$?`, `$-`, `$0` to `$9` and a `${` with no closing brace are consumed the
+same way as an unknown name. Only a `$` at the end of the value, or one before a character that
+is neither a letter, a digit, an underscore nor one of those, survives. Write `$$` where the path
+really contains a `$`. An interpreted script sees its own name as `/proc/self/fd/3`, not as the configured path: `$0`, `BASH_SOURCE`, Python's `__file__` and Perl's `$FindBin::Bin` all carry it, so `dirname "$0"` points at `/proc/self/fd`. To find files next to the script, resolve it first: `readlink -f "$0"`, `os.path.realpath(__file__)` or `$FindBin::RealBin`.
+
+These scripts run only under the daemon, never under a manual `proxsave --backup` or
+a cron-mode run. Their output is discarded and their exit status does not change the
+backup result. The normal wait is limited to 10 minutes; shutdown and abandoned-child
+handling have different wait and cleanup rules. See [Personal scripts](DAEMON.md#personal-scripts-around-a-run).
+
+At startup, each path is classified as not configured, ready, ready with warning, or
+refused. The script must be a regular executable owned by root or the daemon UID and
+must not be writable by group or others. Symlinked paths and loosely writable
+non-sticky directories are refused. A safely permissioned ancestor owned by another
+UID can be accepted with a trust warning, since that owner can replace descendants.
+The execution-time gate checks the opened script again before each launch. Startup
+advisories and refusals, and execution-time refusals, are recorded in the daemon log;
+see [DAEMON.md](DAEMON.md) for the full policy and diagnostic commands.
 
 ---
 
 ## Healthchecks connector (daemon)
 
-The daemon can push to an external [healthchecks](https://healthchecks.io/) monitor. The four checks, the monitoring portal, and the centralized-vs-self behavior are documented in [HEALTHCHECKS.md](HEALTHCHECKS.md); the keys are:
+The daemon can push to an external [healthchecks](https://healthchecks.io/) monitor. The checks it reports, the monitoring portal, and the centralized-vs-self behavior are documented in [HEALTHCHECKS.md](HEALTHCHECKS.md).
+
+**From the dashboard**: the configuration form's **Healthchecks** field offers `Off`,
+`ProxSave HC Server` (centralized) and `Your own server` (self). It is active only when the
+scheduler engine is the daemon, because the daemon is the only thing that pings. Choosing
+`Your own server` leads to a follow-up screen for the ping URLs: the alive and backup URLs
+are required there, the updates URL and the four notification delivery check URLs optional.
+Those four are checks on your own healthchecks instance that watch each channel's delivery,
+not the channels' own addresses: see
+[Notification delivery checks](HEALTHCHECKS.md#notification-delivery-checks). Whatever is configured,
+`Diagnostic Checks` -> `Healthchecks` verifies it and shows the portal details without
+running a backup. The keys are:
 
 ```bash
-HEALTHCHECK_ENABLED=false      # forced true by --daemon-setup / --upgrade auto-migration
+HEALTHCHECK_ENABLED=false      # true with the daemon (--daemon-setup / --upgrade); back to false by --daemon-remove
 HEALTHCHECK_MODE=centralized   # centralized (fetch URLs from the server) | self
+HEALTHCHECK_ACCOUNT_INITIAL_EMAIL=   # centralized: your email for the monitoring portal, applied once after you confirm the mail
 HEALTHCHECK_HEARTBEAT_INTERVAL=5m
 HEALTHCHECK_UPDATE_INTERVAL=5m
 HEALTHCHECK_SEND_LOG=true
@@ -109,13 +365,16 @@ HEALTHCHECK_SEND_LOG=true
 HEALTHCHECK_ALIVE_URL=
 HEALTHCHECK_BACKUP_URL=
 
-# Self mode
-HEALTHCHECK_PING_ENDPOINT=https://hc-ping.com
-HEALTHCHECK_PING_KEY=
-HEALTHCHECK_ALIVE_ID=
-HEALTHCHECK_BACKUP_ID=
-HEALTHCHECK_UPDATES_URL=
+# Self mode only: checks on your own healthchecks instance. No effect in centralized mode.
+HEALTHCHECK_PING_ENDPOINT=https://hc-ping.com   # base for the *_ID form
+HEALTHCHECK_PING_KEY=                           # optional, inserted between base and id
+HEALTHCHECK_ALIVE_ID=                           # service-alive check, used when HEALTHCHECK_ALIVE_URL is empty
+HEALTHCHECK_BACKUP_ID=                          # backup-outcome check, used when HEALTHCHECK_BACKUP_URL is empty
+HEALTHCHECK_UPDATES_URL=                        # updates check, optional: /1 when a newer release exists
 HEALTHCHECK_UPDATES_ID=
+# Notification delivery checks, optional: each watches whether one channel delivered.
+# Not the channel settings (Gotify is GOTIFY_SERVER_URL and GOTIFY_TOKEN). Any of them
+# set keeps every run notified whatever NOTIFY_ON says.
 HEALTHCHECK_NOTIFY_EMAIL_URL=
 HEALTHCHECK_NOTIFY_EMAIL_ID=
 HEALTHCHECK_NOTIFY_TELEGRAM_URL=
@@ -126,7 +385,24 @@ HEALTHCHECK_NOTIFY_WEBHOOK_URL=
 HEALTHCHECK_NOTIFY_WEBHOOK_ID=
 ```
 
-`HEALTHCHECK_ENABLED` parses as `false` by default, but `--daemon-setup` and the `--upgrade` auto-migration force it to `true` when enabling the daemon.
+A full `*_URL` wins over the matching `*_ID`; an id resolves to
+`<endpoint>/<key>/<id>` with a ping key, `<endpoint>/<id>` without. Which checks to create
+on your instance, and with which period, is in
+[Setting it up](HEALTHCHECKS.md#setting-it-up).
+
+`HEALTHCHECK_ENABLED` is the only switch. `HEALTHCHECK_MODE` selects *how* the ping URLs are
+obtained, and the loader recognizes exactly one value, `self`; anything else, `off`
+included, resolves to `centralized`. Choosing `Off` on the form therefore writes
+`HEALTHCHECK_MODE=off` **and** `HEALTHCHECK_ENABLED=false`, and it is the second line that
+turns the connector off. Setting the mode to `off` by hand while leaving
+`HEALTHCHECK_ENABLED=true` does not disable anything. The form also clears
+`HEALTHCHECK_ALIVE_URL` and `HEALTHCHECK_BACKUP_URL` when it changes the mode, so a
+leftover self URL cannot linger as the centralized cache; a same-mode pass leaves them
+alone.
+
+`HEALTHCHECK_ENABLED` parses as `false` by default. `--daemon-setup` and the `--upgrade` retrofit set it to `true` when enabling the daemon, and `--daemon-remove` sets it back to `false` when reverting to cron. The two directions belong together: the checks this key turns on are daemon-only, so a cron host left with `HEALTHCHECK_ENABLED=true` reports the missing daemon on every run, as a warning on either engine. On cron the warning names the engine as well, because the key is asking for monitoring that cannot run there. Clearing the key is what stops the report, which is why `--daemon-remove` does it for you.
+
+A host reverted by an older build kept the key at `true`, and nothing rewrites it for that host: it reports the missing daemon on every run and exits `1` until you set `HEALTHCHECK_ENABLED=false` yourself, or run `--daemon-setup` then `--daemon-remove`. ProxSave does not correct it, because on disk that host looks exactly like one whose operator set the key deliberately. Only hosts reverted before this release are affected.
 
 ---
 
@@ -136,10 +412,19 @@ Restore behavior is chosen **interactively at restore time** when PBS-specific
 categories are going to be applied. This is not configured through `backup.env`.
 
 You will be asked to choose a behavior:
-- **Merge (existing PBS)**: intended for restoring onto an already operational PBS; ProxSave applies supported PBS categories via `proxmox-backup-manager` without deleting existing objects that are not in the backup.
+- **Merge (existing PBS)**: intended for restoring onto an already operational PBS; ProxSave applies supported PBS categories via `proxmox-backup-manager` without deleting existing objects that are not in the backup. The choice governs the API-applied categories: it does not stop the file-only items below from being written.
 - **Clean 1:1 (fresh PBS install)**: intended for restoring onto a new, clean PBS; ProxSave attempts to make supported PBS objects match the backup (may remove objects that exist on the system but are not in the backup).
 
 ProxSave applies supported PBS staged categories via API automatically (and may fall back to file-based staged apply only in **Clean 1:1** mode).
+
+A few PBS items have no stable API and are written straight from the stage in **both** modes.
+They are rewritten whole, so a section the backup does not carry is gone from the file
+afterwards: `acme/plugins.cfg`, `metricserver.cfg`, `proxy.cfg` and the whole `pbs_tape`
+category (`tape.cfg`, `tape-job.cfg`, `media-pool.cfg`, `tape-encryption-keys.json`). The
+`acme/accounts/` directory goes further and is mirrored, so an ACME account registered on the
+node that the backup does not carry is **removed**, in Merge as well. Merge is therefore a
+statement about the API-applied objects, not a promise that nothing outside the API touches
+`/etc/proxmox-backup`. Full list in [RESTORE_GUIDE.md](RESTORE_GUIDE.md).
 
 ### Dual-role hosts
 
@@ -239,8 +524,8 @@ SET_BACKUP_PERMISSIONS=false                    # true = apply chown/chmod on ba
 - Checks for suspicious open ports
 - Scans for suspicious processes
 - Validates file hashes to detect tampering
-- **If `CONTINUE_ON_SECURITY_ISSUES=false`**: Backup aborts on any issue
-- **If `CONTINUE_ON_SECURITY_ISSUES=true`**: Issues logged as warnings, backup continues
+- **If `CONTINUE_ON_SECURITY_ISSUES=false`**: Security errors abort the backup; warning-only results do not
+- **If `CONTINUE_ON_SECURITY_ISSUES=true`**: Findings are logged and the run continues despite security errors; later backup phases can still fail
 
 #### Process List Merge Behavior
 
@@ -281,15 +566,22 @@ When `SET_BACKUP_PERMISSIONS=true`, the system applies Bash-compatible ownership
 - Recursively changes owner:group for:
   - `BACKUP_PATH` (primary backup directory)
   - `LOG_PATH` (primary log directory)
-  - `SECONDARY_PATH` (if configured)
-  - `SECONDARY_LOG_PATH` (if configured)
+  - `SECONDARY_PATH` (when `SECONDARY_ENABLED=true`)
+  - `SECONDARY_LOG_PATH` (when `SECONDARY_ENABLED=true`)
 - Uses `BACKUP_USER:BACKUP_GROUP` as the target owner
 - Does NOT touch binary files, config files, or system paths
 
 **Permissions (chmod)**:
-- Applies mode `0750` (rwxr-x---) to directories only
-- Files keep their existing permissions (unchanged)
-- Conservative and safe approach
+- Applies mode `0750` (rwxr-x---) to directories
+- Applies mode `0640` (rw-r-----) to the files of a backup set: the archive or bundle and its `.sha256`, `.metadata` and `.manifest.json`
+- Every other file (logs included) keeps its existing permissions
+- The backup written by the current run gets `BACKUP_USER:BACKUP_GROUP` and `0640` on `BACKUP_PATH` and `SECONDARY_PATH` as soon as it is stored, not at the next run
+
+**Without it** (`SET_BACKUP_PERMISSIONS=false`, the default): every file of a backup set is `0600` owned by `root:root`, so only root can read the backups.
+
+**Turning it off later**: files already at `0640` stay as they are until retention removes them; new backups are `0600` `root:root` again.
+
+**Cloud storage** is not covered: the mode of a cloud copy is whatever the rclone backend gives it.
 
 **Requirements**:
 - Both `BACKUP_USER` and `BACKUP_GROUP` must be set
@@ -306,7 +598,7 @@ When `SET_BACKUP_PERMISSIONS=true`, the system applies Bash-compatible ownership
 - Migration from legacy Bash version
 - Multi-user environments requiring specific ownership
 - Shared backup storage with group access
-- POSIX-capable NFS mounts requiring specific ownership
+- POSIX-capable NFS and CephFS mounts requiring specific ownership
 
 **Example**:
 ```bash
@@ -319,7 +611,8 @@ BACKUP_USER=backup
 BACKUP_GROUP=backup
 SET_BACKUP_PERMISSIONS=true
 
-# Result: All backup/log directories owned by backup:backup with mode 0750
+# Result: backup/log directories owned by backup:backup with mode 0750,
+#         backup files owned by backup:backup with mode 0640
 ```
 
 ---
@@ -336,6 +629,22 @@ MIN_DISK_SPACE_CLOUD_GB=1          # Cloud storage (not enforced for remote)
 **Behavior**: Backup aborts if available space < minimum threshold.
 
 **Defaults**: when a key is absent the compiled fallback is `10` GB, and any value `<= 0` is coerced to `10`. `MIN_DISK_SPACE_SECONDARY_GB` and `MIN_DISK_SPACE_CLOUD_GB` fall back to whatever `MIN_DISK_SPACE_PRIMARY_GB` resolves to. The `1` shown above is an example, not the fallback.
+
+---
+
+## Pre-Backup Permission Check
+
+```bash
+SKIP_PERMISSION_CHECK=false        # true = skip the pre-backup permission check (test only)
+```
+
+The pre-backup checks verify that the backup and log directories are writable and owned as
+expected before anything is collected. `SKIP_PERMISSION_CHECK=true` drops that verification.
+
+Leave it `false` on a real host. It exists for test rigs where the directories are owned by
+whoever runs the suite: skipping the check does not fix the ownership, it only stops ProxSave
+from telling you about it, and an archive written under the wrong owner can be one nobody but
+root reads back.
 
 ---
 
@@ -358,27 +667,26 @@ BACKUP_PATH=${BASE_DIR}/backup
 
 # Primary log storage
 LOG_PATH=${BASE_DIR}/log
+
+# Daemon log storage
+DAEMON_LOG_PATH=${LOG_PATH}/daemon
 ```
 
-**Path resolution**: `${BASE_DIR}` expands automatically from the installed `proxsave` executable path. Scalar string values also support `$VAR` / `${VAR}` expansion (config keys first, then environment variables), but `BASE_DIR` itself is not configurable from `backup.env` or the parent environment.
+`LOG_PATH` also holds `.whatsnew_seen.json`, the release notes ProxSave has already shown. It is
+read and written within `FS_IO_TIMEOUT`, so a log directory on a dead mount only means no notes
+are shown; pointing `LOG_PATH` elsewhere shows every release's notes once more.
 
-### Legacy key names
+`DAEMON_LOG_PATH` holds the logs of the daemon and of `--daemon-setup`,
+`--daemon-remove` and `--daemon-status`, named `daemon-<host>-<timestamp>.log`.
+Each daemon start keeps its own log and the two before it. Absent or empty
+means `${LOG_PATH}/daemon`; set it to `${LOG_PATH}` to keep them beside the
+run logs.
 
-Seven keys have a legacy alias from the Bash-era configuration, and **the legacy name wins when both are present**:
+Retention deletes a run log together with its archive. A run log with no
+archive (a dry run, a failed run) is deleted once it is older than the oldest
+backup kept at that destination.
 
-| Legacy name (wins) | Canonical name |
-|---|---|
-| `LOCAL_BACKUP_PATH` | `BACKUP_PATH` |
-| `LOCAL_LOG_PATH` | `LOG_PATH` |
-| `ENABLE_SECONDARY_BACKUP` | `SECONDARY_ENABLED` |
-| `SECONDARY_BACKUP_PATH` | `SECONDARY_PATH` |
-| `ENABLE_CLOUD_BACKUP` | `CLOUD_ENABLED` |
-| `RCLONE_REMOTE` | `CLOUD_REMOTE` |
-| `PROMETHEUS_ENABLED` | `METRICS_ENABLED` |
-
-These seven are the ones where the legacy name is checked first. Other pairs, such as `MAX_LOCAL_BACKUPS` / `LOCAL_RETENTION_DAYS` or `AGE_RECIPIENT` / `AGE_RECIPIENTS`, list the canonical name first and are harmless.
-
-This matters after `--upgrade-config`, which keeps unknown keys in a "Custom keys" section while also adding the template's canonical line, and does not prune any of these. A config inherited from an older install can end up with both, and editing the canonical one then has no effect: the backups keep landing wherever the legacy key points. Grep your `backup.env` for the left column and delete those lines once you have moved the value across. Two more cloud pairs are listed in [CLOUD_STORAGE.md](CLOUD_STORAGE.md), where the canonical name wins instead, so check that table rather than assuming.
+**Path resolution**: `${BASE_DIR}` expands automatically from the installed `proxsave` executable path. Scalar string values also support `$VAR` / `${VAR}` expansion (config keys first, then environment variables; `$$` is a literal `$`), but `BASE_DIR` itself is not configurable from `backup.env` or the parent environment.
 
 ---
 
@@ -461,7 +769,7 @@ PREFILTER_MAX_FILE_SIZE_MB=8       # Skip prefilter for files >8MB
 
 ### What These Do
 
-- **Deduplication**: Detects duplicate data blocks (reduces storage)
+- **Deduplication**: Finds identical whole files within the collected tree and replaces duplicates with links before archiving; this is not block deduplication across backup runs
 - **Prefilter**: Applies safe, semantic-preserving normalization to small text/JSON files to improve compression (e.g. removes CR from CRLF line endings and minifies JSON). It does **not** reorder, de-indent, or strip structured configuration files, and it avoids touching Proxmox/PBS structured config paths (e.g. `etc/pve/**`, `etc/proxmox-backup/**`).
 
 ### Prefilter (`ENABLE_PREFILTER`): details and risks
@@ -529,6 +837,12 @@ BACKUP_EXCLUDE_PATTERNS="**/cache/**, /var/tmp/**, *.log"
 
 ## Secondary Storage
 
+**From the dashboard**: all three variables are on the configuration form
+(`Maintenance` -> `Install` -> `Edit install`) as **Secondary storage**, **Secondary backup
+path** and **Secondary log path**. The form validates both paths against the rules below
+before it writes them, which is the easiest way to avoid the mistakes listed under
+[What NOT to Do](#what-not-to-do).
+
 ```bash
 # Enable secondary storage
 SECONDARY_ENABLED=false            # true | false
@@ -569,16 +883,16 @@ sudo mount -t cifs //192.168.0.10/backup /mnt/nas-backup -o credentials=/root/.s
 
 **2. Then configure SECONDARY_PATH**:
 ```bash
-SECONDARY_PATH=/mnt/nas-backup  # ✓ Correct - uses mounted path
+SECONDARY_PATH=/mnt/nas-backup  # Correct - uses mounted path
 SECONDARY_LOG_PATH=/mnt/nas-logs  # Optional
 ```
 
 ### What NOT to Do
 
 ```bash
-SECONDARY_PATH=192.168.0.10/backup       # ✗ WRONG - network address
-SECONDARY_PATH=//server/share            # ✗ WRONG - UNC path
-SECONDARY_PATH=\\192.168.0.10\backup    # ✗ WRONG - Windows path
+SECONDARY_PATH=192.168.0.10/backup       # WRONG - network address
+SECONDARY_PATH=//server/share            # WRONG - UNC path
+SECONDARY_PATH=\\192.168.0.10\backup    # WRONG - Windows path
 ```
 
 **For direct network access without mounting:** Use `CLOUD_REMOTE` with rclone instead (see [Cloud Storage](#cloud-storage-rclone) section).
@@ -594,12 +908,20 @@ SECONDARY_PATH=\\192.168.0.10\backup    # ✗ WRONG - Windows path
 
 ## Cloud Storage (rclone)
 
+**From the dashboard**: the configuration form has **Cloud backups (rclone)**,
+**Rclone backup remote** and **Rclone log remote**, which write `CLOUD_ENABLED`,
+`CLOUD_REMOTE` and `CLOUD_LOG_PATH`. That is the whole of its cloud coverage:
+`CLOUD_REMOTE_PATH`, the upload mode, the verification switches and every rclone setting
+below are edited here. Configure the rclone remote itself (`rclone config`) before turning
+the toggle on; the form does not do it for you.
+
 ```bash
 # Enable cloud storage
 CLOUD_ENABLED=false                # true | false
 
 # rclone remote (recommended: remote NAME + path via CLOUD_REMOTE_PATH)
 CLOUD_REMOTE=GoogleDrive                   # remote name from `rclone config`
+# CLOUD_REMOTE can also be an absolute local directory (/mnt/cloud): see CLOUD_STORAGE.md
 CLOUD_REMOTE_PATH=/proxsave/backup         # folder path inside the remote
 
 # Cloud log path (optional)
@@ -664,10 +986,10 @@ CLOUD_LOG_PATH=B+K/BACKUP/marcellus/logs
 ### When Auto-Fallback Helps
 
 Automatic with `false`:
-- ✅ **Cloudflare R2** with restricted API tokens (no list permissions)
-- ✅ **S3-compatible providers** with minimal token permissions
-- ✅ **Backblaze B2**, **Wasabi** write-only tokens
-- ✅ **First-time setup** with uncertain token permissions
+- **Cloudflare R2** with restricted API tokens (no list permissions)
+- **S3-compatible providers** with minimal token permissions
+- **Backblaze B2**, **Wasabi** write-only tokens
+- **First-time setup** with uncertain token permissions
 
 ### When to Set CLOUD_WRITE_HEALTHCHECK=true
 
@@ -688,9 +1010,9 @@ Automatic with `false`:
 - `path`: Directory inside remote (optional for root)
 
 **Examples**:
-- `gdrive:pbs-backups` → Google Drive, folder "pbs-backups"
-- `s3:my-bucket/backups` → S3 bucket, subfolder "backups"
-- `minio:/pbs` → MinIO, absolute path "/pbs"
+- `gdrive:pbs-backups` -> Google Drive, folder "pbs-backups"
+- `s3:my-bucket/backups` -> S3 bucket, subfolder "backups"
+- `minio:/pbs` -> MinIO, absolute path "/pbs"
 
 ### Upload Modes
 
@@ -701,29 +1023,36 @@ Automatic with `false`:
 
 ---
 
+## PBS Storage (Proxmox Backup Server)
+
+```bash
+# Each backup is also uploaded to a PBS storage defined in Proxmox VE
+# (/etc/pve/storage.cfg, type pbs), and the run log is attached to it.
+# Server, port, datastore, namespace, user, fingerprint, password and
+# encryption key are read from that storage at every run.
+# Proxmox VE hosts only. Snapshots go to the group host/proxsave-<hostname>.
+# The namespace must already exist.
+# Retention needs Datastore.Prune or Datastore.Modify on the datastore.
+PBS_TARGET_ENABLED=false     # true-false = enable/disable upload to the PBS storage
+PBS_TARGET_STORAGE=          # Proxmox VE storage ID of type pbs
+MAX_PBS_TARGET_BACKUPS=15    # snapshots kept by retention (0 = no retention)
+MIN_DISK_SPACE_PBS_GB=1      # free space required on the datastore
+```
+
+- `proxmox-backup-client` must be installed. Target selection and retention settings are stored in `backup.env`; connection details and credentials are reused from the selected PVE storage.
+- Retention keeps the newest `MAX_PBS_TARGET_BACKUPS` snapshots of the group (with `RETENTION_POLICY=gfs`, the same GFS rules as the other destinations). A failed upload deletes nothing.
+- When the storage has an encryption key, the snapshot and the log are encrypted with it. When it has none they are uploaded unencrypted, and step [7] says so (`Encryption: none, storage <id> has no key`).
+- ProxSave sets no timeout on the PBS client. Under cron nothing stops a hung upload; the daemon's `MAX_RUN_DURATION` watchdog does, so the daemon is the recommended scheduler with PBS.
+
+---
+
 ## Storage Comparison
 
-Quick comparison to help you choose the right storage configuration:
-
-| Feature | SECONDARY_PATH | CLOUD_REMOTE (rclone) |
-|---------|----------------|----------------------|
-| **Path Type** | Filesystem-mounted paths only | Network addresses via rclone |
-| **Valid Examples** | `/mnt/nas-backup`<br>`/media/usb-drive`<br>`/backup/secondary` | `CLOUD_REMOTE=GoogleDrive` + `CLOUD_REMOTE_PATH=/backups`<br>`CLOUD_REMOTE=b2` + `CLOUD_REMOTE_PATH=/pbs-prod`<br>`CLOUD_REMOTE=minio` + `CLOUD_REMOTE_PATH=/pbs` |
-| **Invalid Examples** | ❌ `192.168.0.10/folder`<br>❌ `//server/share`<br>❌ `\\192.168.0.10\backup` | N/A (handles network directly) |
-| **Network Storage** | Must mount first via NFS/CIFS/SMB | Direct access via rclone config |
-| **Setup Complexity** | Simple (native Go copy) | Moderate (requires rclone config) |
-| **Dependencies** | None | Requires rclone installed |
-| **Speed** | Fast (local filesystem I/O) | Depends on network/cloud |
-| **Use Case** | - Local USB drives<br>- Pre-mounted NAS shares<br>- Additional local disks | - Cloud storage (GDrive, S3, B2)<br>- LAN servers (MinIO, S3)<br>- Remote storage without mounting |
-| **Failure Behavior** | Non-critical (warns, continues) | Non-critical (warns, continues) |
-| **Setup Example** | `sudo mount 192.168.0.10:/share /mnt/nas`<br>`SECONDARY_PATH=/mnt/nas` | `rclone config` (create "minio" remote)<br>`CLOUD_REMOTE=minio` + `CLOUD_REMOTE_PATH=/backups` |
+Destination selection and mounting procedures are maintained in the [storage guide](STORAGE.md). Secondary storage uses an existing local filesystem path; cloud storage uses an rclone remote and does not require a filesystem mount.
 
 ### Decision Guide
 
-- **Use SECONDARY_PATH if**: You have local storage (USB drive) OR willing to mount network shares to filesystem
-- **Use CLOUD_REMOTE if**: You want direct network access (no mounting) OR using cloud providers OR using S3-compatible storage
-
-**See** [docs/CLOUD_STORAGE.md](CLOUD_STORAGE.md) **for complete rclone setup guide.**
+Use the [destination guide](STORAGE.md) for local disks, NAS mounts and native PBS. Use the [cloud guide](CLOUD_STORAGE.md) for remote credentials and accessible archive retrieval.
 
 ---
 
@@ -860,27 +1189,25 @@ Set the tiers in the same edit as the policy.
 
 ### Benefits
 
-- Better historical coverage than simple count
-- Automatic time distribution
-- ISO 8601 week numbering (standard)
-- Efficient storage (fewer total backups)
+Operational retention planning and verification are maintained in the [storage guide](STORAGE.md). The key definitions and GFS deletion constraints above remain authoritative here.
 
 ### Example Output
 
-```text
-GFS classification → daily: 7/7, weekly: 4/4, monthly: 12/12, yearly: 2/3, to_delete: 15
-Deleting old backup: pbs-backup-20220115-120000.tar.xz (created: 2022-01-15 12:00:00)
-Cloud storage retention applied: deleted 15 backups (logs deleted: 15), 26 backups remaining
-```
+Read the retention classification and deletion messages in the saved run log, then verify the remaining archive set on every enabled destination.
 
 ### Storage Comparison
 
-- **Simple**: `MAX_CLOUD_BACKUPS=1095` for 3 years daily = 1095 backups
-- **GFS**: `DAILY=7, WEEKLY=4, MONTHLY=12, YEARLY=3` = ~26 backups (97% storage reduction!)
+A GFS tier selects distinct archives after higher-priority tiers; the sum of configured tier counts is not a guaranteed archive total. See [retention planning](STORAGE.md).
 
 ---
 
 ## Encryption & Bundling
+
+**From the dashboard**: the configuration form's **Backup encryption (AGE)** toggle writes
+`ENCRYPT_ARCHIVE`, and `Maintenance` -> `New key` generates the recipient that
+`AGE_RECIPIENT_FILE` points at (from an existing public key, a passphrase, or an existing
+private key). `BUNDLE_ASSOCIATED_FILES`, `AGE_RECIPIENT` and `AGE_RECIPIENT_FILE` itself
+are edited here.
 
 ```bash
 # Bundle associated files into single .tar
@@ -908,7 +1235,7 @@ AGE_RECIPIENT_FILE=${BASE_DIR}/identity/age/recipient.txt
 ### Encryption
 
 - Uses AGE (age-encryption.org)
-- Streaming encryption (no plaintext on disk)
+- Streaming encryption avoids a plaintext archive on disk; collected files are staged in plaintext before archiving, as described in [Plaintext staging](ENCRYPTION.md#plaintext-staging)
 - Supports multiple recipients
 - Passphrase or key-based
 
@@ -918,7 +1245,80 @@ AGE_RECIPIENT_FILE=${BASE_DIR}/identity/age/recipient.txt
 
 ## Notifications
 
+Two of the four channels are on the dashboard's configuration form: **Telegram
+notifications**, **Email notifications** and **Email delivery mode**. Gotify and webhooks
+have no form fields and are configured here only. After enabling Telegram,
+`Diagnostic Checks` -> `Telegram` verifies the pairing without running a backup.
+
+### Which runs get notified (`NOTIFY_ON`)
+
+```bash
+# When to send, on every channel below
+NOTIFY_ON=warning                  # always | warning | failure
+```
+
+`NOTIFY_ON` is a **severity threshold, not an exact match**:
+
+| Value | Notified | Silent |
+|-------|----------|--------|
+| `always` | success, warning, failure | nothing |
+| `warning` (default) | warning **and** failure | success |
+| `failure` | failure | success, warning |
+
+So `NOTIFY_ON=warning` means "warnings and anything worse", not "warnings only". It is the
+setting for *tell me when something needs looking at*.
+
+Below `always` a clean run is silent, so something else has to alarm when a run never
+happens: the [healthchecks monitor](HEALTHCHECKS.md), which `NOTIFY_ON` never filters. A run
+applies `warning` or `failure` only when that monitor is confirmed, and notifies every
+outcome otherwise:
+
+- `HEALTHCHECK_ENABLED=true`
+- the daemon transmitting
+- centralized mode: an alert channel on the portal that has already delivered a DOWN
+- centralized mode: the server applying this `NOTIFY_ON`
+- self mode: no `HEALTHCHECK_NOTIFY_*` variable set (see
+  [Notification delivery checks](HEALTHCHECKS.md#notification-delivery-checks))
+
+The run log and the Healthchecks check screens show which filter applies now; details in
+[HEALTHCHECKS.md](HEALTHCHECKS.md#alert-delivery-and-notify_on).
+
+It applies on top of each channel's own `*_ENABLED` flag, and to every channel at once;
+there is no per-channel form. A channel skipped by the filter says so in the log:
+
+```
+SKIP     Webhook: filtered
+```
+
+The install wizard asks for it as **Notify level** (`Every run`, `Warnings and failures`,
+`Failures only`) right after the Healthchecks mode. With Healthchecks off or the cron
+engine it does not ask and writes `always`, since no level below that can apply there.
+Upgrading from a release without `NOTIFY_ON` writes `NOTIFY_ON=warning` into the existing
+`backup.env`; the configuration merge adds the line only, without the template's comments.
+
+Three things it deliberately does **not** change:
+
+- **A broken channel.** One that is enabled but failed to build - a mistyped
+  `EMAIL_DELIVERY_METHOD` is the usual cause - still warns and is still reported as an
+  error at every threshold. The filter quietens channels that work and have nothing to
+  say; it never quietens one that could not say anything.
+- **The exit code.** A run that ends with warnings still exits `1`, still logs the
+  warnings, and still reports `status=warning` in the Prometheus textfile. `NOTIFY_ON` is
+  a delivery decision only, so anything watching the exit code sees what it saw before.
+- **Healthchecks.** The [healthchecks connector](HEALTHCHECKS.md) is not a notification
+  channel and is never filtered. It is what still reports a run you chose not to hear
+  about, including a run that never happened at all.
+
+An unrecognised value is not silently accepted: it is named in a warning and treated as
+`always`, because the failure mode of a typo here is silence, and silence looks exactly
+like a backup that never ran.
+
 ### Telegram
+
+**From the dashboard**: the form's **Telegram notifications** toggle writes
+`TELEGRAM_ENABLED`, and also sets `BOT_TELEGRAM_TYPE=centralized` unless you are editing a
+file that already carries that variable, so an existing `personal` setup survives an edit.
+The bot token and chat ID are not on the form; a personal bot is configured here.
 
 ```bash
 # Enable Telegram notifications
@@ -962,6 +1362,12 @@ TELEGRAM_CONFIRM_INTERVAL_SECONDS=1
 
 ### Email
 
+**From the dashboard**: the form's **Email notifications** toggle writes `EMAIL_ENABLED`,
+and **Email delivery mode** writes `EMAIL_DELIVERY_METHOD` (the three options map to
+`relay`, `sendmail` and `pmf`). Neither field asks about `EMAIL_FALLBACK_SENDMAIL`: an
+existing value is preserved byte for byte, and only a file without it gets `true` seeded. The recipient
+and From address are edited here.
+
 ```bash
 # Enable email notifications
 EMAIL_ENABLED=false                # true | false
@@ -981,9 +1387,9 @@ EMAIL_RECIPIENT=                   # e.g., "admin@example.com"
 EMAIL_FROM=no-reply@proxmox.tis24.it
 ```
 
-If `EMAIL_ENABLED` is omitted, the default remains `false`. The legacy alias `EMAIL_ENABLE` is still accepted during migration and runtime loading.
+If `EMAIL_ENABLED` is omitted, the default remains `false`.
 
-**Which delivery method should I choose?**
+**Which delivery mode should I choose?**
 
 | Method | Best when | Where SMTP is configured |
 | --- | --- | --- |
@@ -995,19 +1401,21 @@ The value `pmf` may also be written as `proxmox`, `proxmox-notifications`, or `p
 
 **Notes**:
 - Allowed values for `EMAIL_DELIVERY_METHOD` are: `pmf`, `relay`, `sendmail` (invalid values will skip Email with a warning).
-- `EMAIL_FALLBACK_SENDMAIL=true` controls local `/usr/sbin/sendmail` failover. `EMAIL_FALLBACK_PMF` is accepted only as a transitional alias from older templates.
+- `EMAIL_FALLBACK_SENDMAIL=true` controls local `/usr/sbin/sendmail` failover.
 - `relay` requires a real mailbox recipient and blocks `root@` recipients; set `EMAIL_RECIPIENT` to a non-root mailbox if needed.
 - Default install behavior is `relay -> sendmail`.
 - If you manually set `EMAIL_DELIVERY_METHOD=pmf`, fallback order is `pmf -> relay -> sendmail` when `EMAIL_FALLBACK_SENDMAIL=true`.
 - When logs say the relay "accepted request", it means the worker and upstream email API accepted the submission. It does **not** guarantee final inbox delivery (the message may still bounce, be deferred, or land in spam later).
 - If `EMAIL_RECIPIENT` is empty, ProxSave auto-detects the recipient from the `root@pam` user:
-  - **PVE**: Proxmox API via `pvesh get /access/users/root@pam` → fallback to `pveum user list` → fallback to `/etc/pve/user.cfg`
-  - **PBS**: `proxmox-backup-manager user list` → fallback to `/etc/proxmox-backup/user.cfg`
+  - **PVE**: Proxmox API via `pvesh get /access/users/root@pam` -> fallback to `pveum user list` -> fallback to `/etc/pve/user.cfg`
+  - **PBS**: `proxmox-backup-manager user list` -> fallback to `/etc/proxmox-backup/user.cfg`
   - **Dual**: intentionally uses the **PVE** detection path for `root@pam` email discovery
 - `sendmail` requires a recipient and uses `/usr/sbin/sendmail` (auto-detect applies if `EMAIL_RECIPIENT` is empty, as described above).
 - With `pmf`, final delivery recipients are determined by Proxmox Notifications targets/matchers. `EMAIL_RECIPIENT` is only used for the `To:` header and may be empty.
 
 ### Gotify
+
+Not on any dashboard form; configured here only.
 
 ```bash
 # Enable Gotify notifications
@@ -1031,6 +1439,8 @@ GOTIFY_PRIORITY_FAILURE=8          # Failure notifications
 3. Copy app token to `GOTIFY_TOKEN`
 
 ### Webhook
+
+Not on any dashboard form; configured here only.
 
 ```bash
 # Enable webhook notifications
@@ -1078,6 +1488,8 @@ WEBHOOK_DISCORD_ALERTS_AUTH_SECRET=    # HMAC secret key
 WEBHOOK_DISCORD_ALERTS_PRIORITY=0
 ```
 
+A `$` in these values is expanded as in every other value of this file: write `$$` for a literal `$`, as in a password or secret that contains one.
+
 **Supported formats**:
 - **discord**: Discord webhook JSON format
 - **slack**: Slack incoming webhook format
@@ -1101,13 +1513,21 @@ METRICS_PATH=${BASE_DIR}/metrics   # Empty = /var/lib/prometheus/node-exporter
 - Backup duration and start/end timestamps
 - Archive size and raw bytes collected
 - Files collected/failed and success/failure status
-- Storage usage counters per location (local/secondary/cloud)
+- Backup counts per location (local always; secondary, cloud and pbs only while that destination is on)
 
 **Integration**: Point Prometheus node_exporter to `METRICS_PATH`.
 
 ---
 
 ## Collector Options
+
+Exactly one collector variable is on the dashboard's configuration form:
+`BACKUP_FIREWALL_RULES`, as the **Backup firewall rules** toggle. Every other variable in
+this section is edited here.
+
+Collector toggles control specific collection paths. The same information may also
+be present in a database or another selected path. Review the exclusions below and
+inspect a real backup before relying on a toggle to exclude sensitive data.
 
 ### PVE-Specific
 
@@ -1150,9 +1570,11 @@ CEPH_CONFIG_PATH=/etc/ceph         # Ceph config directory
 BACKUP_VM_CONFIGS=true             # VM/CT config files
 ```
 
-**Note (PVE snapshot behavior)**: ProxSave snapshots `PVE_CONFIG_PATH` for completeness. When a PVE feature is disabled, proxsave also excludes its well-known files from that snapshot to avoid "still included via full directory copy" surprises (e.g. `qemu-server/` + `lxc/` for `BACKUP_VM_CONFIGS=false`, `firewall/` + `host.fw` for `BACKUP_PVE_FIREWALL=false`, `user.cfg`/`domains.cfg` plus the credential files `priv/shadow.cfg`/`priv/token.cfg`/`priv/tfa.cfg` for `BACKUP_PVE_ACL=false` (ACLs are stored in `user.cfg` on PVE), `jobs.cfg` + `vzdump.cron` for `BACKUP_PVE_JOBS=false`, `corosync.conf` (and `config.db` capture) for `BACKUP_CLUSTER_CONFIG=false`).
+**Note (PVE snapshot behavior)**: ProxSave snapshots `PVE_CONFIG_PATH` for completeness. When a PVE feature is disabled, proxsave also excludes its well-known files from that snapshot to avoid "still included via full directory copy" surprises (e.g. `qemu-server/` + `lxc/` for `BACKUP_VM_CONFIGS=false`, `firewall/` + `host.fw` for `BACKUP_PVE_FIREWALL=false`, `user.cfg`/`domains.cfg` plus the credential files `priv/shadow.cfg`/`priv/token.cfg`/`priv/tfa.cfg` for `BACKUP_PVE_ACL=false` (ACLs are stored in `user.cfg` on PVE), `jobs.cfg` + `vzdump.cron` for `BACKUP_PVE_JOBS=false`, `corosync.conf` for `BACKUP_CLUSTER_CONFIG=false`).
 
-> **Security note**: `/etc/pve` is a pmxcfs mount backed by the cluster database `config.db`. Setting `BACKUP_PVE_ACL=false` removes the flat `priv/*` credential files from the snapshot, but the same secrets remain inside `config.db` (captured when `BACKUP_CLUSTER_CONFIG=true`). To exclude PVE access-control secrets from the backup entirely, set both `BACKUP_PVE_ACL=false` and `BACKUP_CLUSTER_CONFIG=false`. ProxSave logs a WARNING during backup when this combination leaves secrets in `config.db`.
+The pmxcfs database `config.db` is collected independently on every PVE host, including standalone hosts and configurations with `BACKUP_CLUSTER_CONFIG=false`. That flag controls Corosync configuration and cluster-specific data/runtime information. Missing Corosync files do not warn on a confirmed standalone host.
+
+> **Security note**: Setting `BACKUP_PVE_ACL=false` removes the flat access-control files and `priv/{shadow,token,tfa}.cfg` credentials from the `/etc/pve` snapshot, but the same secrets remain inside `config.db`. ProxSave logs a WARNING when these files are disabled and the database is not excluded. To exclude the database and its sidecars explicitly, add `config.db*` to `BACKUP_EXCLUDE_PATTERNS`. Disabling `BACKUP_CLUSTER_CONFIG` does not exclude the database. Excluding it removes the database recovery artifact; review that tradeoff and any custom paths that could collect another copy of the same data.
 
 ### PBS-Specific
 
@@ -1167,7 +1589,7 @@ BACKUP_PBS_S3_ENDPOINTS=true       # s3.cfg (S3 endpoints, used by S3 datastores
 BACKUP_PBS_NODE_CONFIG=true        # node.cfg (global PBS settings)
 
 # ACME
-BACKUP_PBS_ACME_ACCOUNTS=true      # acme/accounts.cfg
+BACKUP_PBS_ACME_ACCOUNTS=true      # acme/accounts/ (one file per account)
 BACKUP_PBS_ACME_PLUGINS=true       # acme/plugins.cfg
 
 # Integrations
@@ -1202,13 +1624,30 @@ BACKUP_PRUNE_SCHEDULES=true        # Retention prune schedules
 # PXAR metadata scanning
 PXAR_SCAN_ENABLE=false             # Enable PXAR file metadata collection
 PXAR_SCAN_DS_CONCURRENCY=3         # Datastores scanned in parallel
-PXAR_FILE_INCLUDE_PATTERN=         # Include patterns (default: *.pxar, *.pxar.*, catalog.pxar*)
+PXAR_FILE_INCLUDE_PATTERN=         # Include patterns (default: *.pxar, *.pxar.*, catalog.pxar, catalog.pxar.*)
 PXAR_FILE_EXCLUDE_PATTERN=         # Exclude patterns (e.g., *.tmp, *.lock)
 ```
 
 **Note (PBS snapshot behavior)**: ProxSave snapshots `PBS_CONFIG_PATH` (`/etc/proxmox-backup`) for completeness. When a PBS feature is disabled, proxsave excludes the corresponding well-known config files from that snapshot (for example, `remote.cfg` is excluded when `BACKUP_REMOTE_CONFIGS=false`) and also skips the related command outputs.
 
-**PXAR scanning**: Collects metadata from Proxmox Backup Server .pxar archives.
+**Note (ACME plugin credentials)**: with `BACKUP_PBS_ACME_PLUGINS=true` the archive also holds the output of `proxmox-backup-manager acme plugin config <id>` in `var/lib/proxsave-info/commands/pbs/acme_plugin_<id>_config.json`. Its `data` field carries the DNS provider credentials in the clear; PBS keeps the same data base64-encoded in `acme/plugins.cfg` (mode 0600), which the archive also holds.
+
+**PXAR scanning**: collects *metadata about* the `.pxar` archives inside your PBS datastores, never
+their contents. ProxSave backs up configuration, so no datastore data is copied with or
+without this setting: with it on you additionally get, per datastore, a subdirectory report
+(`<datastore>_subdirs.txt`) and the VM and container PXAR listings
+(`<datastore>_vm_pxar_list.txt`, `<datastore>_ct_pxar_list.txt`). Think of it as an inventory
+of what the datastore held at backup time, useful when reconstructing what existed; losing it
+costs you that picture, not any backup.
+
+It is **off by default**, and turning it on has a real cost: the scan walks every configured or
+discovered PBS datastore, `PXAR_SCAN_DS_CONCURRENCY` at a time. On a large or slow datastore that is the most
+expensive thing in the run.
+
+> **Changed in 0.30.0.** This used to compile to `true` while the shipped template said
+> `false`, so one release behaved two ways: a fresh install had scanning off, while a config
+> old enough to predate the key had it on. Both now default to off, which means a config that
+> was getting these inventories stops getting them. Set `PXAR_SCAN_ENABLE=true` to keep them.
 
 **Note**: `PXAR_FILE_INCLUDE_PATTERN` and `PXAR_FILE_EXCLUDE_PATTERN` are also reused for file sampling in PVE datastore metadata. Leave them empty to use the built-in defaults per platform.
 
@@ -1220,6 +1659,9 @@ PVE_CONFIG_PATH=/etc/pve
 PVE_CLUSTER_PATH=/var/lib/pve-cluster
 COROSYNC_CONFIG_PATH=${PVE_CONFIG_PATH}/corosync.conf
 VZDUMP_CONFIG_PATH=/etc/vzdump.conf
+
+# PBS config directory
+PBS_CONFIG_PATH=/etc/proxmox-backup
 
 # PBS datastore paths (comma/space separated)
 PBS_DATASTORE_PATH=                # e.g., "/mnt/pbs1,/mnt/pbs2"
@@ -1236,11 +1678,15 @@ HOST_BACKUP_MODE=false             # Appliance backing up a host mounted read-on
 
 **Note**: `${PVE_CONFIG_PATH}` (and other `${VAR}` references) are resolved from the same `backup.env` file too, so you do not need to `export` them.
 
+**Note**: the PVE path overrides, `CEPH_CONFIG_PATH` and `SYSTEM_ROOT_PREFIX` choose where a file is read, not where it is stored. The archive always holds `/etc/pve`, `/var/lib/pve-cluster`, `/etc/pve/corosync.conf`, `/etc/vzdump.conf`, `/etc/corosync/authkey` and `/etc/ceph` at those paths, which is where the restore looks for them.
+
 **Use case**: Working with mounted snapshots or mirrors at non-standard paths.
 
-**HA-LXC appliance (`HOST_BACKUP_MODE`)**: run ProxSave inside a privileged LXC that backs up the Proxmox host bind-mounted read-only. A non-empty `SYSTEM_ROOT_PREFIX` already makes Proxmox detection and absolute-symlink resolution prefix-aware. `HOST_BACKUP_MODE=true` additionally frames the run as a host-backup appliance and enables the ZFS inventory, which reports the host pools accurately because a privileged LXC shares the host kernel. Namespace-scoped and cluster-daemon commands (udevadm, ethtool, pvesh, ceph) stay skipped under a prefix because they would describe the container, not the host; their data is collected from the host files instead. Symlink targets are stored verbatim, so a backup taken this way restores onto a real host unchanged.
+**HA-LXC appliance (`HOST_BACKUP_MODE`)**: run ProxSave inside a privileged LXC that backs up the Proxmox host bind-mounted read-only. A non-empty `SYSTEM_ROOT_PREFIX` already makes Proxmox detection and absolute-symlink resolution prefix-aware. `HOST_BACKUP_MODE=true` additionally frames the run as a host-backup appliance and enables the ZFS inventory, which reports the host pools accurately because a privileged LXC shares the host kernel. Namespace-scoped and cluster-daemon commands (udevadm, ethtool, the PVE CLI, ceph) stay skipped under a prefix because they would describe the container, not the host; their data is collected from the host files instead. The PVE runtime commands (`pvesh`, `pveum`, `pvecm`, `pvesm`, `pvenode`, `pveversion`, `crontab -l`, `systemctl list-timers`) are skipped under any prefix, with one line in the log: `PVE runtime commands - skipped under SYSTEM_ROOT_PREFIX, they would describe this system, not the host`. The host's PVE configuration, crontabs and systemd units come from the host tree, so the container needs none of the PVE packages. Storage paths from `storage.cfg` are read under the prefix: a storage whose path is missing there, or a network storage (NFS, CIFS, CephFS, GlusterFS) whose mount is not carried into the container, is logged as not visible and not scanned for backup files. A `dir` storage on a separate host disk that is not carried cannot be told apart from an empty directory and reads as empty. An archive from an older release taken under a prefix stored the PVE files under it (`./host/etc/pve/...`); the restore recognizes that layout when the backup's own metadata says it covered PVE (`BACKUP_TYPE` or `BACKUP_TARGETS` pve or dual) and the prefix holds PVE files only (`etc/pve`, `var/lib/pve-cluster`, `etc/corosync`, `etc/vzdump.conf`, `etc/ceph`), logs `PVE configuration - stored under host/ in this backup (taken with SYSTEM_ROOT_PREFIX), restored to its host paths` and writes them at their host paths. A single `etc/pve` tree elsewhere, for example inside an extracted archive under `/home`, which also holds `etc/hostname` and the rest of a system, is a copy and stays where it is. So do the PVE files of a legacy backup taken with a PVE path variable pointing outside those five paths: the archive does not record the variable. Symlink targets are stored verbatim, so a backup taken this way restores onto a real host unchanged.
 
 Set `HOST_BACKUP_MODE=true` only in a privileged LXC that shares the host `/dev/zfs` and owns no independent ZFS pools of its own, otherwise the ZFS inventory could record the container's pools as the host's. The host network inventory relies on the host `/sys/class/net`, so it is only complete if the host sysfs is carried under the prefix (a plain non-recursive bind of `/` does not carry it); when it is absent ProxSave logs that the host sysfs is not available rather than reporting container interfaces.
+
+The PVE cluster database (`/var/lib/pve-cluster/config.db`) is captured with `sqlite3 .backup`, which runs inside the LXC. On a Proxmox host `sqlite3` is always installed (`pve-cluster` depends on it), but in the container it is a separate package: without it ProxSave copies the database raw, which can tear mid-write and miss changes not yet checkpointed, and logs a warning on every run.
 
 ### System Collectors
 
@@ -1256,8 +1702,10 @@ BACKUP_APT_SOURCES=true            # /etc/apt/sources.list*
 # Cron jobs
 BACKUP_CRON_JOBS=true              # /etc/crontab, /etc/cron.*
 
-# Systemd services
-BACKUP_SYSTEMD_SERVICES=true       # /etc/systemd/system
+# Systemd services, service defaults and udev rules, restored with the services category.
+# GRUB settings (/etc/default/grub, grub.d) are kept for reference only under
+# /var/lib/proxsave-info/boot/, which a restore never writes to the system
+BACKUP_SYSTEMD_SERVICES=true       # /etc/systemd/system, /etc/default, /etc/udev/rules.d/
 
 # SSL certificates
 BACKUP_SSL_CERTS=true              # /etc/ssl/certs, /etc/pve/local/pve-ssl.*
@@ -1265,10 +1713,11 @@ BACKUP_SSL_CERTS=true              # /etc/ssl/certs, /etc/pve/local/pve-ssl.*
 # Sysctl configuration
 BACKUP_SYSCTL_CONFIG=true          # /etc/sysctl.conf, /etc/sysctl.d/
 
-# Kernel modules
-BACKUP_KERNEL_MODULES=true         # /etc/modules, /etc/modprobe.d/
+# Kernel modules. /etc/kernel/cmdline and /etc/kernel/proxmox-boot-uuids are kept for
+# reference only under /var/lib/proxsave-info/boot/, which a restore never writes to the system
+BACKUP_KERNEL_MODULES=true         # /etc/modules, /etc/modprobe.d/, /etc/kernel/cmdline, /etc/kernel/proxmox-boot-uuids
 
-# Firewall rules
+# Firewall rules (the dashboard form's "Backup firewall rules" toggle writes this one)
 BACKUP_FIREWALL_RULES=false        # iptables, nftables
 
 # Installed packages
@@ -1291,7 +1740,7 @@ BACKUP_ZFS_CONFIG=true             # /etc/zfs, /etc/hostid, zpool cache & proper
 BACKUP_ROOT_HOME=true              # /root (excluding .cache, .local/share/Trash)
 
 # Backup script repository
-BACKUP_SCRIPT_REPOSITORY=false     # Snapshot the ProxSave install dir (excludes .git and backup/log output)
+BACKUP_SCRIPT_REPOSITORY=false     # Snapshot the ProxSave install dir (excludes .git, backup/log output, restore/ and guards/)
 
 # Backup configuration file
 BACKUP_CONFIG_FILE=true            # Include this backup.env configuration file in the backup
@@ -1320,14 +1769,23 @@ BACKUP_BLACKLIST="
 "
 ```
 
-**Format**: Bash-style heredoc, one path per line, `#` for comments.
+**Format**: A double-quoted multiline value, one path per line, with `#` comment lines. This is ProxSave configuration syntax, not a shell heredoc.
+
+Collecting a custom path does not automatically make it a restore category. FULL
+restore selects recognized categories present in the archive; additional files may
+require manual extraction and review. See [Restore Modes](RESTORE_GUIDE.md#restore-modes).
+
+**Note (boot files)**: a custom path that brings in `/etc/default/grub`, `/etc/default/grub.d/`, `/etc/kernel/cmdline` or `/etc/kernel/proxmox-boot-uuids` is collected, but a restore never writes those files to the system: they name the backed-up host's root device, pool and ESPs, and go to the export directory with `proxsave_info`. The `boot` restore category carries the kernel parameters instead.
 
 ---
 
 ## Related Documentation
 
 - [README.md](../README.md) - Main documentation
+- [DASHBOARD.md](DASHBOARD.md) - The interactive menu and every screen it opens
+- [DAEMON.md](DAEMON.md) - The resident scheduler behind `SCHEDULER_MODE=daemon`
+- [HEALTHCHECKS.md](HEALTHCHECKS.md) - The monitoring modes behind the `HEALTHCHECK_*` variables
 - [CLOUD_STORAGE.md](CLOUD_STORAGE.md) - Complete rclone setup guide
 - [ENCRYPTION.md](ENCRYPTION.md) - AGE encryption workflow
-- [CLI_REFERENCE.md](CLI_REFERENCE.md) - Command-line reference
+- [CLI_REFERENCE.md](CLI_REFERENCE.md) - Command-line reference, for automation and recovery
 - [EXAMPLES.md](EXAMPLES.md) - Practical configuration examples

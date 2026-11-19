@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -15,7 +16,7 @@ func (c *Collector) detectZFSUsage() (bool, string) {
 
 	// Strong indicator: ZFS filesystems currently mounted.
 	if data, err := os.ReadFile(c.systemPath("/proc/mounts")); err == nil && len(data) > 0 {
-		for _, line := range strings.Split(string(data), "\n") {
+		for line := range strings.SplitSeq(string(data), "\n") {
 			fields := strings.Fields(line)
 			if len(fields) >= 3 && fields[2] == "zfs" {
 				indicators = append(indicators, "mounted_zfs")
@@ -31,7 +32,7 @@ func (c *Collector) detectZFSUsage() (bool, string) {
 
 	// Medium indicator: fstab references ZFS.
 	if data, err := os.ReadFile(c.systemPath("/etc/fstab")); err == nil && len(data) > 0 {
-		for _, line := range strings.Split(string(data), "\n") {
+		for line := range strings.SplitSeq(string(data), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue
@@ -74,9 +75,7 @@ func (c *Collector) collectBestEffortProbe(ctx context.Context, spec CommandSpec
 			return ctxErr
 		}
 		if !ok {
-			if reason == "" {
-				reason = "required capability not detected"
-			}
+			reason = cmp.Or(reason, "required capability not detected")
 			c.logger.Debug("Skipping %s: %s", description, reason)
 			return nil
 		}
@@ -164,18 +163,20 @@ func (c *Collector) collectSystemNetworkStatic(ctx context.Context) error {
 	}
 
 	c.logger.Debug("Collecting network configuration files (/etc/network/*)")
+	// Both helpers answer a missing source with nil, so err here is a REAL copy
+	// failure; the old "No ... found" Debug wording was false from the first port.
 	if err := c.safeCopyFile(ctx,
 		c.systemPath("/etc/network/interfaces"),
 		filepath.Join(c.tempDir, "etc/network/interfaces"),
 		"Network interfaces"); err != nil {
-		c.logger.Debug("No /etc/network/interfaces found")
+		c.logger.Warning("Failed to collect /etc/network/interfaces: %v", err)
 	}
 
 	if err := c.safeCopyDir(ctx,
 		c.systemPath("/etc/network/interfaces.d"),
 		filepath.Join(c.tempDir, "etc/network/interfaces.d"),
 		"Network interfaces.d"); err != nil {
-		c.logger.Debug("No /etc/network/interfaces.d found")
+		c.logger.Warning("Failed to collect /etc/network/interfaces.d: %v", err)
 	}
 
 	extraNetworkFiles := []struct {
@@ -190,7 +191,7 @@ func (c *Collector) collectSystemNetworkStatic(ctx context.Context) error {
 			c.systemPath(file.path),
 			filepath.Join(c.tempDir, strings.TrimPrefix(file.path, "/")),
 			file.desc); err != nil {
-			c.logger.Debug("Failed to collect %s: %v", file.path, err)
+			c.logger.Warning("Failed to collect %s: %v", file.path, err)
 		}
 	}
 
@@ -198,21 +199,21 @@ func (c *Collector) collectSystemNetworkStatic(ctx context.Context) error {
 		c.systemPath("/etc/netplan"),
 		filepath.Join(c.tempDir, "etc/netplan"),
 		"Netplan configuration"); err != nil {
-		c.logger.Debug("No /etc/netplan found")
+		c.logger.Debug("Failed to collect /etc/netplan: %v", err)
 	}
 
 	if err := c.safeCopyDir(ctx,
 		c.systemPath("/etc/systemd/network"),
 		filepath.Join(c.tempDir, "etc/systemd/network"),
 		"systemd-networkd configuration"); err != nil {
-		c.logger.Debug("No /etc/systemd/network found")
+		c.logger.Debug("Failed to collect /etc/systemd/network: %v", err)
 	}
 
 	if err := c.safeCopyDir(ctx,
 		c.systemPath("/etc/NetworkManager/system-connections"),
 		filepath.Join(c.tempDir, "etc/NetworkManager/system-connections"),
 		"NetworkManager connections"); err != nil {
-		c.logger.Debug("No NetworkManager system-connections found")
+		c.logger.Debug("Failed to collect /etc/NetworkManager/system-connections: %v", err)
 	}
 
 	return nil
@@ -401,7 +402,55 @@ func (c *Collector) collectSystemServicesStatic(ctx context.Context) error {
 		c.logger.Debug("No /etc/systemd/system found")
 	}
 
+	// /etc/default and the udev rules are restored by the services category, which
+	// writes them straight to the live system. GRUB settings carry host-specific
+	// tokens (root device, IOMMU) that can leave another host unbootable, so they go
+	// under proxsave-info, which every restore mode treats as export-only, and never
+	// sit at ./etc/default/grub where services would write them.
+	stagedDefault := filepath.Join(c.tempDir, "etc/default")
+	if err := c.safeCopyDir(ctx,
+		c.systemPath("/etc/default"),
+		stagedDefault,
+		"Service defaults"); err != nil {
+		c.logger.Debug("No /etc/default found")
+	}
+	for _, name := range []string{"grub", "grub.d"} {
+		c.moveToBootReference(filepath.Join(stagedDefault, name), c.proxsaveInfoDir("boot", "etc", "default", name))
+	}
+
+	if err := c.safeCopyDir(ctx,
+		c.systemPath("/etc/udev/rules.d"),
+		filepath.Join(c.tempDir, "etc/udev/rules.d"),
+		"Udev rules"); err != nil {
+		c.logger.Debug("No /etc/udev/rules.d found")
+	}
+
 	return nil
+}
+
+// moveToBootReference moves an entry already staged under ./etc/default into the
+// boot reference tree, so it is collected once and restored nowhere. When the move
+// fails the staged entry is dropped rather than left where a restore would write it.
+func (c *Collector) moveToBootReference(staged, dest string) {
+	if c.dryRun {
+		return
+	}
+	if _, err := os.Lstat(staged); err != nil {
+		return
+	}
+	err := c.ensureDir(filepath.Dir(dest))
+	if err == nil {
+		err = os.Rename(staged, dest)
+	}
+	if err != nil {
+		c.logger.Warning("Boot configuration %s not collected: %v", filepath.Base(staged), err)
+		c.recordSystemManifestEntry(dest, ManifestEntry{Status: StatusFailed, Error: err.Error()})
+		if rmErr := os.RemoveAll(staged); rmErr != nil {
+			c.logger.Warning("Failed to remove staged %s: %v", staged, rmErr)
+		}
+		return
+	}
+	c.recordSystemManifestEntry(dest, ManifestEntry{Status: StatusCollected})
 }
 
 func (c *Collector) collectSystemLoggingStatic(ctx context.Context) error {
@@ -499,6 +548,18 @@ func (c *Collector) collectSystemKernelModuleStatic(ctx context.Context) error {
 		filepath.Join(c.tempDir, "etc/modprobe.d"),
 		"Modprobe.d directory"); err != nil {
 		c.logger.Debug("No /etc/modprobe.d found")
+	}
+
+	// The kernel command line and the ESP list are kept for reference only, under
+	// proxsave-info: the command line carries the root device and the ESP UUIDs belong
+	// to the disks of this host.
+	for _, name := range []string{"cmdline", "proxmox-boot-uuids"} {
+		if err := c.safeCopyFile(ctx,
+			c.systemPath(filepath.Join("/etc/kernel", name)),
+			c.proxsaveInfoDir("boot", "etc", "kernel", name),
+			"Kernel "+name); err != nil {
+			c.logger.Debug("No /etc/kernel/%s found", name)
+		}
 	}
 
 	return nil
@@ -772,12 +833,22 @@ func (c *Collector) collectSystemNetworkDNSRuntime(ctx context.Context, commands
 }
 
 func (c *Collector) collectSystemStorageMountsRuntime(ctx context.Context, commandsDir string) error {
-	if err := c.collectCommandMulti(ctx,
+	// df statfs's every mount: bounded so a dead NFS/CIFS mount cannot block the run.
+	dfCtx, cancel := c.boundedCommandContext(ctx, c.fsIoTimeout())
+	defer cancel()
+	if err := c.collectCommandMulti(dfCtx,
 		commandSpec("df", "-h"),
 		filepath.Join(commandsDir, "df.txt"),
 		"Disk usage",
 		false); err != nil {
-		return err
+		// A df killed by its bound fails as a process ("signal: killed"), a non-critical
+		// failure; one that exits in the instant the bound fires comes back as the
+		// deadline itself. Only the run's own cancellation stops the brick: the mount
+		// table is still collected.
+		if ctx.Err() != nil || !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		c.logger.Debug("Disk usage: df -h stopped by FS_IO_TIMEOUT (%v); collecting the mount table", err)
 	}
 
 	if err := c.safeCmdOutput(ctx,
@@ -1230,9 +1301,7 @@ func (c *Collector) buildNetworkReport(ctx context.Context, commandsDir string) 
 
 func ensureSystemPath() {
 	current := os.Getenv("PATH")
-	if current == "" {
-		current = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-	}
+	current = cmp.Or(current, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 
 	segments := strings.Split(current, string(os.PathListSeparator))
 	seen := make(map[string]struct{}, len(segments))
@@ -1339,8 +1408,11 @@ func (c *Collector) collectCriticalFiles(ctx context.Context) error {
 			return err
 		}
 		dest := filepath.Join(c.tempDir, strings.TrimPrefix(file, "/"))
+		// A returned error is ALWAYS a real failure (safeCopyFile answers a missing
+		// source with nil), and these are the files a restore needs most: mute at
+		// Debug since the initial Go port while fstab and logrotate siblings warned.
 		if err := c.safeCopyFile(ctx, c.systemPath(file), dest, fmt.Sprintf("critical file %s", filepath.Base(file))); err != nil && !errors.Is(err, os.ErrNotExist) {
-			c.logger.Debug("Failed to copy critical file %s: %v", file, err)
+			c.logger.Warning("Failed to copy critical file %s: %v", file, err)
 		}
 	}
 
@@ -1406,19 +1478,32 @@ func (c *Collector) collectCustomPaths(ctx context.Context) error {
 		info, err := os.Lstat(physicalPath)
 		if err != nil {
 			if !os.IsNotExist(err) {
-				c.logger.Debug("Custom path %s not accessible: %v", physicalPath, err)
+				c.logger.Warning("Custom path %s not accessible: %v", physicalPath, err)
 			}
 			continue
 		}
 
 		dest := filepath.Join(c.tempDir, strings.TrimPrefix(logicalPath, "/"))
+		// The operator asked for these by name; a real copy failure (not-found is
+		// answered with nil inside the helpers) must not hide at Debug.
 		if info.IsDir() {
 			if err := c.safeCopyDir(ctx, physicalPath, dest, fmt.Sprintf("custom directory %s", logicalPath)); err != nil {
-				c.logger.Debug("Failed to copy custom directory %s: %v", physicalPath, err)
+				c.logger.Warning("Failed to copy custom directory %s: %v", physicalPath, err)
 			}
 		} else {
 			if err := c.safeCopyFile(ctx, physicalPath, dest, fmt.Sprintf("custom file %s", filepath.Base(logicalPath))); err != nil {
-				c.logger.Debug("Failed to copy custom file %s: %v", physicalPath, err)
+				c.logger.Warning("Failed to copy custom file %s: %v", physicalPath, err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				if target, logicalTarget, ok := c.symlinkedDirectory(physicalPath); ok {
+					if _, done := seen[logicalTarget]; !done {
+						seen[logicalTarget] = struct{}{}
+						targetDest := filepath.Join(c.tempDir, strings.TrimPrefix(logicalTarget, "/"))
+						if err := c.safeCopyDir(ctx, target, targetDest, fmt.Sprintf("custom directory %s", logicalTarget)); err != nil {
+							c.logger.Warning("Failed to copy custom directory %s: %v", target, err)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -1524,6 +1609,14 @@ func (c *Collector) collectScriptRepository(ctx context.Context) error {
 		if err != nil || rel == "." {
 			return nil
 		}
+		// The repository is BASE_DIR. Its top-level restore and guards directories are
+		// host state, not scripts: restore holds the safety backups of past restores,
+		// with /etc/shadow and /etc/pve/priv material in the clear, and guards the mount
+		// guards. Only the top level: a directory with either name inside the operator's
+		// own scripts is kept.
+		if d.IsDir() && (rel == "restore" || rel == "guards") {
+			return filepath.SkipDir
+		}
 		// Skip VCS metadata and runtime/output dirs at ANY depth (not just the top
 		// level): .git/.svn/.hg carry full history/objects (large and sensitive), and
 		// backup(s)/log(s) are regenerated output that only bloats the snapshot.
@@ -1620,6 +1713,53 @@ func (c *Collector) collectRootHome(ctx context.Context) error {
 	return nil
 }
 
+// symlinkedDirectory resolves a collected symlink (a host path under
+// SystemRootPrefix) and returns the directory it points at, physical and as a host
+// path, when it is one: the link alone holds none of the content, so the caller
+// collects that directory at its own path too. A target that is not a directory, is
+// gone, lies in the staging tree or contains it (a link to "/"), or whose link is
+// excluded by the patterns is not returned.
+func (c *Collector) symlinkedDirectory(physicalLink string) (target, logical string, ok bool) {
+	if c.shouldExclude(physicalLink) {
+		return "", "", false
+	}
+	dest, err := os.Readlink(physicalLink)
+	if err != nil {
+		return "", "", false
+	}
+	if filepath.IsAbs(dest) {
+		dest = c.systemPath(dest)
+	} else {
+		dest = filepath.Join(filepath.Dir(physicalLink), dest)
+	}
+	target, err = filepath.EvalSymlinks(dest)
+	if err != nil || c.isWithinStagingDir(target) {
+		return "", "", false
+	}
+	// target is resolved, so the staging tree and the prefix it is compared with are
+	// too: under a symlinked /tmp or SYSTEM_ROOT_PREFIX the lexical ones never matched.
+	if staging := c.stagingRoot(); staging != "" {
+		if rel, err := filepath.Rel(target, staging); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", "", false
+		}
+	}
+	if info, err := os.Stat(target); err != nil || !info.IsDir() {
+		return "", "", false
+	}
+	logical = target
+	if prefix := filepath.Clean(c.config.SystemRootPrefix); c.config.SystemRootPrefix != "" && prefix != string(filepath.Separator) {
+		if real, err := filepath.EvalSymlinks(prefix); err == nil {
+			prefix = real
+		}
+		rel, err := filepath.Rel(prefix, target)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", "", false
+		}
+		logical = filepath.Join(string(filepath.Separator), rel)
+	}
+	return target, logical, true
+}
+
 func (c *Collector) collectUserHomes(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1665,6 +1805,23 @@ func (c *Collector) collectUserHomes(ctx context.Context) error {
 
 		if err := c.safeCopyFile(ctx, src, dest, fmt.Sprintf("home entry %s", name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			c.logger.Debug("Failed to copy home entry %s: %v", name, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		// A relocated home (/home/alice -> /data/home/alice): the link alone is a
+		// dangling link once restored, so its directory is collected at its own path.
+		if target, logicalTarget, ok := c.symlinkedDirectory(src); ok {
+			extraExclude := []string(nil)
+			if !c.config.BackupSSHKeys {
+				extraExclude = append(extraExclude, ".ssh")
+			}
+			targetDest := filepath.Join(c.tempDir, strings.TrimPrefix(logicalTarget, "/"))
+			if err := c.withTemporaryExcludes(extraExclude, func() error {
+				return c.safeCopyDir(ctx, target, targetDest, fmt.Sprintf("home directory for %s", name))
+			}); err != nil && !errors.Is(err, os.ErrNotExist) {
+				c.logger.Debug("Failed to copy home for %s: %v", name, err)
+			}
 		}
 	}
 

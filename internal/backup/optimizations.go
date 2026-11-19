@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -13,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/tis24dev/proxsave/internal/logging"
 )
@@ -42,6 +45,25 @@ type OptimizationConfig struct {
 	EnableDeduplication       bool
 	EnablePrefilter           bool
 	PrefilterMaxFileSizeBytes int64
+	// ExcludePatterns are the run's archive exclusions (see dedupManifestExcluded).
+	ExcludePatterns []string
+}
+
+// dedupManifestExcluded returns the exclusion pattern that would keep the dedup
+// manifest, or a directory above it, out of the archive, "" when none does. The
+// archiver drops a matching path silently, so an operator pattern such as *.json or
+// /var/lib/** shipped the dedup symlinks without the manifest that turns them back
+// into files on restore: the duplicates came back as links, or dangling ones.
+func dedupManifestExcluded(root string, patterns []string) string {
+	if len(patterns) == 0 {
+		return ""
+	}
+	for rel := DedupManifestRelPath; rel != "." && rel != "/"; rel = filepath.Dir(rel) {
+		if excluded, pattern := FindExcludeMatch(patterns, filepath.Join(root, rel), root, ""); excluded {
+			return pattern
+		}
+	}
+	return ""
 }
 
 // Enabled returns true if at least one optimization is active.
@@ -70,6 +92,12 @@ func ApplyOptimizations(ctx context.Context, logger *logging.Logger, root string
 	logger.Info("Running backup optimizations (dedup=%v prefilter=%v)",
 		cfg.EnableDeduplication, cfg.EnablePrefilter)
 
+	if cfg.EnableDeduplication {
+		if pattern := dedupManifestExcluded(root, cfg.ExcludePatterns); pattern != "" {
+			logger.Info("Deduplication skipped: the dedup manifest %s matches exclusion pattern %s", DedupManifestRelPath, pattern)
+			cfg.EnableDeduplication = false
+		}
+	}
 	if cfg.EnableDeduplication {
 		logger.Debug("Starting deduplication stage")
 		dups, reclaimed, err := deduplicateFiles(ctx, logger, root)
@@ -303,9 +331,7 @@ func revertDedupSymlink(r dedupReplacement) error {
 		return err
 	}
 	mode := r.mode.Perm()
-	if mode == 0 {
-		mode = 0o600
-	}
+	mode = cmp.Or(mode, 0o600)
 	tmp, err := os.CreateTemp(filepath.Dir(r.duplicate), ".proxsave-dedup-revert-*")
 	if err != nil {
 		return err
@@ -541,11 +567,42 @@ func normalizeTextFile(root *os.Root, name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	normalized := bytes.ReplaceAll(data, []byte("\r"), nil)
+	// Only CRLF pairs in plain single-byte text are collapsed - the documented
+	// contract ("removal of \r from CRLF text files"). The extension gate upstream
+	// cannot tell content: a .txt can be UTF-16 (where stripping every 0x0D byte
+	// breaks a code unit in half and shifts everything after it into garbage) and a
+	// .log can carry lone \r progress lines or embedded binary. Measured, not
+	// hypothetical: both corruptions were reproduced live before this guard.
+	if !isPlainSingleByteText(data) {
+		return false, nil
+	}
+	normalized := bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
 	if bytes.Equal(data, normalized) {
 		return false, nil
 	}
 	return true, atomicRootRewrite(root, name, normalized)
+}
+
+// isPlainSingleByteText reports whether data is safe for byte-level CRLF
+// normalization. Invalid UTF-8 and control characters other than common text
+// whitespace are treated as binary so an extension alone can never authorize a
+// destructive rewrite.
+func isPlainSingleByteText(data []byte) bool {
+	if !utf8.Valid(data) {
+		return false
+	}
+	for len(data) > 0 {
+		r, size := utf8.DecodeRune(data)
+		data = data[size:]
+		switch r {
+		case '\t', '\n', '\r':
+			continue
+		}
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeConfigFile(root *os.Root, name string) (bool, error) {

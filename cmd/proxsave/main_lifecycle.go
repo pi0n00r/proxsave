@@ -9,6 +9,7 @@ import (
 
 	"github.com/tis24dev/proxsave/internal/cli"
 	"github.com/tis24dev/proxsave/internal/logging"
+	"github.com/tis24dev/proxsave/internal/orchestrator"
 	"github.com/tis24dev/proxsave/internal/types"
 	buildinfo "github.com/tis24dev/proxsave/internal/version"
 )
@@ -88,6 +89,11 @@ func finishMainRun(run runBootstrap) {
 func preparePreRuntimeArgs(ctx context.Context, bootstrap *logging.BootstrapLogger, toolVersion string) (*cli.Args, int, bool) {
 	args := cli.Parse()
 	logging.DebugStepBootstrap(bootstrap, "main run", "args parsed")
+	// The restore run directories and the mount guards live under BASE_DIR, which is
+	// read off the executable's location, never off backup.env: set it before any mode
+	// (--cleanup-guards runs next, before the configuration is loaded).
+	baseDir, _ := detectedBaseDirOrFallback()
+	orchestrator.SetBaseDir(baseDir)
 	if exitCode, handled := dispatchFlagOnlyModes(args); handled {
 		return args, exitCode, true
 	}
@@ -145,7 +151,7 @@ func resolveRunConfigPath(args *cli.Args, bootstrap *logging.BootstrapLogger) (i
 	logging.DebugStepBootstrap(bootstrap, "main run", "resolving config path")
 	resolvedConfigPath, err := resolveInstallConfigPath(args.ConfigPath)
 	if err != nil {
-		bootstrap.Error("ERROR: %v", err)
+		bootstrap.Error("%v", err)
 		return types.ExitConfigError.Int(), false
 	}
 	args.ConfigPath = resolvedConfigPath
@@ -169,7 +175,7 @@ func prepareRuntime(ctx context.Context, args *cli.Args, bootstrap *logging.Boot
 
 func enforceGoRuntimeVersion(bootstrap *logging.BootstrapLogger) (int, bool) {
 	if err := checkGoRuntimeVersion(goRuntimeMinVersion); err != nil {
-		bootstrap.Error("ERROR: %v", err)
+		bootstrap.Error("%v", err)
 		return types.ExitEnvironmentError.Int(), false
 	}
 	return types.ExitSuccess.Int(), true

@@ -54,8 +54,14 @@ type Logger struct {
 	// only after logSinkTimeoutStrikes strikes so a single transient stall does not
 	// permanently truncate the on-disk log. A successful write resets it. Guarded by mu.
 	consecutiveLogTimeouts int
-	warningCount           int64
-	errorCount             int64
+	// fileWriteGap counts the lines lost to write errors since the last one that landed,
+	// fileWriteGapCause is the error that opened the gap, fileIncomplete stays true once
+	// any line of the run missed the file (see writeOnceLocked). Guarded by mu.
+	fileWriteGap      int
+	fileWriteGapCause error
+	fileIncomplete    bool
+	warningCount      int64
+	errorCount        int64
 	// notifyCount tracks NOTIFY-ERR lines: notification/communication failures that
 	// display as errors but are warning-weight for the run status (never escalate the
 	// exit code / gauge to error). Kept separate from errorCount so a notify failure
@@ -67,8 +73,7 @@ type Logger struct {
 	// shares this one logger instance, so a channel outage never escalates the run.
 	// Guarded by mu; nestable via Enter/ExitNotifyErrorScope.
 	notifyErrorScope int
-	issueLines       []string // Captured WARNING/ERROR/CRITICAL lines for end-of-run summary
-	exitFunc         func(int)
+	issueLines       []string     // Captured WARNING/ERROR/CRITICAL lines for end-of-run summary
 	secrets          []secretForm // registered secret values scrubbed from every log line
 	// mirror is an optional COLORED tap that receives a copy of every line the
 	// logger records, on BOTH the standard path (logWithLabel) AND the raw path
@@ -115,7 +120,6 @@ func New(level types.LogLevel, useColor bool) *Logger {
 		useColor:   useColor,
 		output:     os.Stdout,
 		timeFormat: "2006-01-02 15:04:05",
-		exitFunc:   os.Exit,
 	}
 }
 
@@ -174,18 +178,6 @@ func (l *Logger) SetLevel(level types.LogLevel) {
 	l.level = level
 }
 
-// SetExitFunc allows customizing the exit function (useful for tests).
-// If fn is nil, it restores os.Exit.
-func (l *Logger) SetExitFunc(fn func(int)) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if fn == nil {
-		l.exitFunc = os.Exit
-		return
-	}
-	l.exitFunc = fn
-}
-
 // OpenLogFile opens a log file and starts real-time writing.
 func (l *Logger) OpenLogFile(logPath string) error {
 	l.mu.Lock()
@@ -206,6 +198,7 @@ func (l *Logger) OpenLogFile(logPath string) error {
 
 	l.logFile = file
 	l.fileSinkDisabled = false
+	l.fileWriteGap, l.fileWriteGapCause, l.fileIncomplete = 0, nil, false
 	// A fresh mount must start with a clean strike count: OpenLogFile is the only
 	// re-enable path, so any stale count from a prior disable would otherwise let
 	// a single new timeout re-latch the sink and defeat the N-strike protection.
@@ -234,27 +227,71 @@ func (l *Logger) openFileBounded(logPath string) (*os.File, error) {
 // non-timeout outcome resets the streak. Caller MUST hold l.mu and have checked
 // logFile != nil && !fileSinkDisabled.
 func (l *Logger) writeFileLocked(line string) {
+	if l.fileWriteGap > 0 {
+		// The first line that lands after lost ones says how many are missing above it.
+		marker := fmt.Sprintf("[%s] %-8s log file writes failed (%v); %d lines missing from the on-disk log here\n",
+			time.Now().Format(l.timeFormat), types.LogLevelWarning.String(), l.fileWriteGapCause, l.fileWriteGap)
+		if !l.writeOnceLocked(marker) {
+			l.fileWriteGap++ // this line is lost too
+			return
+		}
+		l.fileWriteGap = 0
+	}
+	if !l.writeOnceLocked(line) {
+		l.fileWriteGap++
+	}
+}
+
+// writeOnceLocked writes s to the log file and reports whether it landed. A timeout is a
+// strike (see writeFileLocked) and is not a gap: the third one disables the sink with its
+// own marker. Any other error (disk full, EIO, a read-only remount) was dropped without a
+// word, so the run log - copied to the secondary and the cloud, attached to the email -
+// lost its WARNING and ERROR lines and the exit code computed from it read clean. The
+// first one of a series now says so on stdout, counted as a warning.
+func (l *Logger) writeOnceLocked(s string) bool {
 	f := l.logFile // local: a disable nils l.logFile, the abandoned goroutine keeps f
+	var err error
 	if l.ioTimeout <= 0 {
-		_, _ = fileWrite(f, line) // opt-out / legacy: unbounded
-		return
+		_, err = fileWrite(f, s) // opt-out / legacy: unbounded
+	} else {
+		wt := min(l.ioTimeout, logWriteTimeoutCap)
+		_, err = safefs.Run(context.Background(), "logwrite", f.Name(), wt, func() (int, error) {
+			return fileWrite(f, s)
+		})
 	}
-	wt := l.ioTimeout
-	if wt > logWriteTimeoutCap {
-		wt = logWriteTimeoutCap
-	}
-	_, err := safefs.Run(context.Background(), "logwrite", f.Name(), wt, func() (int, error) {
-		return fileWrite(f, line)
-	})
 	if err != nil && errors.Is(err, safefs.ErrTimeout) {
 		l.consecutiveLogTimeouts++
+		l.fileIncomplete = true
 		if l.consecutiveLogTimeouts >= logSinkTimeoutStrikes {
 			l.disableFileSinkLocked(err)
 		}
-		return
+		return true // not a gap: the strikes and the disable marker account for it
 	}
 	// Any non-timeout outcome (a clean write or a non-timeout error) breaks the streak.
 	l.consecutiveLogTimeouts = 0
+	if err == nil {
+		return true
+	}
+	l.fileIncomplete = true
+	if l.fileWriteGap == 0 {
+		l.fileWriteGapCause = err
+		timestamp := time.Now().Format(l.timeFormat)
+		warn := fmt.Sprintf("log file write failed (%v); continuing on stdout, lines are missing from the on-disk log", err)
+		// stdout only - never route this back through the failing file sink.
+		_, _ = fmt.Fprintf(l.output, "[%s] %-8s %s\n", timestamp, types.LogLevelWarning.String(), warn)
+		l.warningCount++
+		l.issueLines = append(l.issueLines, fmt.Sprintf("[%s] %-8s %s", timestamp, types.LogLevelWarning.String(), warn))
+	}
+	return false
+}
+
+// FileIncomplete reports whether lines of this run never reached the log file (a write
+// error, a write timeout, or the sink disabled): the counts parsed back from that file
+// then miss them.
+func (l *Logger) FileIncomplete() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.fileIncomplete || l.fileSinkDisabled
 }
 
 // disableFileSinkLocked turns the file sink off after a timed-out write so every
@@ -272,10 +309,7 @@ func (l *Logger) disableFileSinkLocked(cause error) {
 	// re-wedge; its failure is ignored. disableFileSinkLocked is only reached with
 	// ioTimeout > 0 (the bounded write path), so mwt is always positive.
 	if f := l.logFile; f != nil {
-		mwt := l.ioTimeout
-		if mwt > logWriteTimeoutCap {
-			mwt = logWriteTimeoutCap
-		}
+		mwt := min(l.ioTimeout, logWriteTimeoutCap)
 		marker := fmt.Sprintf("[%s] %-8s log file sink disabled after I/O timeout; on-disk log truncated here\n", timestamp, types.LogLevelWarning.String())
 		_, _ = safefs.Run(context.Background(), "logwrite-marker", f.Name(), mwt, func() (int, error) {
 			return fileWrite(f, marker)
@@ -385,14 +419,35 @@ func FormatConsoleLogLine(timestamp string, level types.LogLevel, message string
 }
 
 // log is the internal method used to write logs.
-func (l *Logger) log(level types.LogLevel, format string, args ...interface{}) {
+func (l *Logger) log(level types.LogLevel, format string, args ...any) {
 	l.logWithLabel(level, "", "", format, args...)
 }
 
-func (l *Logger) logWithLabel(level types.LogLevel, label string, colorOverride string, format string, args ...interface{}) {
+func (l *Logger) logWithLabel(level types.LogLevel, label string, colorOverride string, format string, args ...any) {
+	l.emit(level, label, colorOverride, true, format, args...)
+}
+
+// logFileOnly records a line the console has already shown (a bootstrap line
+// printed before this logger existed): the same counters, issue capture, mirror
+// tap and file line as any other, without printing it on the console again.
+func (l *Logger) logFileOnly(level types.LogLevel, message string) {
+	l.emit(level, "", "", false, "%s", message)
+}
+
+// emit is the single write path of the logger. toConsole is false only for a line
+// the console already shows.
+func (l *Logger) emit(level types.LogLevel, label string, colorOverride string, toConsole bool, format string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if level > l.level {
+	// The threshold is a CONSOLE filter (maintainer call, 2026-09-02). It used to
+	// return here for every level, before the counters, the issue capture and the
+	// file sink - so `--log-level error` made a warning vanish from the footer,
+	// the exit code AND the shipped log at once. Warning-weight lines and above
+	// are always counted and always reach the file; only their display is muted.
+	// Below warning the threshold keeps its full meaning.
+	consoleMuted := level > l.level
+	if consoleMuted && level != types.LogLevelWarning &&
+		level != types.LogLevelError && level != types.LogLevelCritical {
 		return
 	}
 
@@ -466,11 +521,14 @@ func (l *Logger) logWithLabel(level types.LogLevel, label string, colorOverride 
 		l.issueLines = append(l.issueLines, issue)
 	}
 
-	// Write to stdout with colors.
-	_, _ = fmt.Fprint(l.output, outputStdout)
+	// Write to stdout with colors - unless the console threshold mutes it, or the
+	// console already shows the line.
+	if !consoleMuted && toConsole {
+		_, _ = fmt.Fprint(l.output, outputStdout)
+	}
 
-	// Mirror the COLORED line to the optional tap (parallel to the file sink, so a
-	// muted console never starves it). In-memory, non-blocking; never wedges l.mu.
+	// Mirror the COLORED line to the optional tap independently of console
+	// visibility, so every recorded line remains available for a later UI replay.
 	if l.mirror != nil {
 		_, _ = io.WriteString(l.mirror, outputStdout)
 	}
@@ -532,17 +590,17 @@ func (l *Logger) IssueLines() []string {
 }
 
 // Debug writes a debug log.
-func (l *Logger) Debug(format string, args ...interface{}) {
+func (l *Logger) Debug(format string, args ...any) {
 	l.log(types.LogLevelDebug, format, args...)
 }
 
 // Info writes an informational log
-func (l *Logger) Info(format string, args ...interface{}) {
+func (l *Logger) Info(format string, args ...any) {
 	l.log(types.LogLevelInfo, format, args...)
 }
 
 // Phase writes an informational log with PHASE label
-func (l *Logger) Phase(format string, args ...interface{}) {
+func (l *Logger) Phase(format string, args ...any) {
 	if l == nil {
 		return
 	}
@@ -554,7 +612,7 @@ func (l *Logger) Phase(format string, args ...interface{}) {
 }
 
 // Step writes an informational log with STEP label (to highlight sequential activities)
-func (l *Logger) Step(format string, args ...interface{}) {
+func (l *Logger) Step(format string, args ...any) {
 	if l == nil {
 		return
 	}
@@ -566,7 +624,7 @@ func (l *Logger) Step(format string, args ...interface{}) {
 }
 
 // Skip writes an informational log with SKIP label (for disabled/ignored elements)
-func (l *Logger) Skip(format string, args ...interface{}) {
+func (l *Logger) Skip(format string, args ...any) {
 	if l == nil {
 		return
 	}
@@ -578,12 +636,12 @@ func (l *Logger) Skip(format string, args ...interface{}) {
 }
 
 // Warning writes a warning log.
-func (l *Logger) Warning(format string, args ...interface{}) {
+func (l *Logger) Warning(format string, args ...any) {
 	l.log(types.LogLevelWarning, format, args...)
 }
 
 // Error writes an error log.
-func (l *Logger) Error(format string, args ...interface{}) {
+func (l *Logger) Error(format string, args ...any) {
 	l.log(types.LogLevelError, format, args...)
 }
 
@@ -596,7 +654,7 @@ const NotifyErrorLabel = "NOTIFY-ERR"
 // (red, captured in the issue summary) but is tallied into notifyCount rather than
 // errorCount, so it displays as ERROR yet never escalates the run status to error.
 // The run-side count logic buckets the NOTIFY-ERR token as warning-weight.
-func (l *Logger) NotifyError(format string, args ...interface{}) {
+func (l *Logger) NotifyError(format string, args ...any) {
 	if l == nil {
 		return
 	}
@@ -637,19 +695,8 @@ func (l *Logger) ExitNotifyErrorScope() {
 }
 
 // Critical writes a critical log.
-func (l *Logger) Critical(format string, args ...interface{}) {
+func (l *Logger) Critical(format string, args ...any) {
 	l.log(types.LogLevelCritical, format, args...)
-}
-
-// Fatal writes a critical log and exits with the specified code
-func (l *Logger) Fatal(exitCode types.ExitCode, format string, args ...interface{}) {
-	l.Critical(format, args...)
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.exitFunc == nil {
-		l.exitFunc = os.Exit
-	}
-	l.exitFunc(exitCode.Int())
 }
 
 // AppendRaw writes a raw log line directly to the log file (if any)
@@ -698,41 +745,36 @@ func GetDefaultLogger() *Logger {
 // Package-level convenience functions
 
 // Debug writes a debug log using the default logger.
-func Debug(format string, args ...interface{}) {
+func Debug(format string, args ...any) {
 	defaultLogger.Debug(format, args...)
 }
 
 // Info writes an informational log using the default logger
-func Info(format string, args ...interface{}) {
+func Info(format string, args ...any) {
 	defaultLogger.Info(format, args...)
 }
 
 // Step writes a STEP log using the default logger.
-func Step(format string, args ...interface{}) {
+func Step(format string, args ...any) {
 	defaultLogger.Step(format, args...)
 }
 
 // Skip writes a SKIP log using the default logger.
-func Skip(format string, args ...interface{}) {
+func Skip(format string, args ...any) {
 	defaultLogger.Skip(format, args...)
 }
 
 // Warning writes a warning log using the default logger.
-func Warning(format string, args ...interface{}) {
+func Warning(format string, args ...any) {
 	defaultLogger.Warning(format, args...)
 }
 
 // Error writes an error log using the default logger.
-func Error(format string, args ...interface{}) {
+func Error(format string, args ...any) {
 	defaultLogger.Error(format, args...)
 }
 
 // Critical writes a critical log using the default logger.
-func Critical(format string, args ...interface{}) {
+func Critical(format string, args ...any) {
 	defaultLogger.Critical(format, args...)
-}
-
-// Fatal writes a critical log and exits with the specified code
-func Fatal(exitCode types.ExitCode, format string, args ...interface{}) {
-	defaultLogger.Fatal(exitCode, format, args...)
 }

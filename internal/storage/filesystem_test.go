@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -8,6 +9,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/tis24dev/proxsave/internal/logging"
+	"github.com/tis24dev/proxsave/internal/types"
 )
 
 func TestFilesystemDetectorTestOwnershipSupportRejectsNonDirectory(t *testing.T) {
@@ -50,6 +54,8 @@ func TestParseFilesystemType_CoversKnownAndUnknownTypes(t *testing.T) {
 		{"fat32", FilesystemFAT32},
 		{"fat", FilesystemFAT},
 		{"fat16", FilesystemFAT},
+		{"msdos", FilesystemMSDOS},
+		{"MSDOS", FilesystemMSDOS},
 		{"exfat", FilesystemExFAT},
 		{"ntfs", FilesystemNTFS},
 		{"ntfs-3g", FilesystemNTFS},
@@ -68,6 +74,32 @@ func TestParseFilesystemType_CoversKnownAndUnknownTypes(t *testing.T) {
 	for _, tc := range cases {
 		if got := parseFilesystemType(tc.in); got != tc.want {
 			t.Fatalf("parseFilesystemType(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// An msdos mount has its own type and behaves like fat for every user of the type: no
+// ownership, excluded from chown/chmod, and no mode set on the Cloud and Secondary copies.
+// vfat keeps its own type with the same behaviour.
+func TestMsdosBehavesLikeFAT(t *testing.T) {
+	if got := parseFilesystemType("msdos"); got != FilesystemMSDOS || string(got) != "msdos" {
+		t.Fatalf("parseFilesystemType(msdos) = %q, want %q", got, "msdos")
+	}
+	if got := parseFilesystemType("vfat"); got != FilesystemFAT32 || string(got) != "vfat" {
+		t.Fatalf("parseFilesystemType(vfat) = %q, want %q", got, "vfat")
+	}
+	for _, fs := range []FilesystemType{FilesystemMSDOS, FilesystemFAT32} {
+		if got, want := fs.hasNoUnixModes(), FilesystemFAT.hasNoUnixModes(); got != want || !got {
+			t.Fatalf("%q hasNoUnixModes() = %v, want %v (as fat)", fs, got, want)
+		}
+		if got, want := fs.ShouldAutoExclude(), FilesystemFAT.ShouldAutoExclude(); got != want || !got {
+			t.Fatalf("%q ShouldAutoExclude() = %v, want %v (as fat)", fs, got, want)
+		}
+		if got, want := fs.SupportsUnixOwnership(), FilesystemFAT.SupportsUnixOwnership(); got != want || got {
+			t.Fatalf("%q SupportsUnixOwnership() = %v, want %v (as fat)", fs, got, want)
+		}
+		if got, want := fs.IsNetworkFilesystem(), FilesystemFAT.IsNetworkFilesystem(); got != want || got {
+			t.Fatalf("%q IsNetworkFilesystem() = %v, want %v (as fat)", fs, got, want)
 		}
 	}
 }
@@ -131,7 +163,11 @@ func TestFilesystemDetectorGetMountPoint_PicksProcForProcPaths(t *testing.T) {
 		t.Skip("this test depends on /proc mounts")
 	}
 	detector := NewFilesystemDetector(newTestLogger())
-	mp, err := detector.getMountPoint("/proc/self")
+	fi, err := os.Stat("/proc/self")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp, _, err := detector.getMountPoint(context.Background(), "/proc/self", fi)
 	if err != nil {
 		t.Fatalf("getMountPoint error: %v", err)
 	}
@@ -276,6 +312,38 @@ func TestFilesystemDetectorSetPermissions_ReturnsErrorWhenChmodFails(t *testing.
 	if !errors.Is(err, os.ErrNotExist) && !strings.Contains(err.Error(), "no such file") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	// The chown ran first and failed too: both operations travel, neither is dropped.
+	var pe *PermissionsError
+	if !errors.As(err, &pe) || pe.Owner == nil || pe.Mode == nil {
+		t.Fatalf("error = %#v, want a *PermissionsError carrying the chown and the chmod failures", err)
+	}
+}
+
+// A chown that fails is returned too, not only logged at DEBUG, and the chmod still
+// runs after it.
+func TestFilesystemDetectorSetPermissions_ReturnsTheChownFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can chown to any owner; the failure needs an unprivileged run")
+	}
+	detector := NewFilesystemDetector(newTestLogger())
+	path := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	info := &FilesystemInfo{Type: FilesystemExt4, SupportsOwnership: true}
+
+	err := detector.SetPermissions(context.Background(), path, 0, 0, 0o600, info)
+	var pe *PermissionsError
+	if !errors.As(err, &pe) || pe.Owner == nil || pe.Mode != nil {
+		t.Fatalf("error = %#v, want a *PermissionsError with the chown failure only", err)
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("error = %v, want it to unwrap to the chown's permission error", err)
+	}
+	st, statErr := os.Stat(path)
+	if statErr != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("the chmod must still run after a failed chown: mode=%v err=%v", st.Mode().Perm(), statErr)
+	}
 }
 
 func TestFilesystemDetectorSetPermissions_SucceedsForExistingFile(t *testing.T) {
@@ -307,5 +375,89 @@ func TestFilesystemDetectorTestOwnershipSupport_FailsWhenDirNotWritable(t *testi
 
 	if detector.testOwnershipSupport(context.Background(), dir) {
 		t.Fatalf("expected ownership support test to fail when directory is not writable")
+	}
+}
+
+// A mount point must own the path by PATH BOUNDARY, not by string prefix: with
+// mounts "/" and "/mnt/nas", BACKUP_PATH=/mnt/nas2 lives on "/", but a bare
+// HasPrefix picked "/mnt/nas" - and a dead /mnt/nas then turned into a critical
+// StorageError aborting the backup of a perfectly healthy sibling path.
+func TestBestMountPointForRespectsPathBoundaries(t *testing.T) {
+	lines := []string{
+		"rootfs / ext4 rw 0 0",
+		"nas /mnt/nas nfs4 rw 0 0",
+	}
+	cases := map[string]string{
+		"/mnt/nas2":    "/",
+		"/mnt/nas":     "/mnt/nas",
+		"/mnt/nas/sub": "/mnt/nas",
+		"/var/backups": "/",
+	}
+	for path, want := range cases {
+		if got := bestMountPointFor(lines, path); got != want {
+			t.Errorf("bestMountPointFor(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// getFilesystemType answered with the FIRST /proc/mounts entry for the mount
+// point. Under a systemd automount the autofs placeholder precedes the real
+// filesystem at the same path - both lines below are verbatim from the live PVE
+// test node - so the backup path resolved to autofs, parseFilesystemType said
+// Unknown, the network write-probe never ran (Unknown is not a network FS) and
+// SetPermissions silently skipped chown/chmod 0600 on the stored backups. The
+// kernel appends mounts in order (verified live with stacked mounts), so the
+// LAST matching entry is the filesystem a path actually resolves to.
+func TestLastMountEntryWinsOverAutofsPlaceholder(t *testing.T) {
+	lines := []string{
+		"systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=37,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=12636 0 0",
+		"binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc rw,nosuid,nodev,noexec,relatime 0 0",
+	}
+	fsTypeStr, device, ok := lastMountEntryFor(lines, "/proc/sys/fs/binfmt_misc")
+	if !ok || fsTypeStr != "binfmt_misc" || device != "binfmt_misc" {
+		t.Fatalf("want the real filesystem behind the autofs placeholder, got type=%q device=%q ok=%v", fsTypeStr, device, ok)
+	}
+
+	nas := []string{
+		"systemd-1 /mnt/nas autofs rw,relatime,fd=41,pgrp=1,timeout=120,minproto=5,maxproto=5,direct 0 0",
+		"nas:/export /mnt/nas nfs4 rw,relatime,vers=4.2 0 0",
+	}
+	fsTypeStr, device, ok = lastMountEntryFor(nas, "/mnt/nas")
+	if !ok || fsTypeStr != "nfs4" || device != "nas:/export" {
+		t.Fatalf("the triggered nfs4 mount must win over its autofs trigger, got type=%q device=%q ok=%v", fsTypeStr, device, ok)
+	}
+
+	if _, _, ok := lastMountEntryFor(nas, "/mnt/other"); ok {
+		t.Fatal("an absent mount point must not match")
+	}
+}
+
+// The detector's ownership findings are DEBUG: the storage blocks print the
+// "  Filesystem:" and "  Permissions:" facts themselves.
+func TestFilesystemDetectorOwnershipFindingsAreDebug(t *testing.T) {
+	for _, tc := range []struct {
+		fsType   FilesystemType
+		probeOK  bool
+		wantLine string
+	}{
+		{FilesystemNFS, true, "DEBUG    Network filesystem nfs supports Unix ownership\n"},
+		{FilesystemNFS4, false, "DEBUG    Network filesystem nfs4 does NOT support Unix ownership\n"},
+		{FilesystemCIFS, false, "DEBUG    Filesystem cifs is incompatible with Unix ownership - will skip chown/chmod\n"},
+	} {
+		logger := logging.New(types.LogLevelDebug, false)
+		buf := &bytes.Buffer{}
+		logger.SetOutput(buf)
+		dir := t.TempDir()
+		detector := NewFilesystemDetector(logger)
+		detector.mountPointLookup = func(string) (string, error) { return dir, nil }
+		detector.filesystemTypeLookup = func(context.Context, string) (FilesystemType, string, error) { return tc.fsType, "dev", nil }
+		detector.ownershipSupportTest = func(context.Context, string) bool { return tc.probeOK }
+		if _, err := detector.DetectFilesystem(context.Background(), dir); err != nil {
+			t.Fatalf("DetectFilesystem(%s): %v", tc.fsType, err)
+		}
+		out := stripTimes(buf.String())
+		if !strings.Contains(out, tc.wantLine) || strings.Contains(out, "INFO") {
+			t.Fatalf("%s: want %q at DEBUG and no INFO line:\n%s", tc.fsType, tc.wantLine, out)
+		}
 	}
 }

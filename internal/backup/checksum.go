@@ -30,13 +30,30 @@ type Manifest struct {
 	CompressionMode  string    `json:"compression_mode,omitempty"`
 	ProxmoxType      string    `json:"proxmox_type"`
 	ProxmoxTargets   []string  `json:"proxmox_targets,omitempty"`
-	ProxmoxVersion   string    `json:"proxmox_version,omitempty"`
-	PVEVersion       string    `json:"pve_version,omitempty"`
-	PBSVersion       string    `json:"pbs_version,omitempty"`
-	Hostname         string    `json:"hostname"`
-	ScriptVersion    string    `json:"script_version,omitempty"`
-	EncryptionMode   string    `json:"encryption_mode,omitempty"`
-	ClusterMode      string    `json:"cluster_mode,omitempty"`
+	// IncompleteTargets names a role this archive was supposed to carry and does
+	// not, because its collection aborted while the run carried on. Absent on a
+	// whole archive. This is the sidecar, the record restore actually reads, so the
+	// gap has to be here: the collection manifest is an ExportOnly diagnostic that
+	// restore never opens, and a half-empty dual archive recorded only there would
+	// pass the compatibility check as a whole one.
+	IncompleteTargets []string `json:"incomplete_targets,omitempty"`
+	ProxmoxVersion    string   `json:"proxmox_version,omitempty"`
+	PVEVersion        string   `json:"pve_version,omitempty"`
+	PBSVersion        string   `json:"pbs_version,omitempty"`
+	Hostname          string   `json:"hostname"`
+	// ServerID is the server identity of the machine that wrote the archive, the
+	// same 16-digit value the identity file persists. Retention uses it to confirm
+	// that an archive naming a spelling of this host's name really is this host's
+	// own work, across a hostname change it can no longer resolve.
+	//
+	// omitempty is load bearing: no archive written before this field existed
+	// carries the key, and an empty value must keep producing byte-identical
+	// manifest JSON so nothing downstream sees a manifest change where there is no
+	// server identity to record.
+	ServerID       string `json:"server_id,omitempty"`
+	ScriptVersion  string `json:"script_version,omitempty"`
+	EncryptionMode string `json:"encryption_mode,omitempty"`
+	ClusterMode    string `json:"cluster_mode,omitempty"`
 	// PassphraseSalt is the per-installation random salt used to derive a
 	// passphrase-based AGE recipient. It is a public value embedded so the
 	// archive stays decryptable from the passphrase alone on any host. Empty
@@ -74,20 +91,13 @@ var checksumOpen = func(ctx context.Context, path string, timeout time.Duration)
 	return safefs.Open(ctx, path, timeout)
 }
 
-// GenerateChecksum calculates the SHA256 checksum of a file with NO FS I/O
-// timeout (the FS_IO_TIMEOUT=0 opt-out / legacy behaviour). Prefer
-// GenerateChecksumBounded with the configured FS_IO_TIMEOUT on any path that
-// may touch a removable or network mount.
-func GenerateChecksum(ctx context.Context, logger *logging.Logger, filePath string) (string, error) {
-	return GenerateChecksumBounded(ctx, logger, filePath, 0)
-}
-
-// GenerateChecksumBounded is GenerateChecksum with a per-chunk no-progress
-// (stall) budget on the open, every read+hash chunk, and the close, so a
-// dead/stale mount cannot wedge any of them in an uninterruptible (D-state)
-// syscall. The budget re-arms on every chunk that makes progress, so a healthy
-// large file over a slow-but-alive link still hashes in full. timeout<=0 disables
-// bounding (a plain synchronous read loop, identical to the legacy behaviour).
+// GenerateChecksumBounded calculates the SHA256 checksum of a file with a
+// per-chunk no-progress (stall) budget on the open, every read+hash chunk, and
+// the close, so a dead/stale mount cannot wedge any of them in an
+// uninterruptible (D-state) syscall. The budget re-arms on every chunk that
+// makes progress, so a healthy large file over a slow-but-alive link still
+// hashes in full. timeout<=0 disables bounding (a plain synchronous read loop,
+// identical to the legacy behaviour).
 // On a stalled read the safefs.CopyBounded worker is abandoned while still
 // holding the fd, so the close is skipped and the *os.File finalizer reclaims the
 // fd once the wedged kernel call returns.
@@ -162,14 +172,8 @@ func CreateManifest(ctx context.Context, logger *logging.Logger, manifest *Manif
 	return nil
 }
 
-// VerifyChecksum verifies a file against a manifest's checksum with NO FS I/O
-// timeout (legacy). Prefer VerifyChecksumBounded on potentially remote/stale paths.
-func VerifyChecksum(ctx context.Context, logger *logging.Logger, filePath, expectedChecksum string) (bool, error) {
-	return VerifyChecksumBounded(ctx, logger, filePath, expectedChecksum, 0)
-}
-
-// VerifyChecksumBounded is VerifyChecksum with a per-chunk FS I/O stall budget
-// (see GenerateChecksumBounded).
+// VerifyChecksumBounded verifies a file against a manifest's checksum with a
+// per-chunk FS I/O stall budget (see GenerateChecksumBounded).
 func VerifyChecksumBounded(ctx context.Context, logger *logging.Logger, filePath, expectedChecksum string, timeout time.Duration) (bool, error) {
 	logger.Debug("Verifying checksum for: %s", filePath)
 
@@ -216,6 +220,35 @@ func LoadManifest(manifestPath string) (*Manifest, error) {
 		unmarshalErr,
 		legacyErr,
 	)
+}
+
+// OwnerFromManifestBytes returns both facts a manifest payload records about the
+// machine that wrote the archive: the host it names and the server identity it
+// carries. Both come from THE SAME payload, which is the point of returning them
+// together rather than reading the manifest twice. On a location several hosts share,
+// a hostname taken from one sidecar and an identity taken from another would describe
+// a writer that never existed, and retention would be deciding a deletion on it.
+//
+// Format precedence is exactly LoadManifest's: JSON wins whenever it parses. The
+// KEY=VALUE fallback can only ever yield a hostname, because the pre-Go pipeline had
+// no notion of a server identity and never wrote such a key. Teaching
+// parseLegacyMetadata one would invent a format no archive on disk carries and
+// could only ever fire on a hand-edited file.
+//
+// Either result may be "", independently, and "" always means "the payload does not
+// say". It is never a match.
+func OwnerFromManifestBytes(data []byte) (hostname, serverID string) {
+	var manifest Manifest
+	if err := json.Unmarshal(data, &manifest); err == nil {
+		return strings.TrimSpace(manifest.Hostname), strings.TrimSpace(manifest.ServerID)
+	}
+
+	var legacy Manifest
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	if err := parseLegacyMetadata(scanner, &legacy); err != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(legacy.Hostname), ""
 }
 
 // loadLegacyManifest attempts to parse legacy Bash metadata files (KEY=VALUE format).

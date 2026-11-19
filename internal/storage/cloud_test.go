@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/tis24dev/proxsave/internal/config"
@@ -58,7 +59,7 @@ func (q *commandQueue) exec(ctx context.Context, name string, args ...string) ([
 }
 
 func newCloudStorageForTest(cfg *config.Config) *CloudStorage {
-	cs, _ := NewCloudStorage(cfg, newTestLogger())
+	cs, _ := NewCloudStorage(cfg, newTestLogger(), "")
 	return cs
 }
 
@@ -110,25 +111,27 @@ func TestCloudRetryBackoff(t *testing.T) {
 }
 
 func TestWaitForRetryContextReturnsOnCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
 
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		cancel()
-		close(done)
-	}()
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			cancel()
+			close(done)
+		}()
 
-	start := time.Now()
-	err := waitForRetryContext(ctx, time.Second)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("waitForRetryContext() error = %v, want context.Canceled", err)
-	}
-	if elapsed := time.Since(start); elapsed >= 200*time.Millisecond {
-		t.Fatalf("waitForRetryContext() returned after %v, want prompt cancellation", elapsed)
-	}
+		start := time.Now()
+		err := waitForRetryContext(ctx, time.Second)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waitForRetryContext() error = %v, want context.Canceled", err)
+		}
+		if elapsed := time.Since(start); elapsed >= 200*time.Millisecond {
+			t.Fatalf("waitForRetryContext() returned after %v, want prompt cancellation", elapsed)
+		}
 
-	<-done
+		<-done
+	})
 }
 
 func TestCloudStorageDetectFilesystem_RcloneMissingReturnsRecoverableError(t *testing.T) {
@@ -192,8 +195,8 @@ func TestCloudStorageMarkCloudLogPathAvailableClearsMissing(t *testing.T) {
 	}
 }
 
-func TestDefaultExecCommandReturnsErrorForMissingCommand(t *testing.T) {
-	_, err := defaultExecCommand(context.Background(), "proxsave-command-does-not-exist")
+func TestDefaultRunCommandReturnsErrorForMissingCommand(t *testing.T) {
+	_, err := defaultRunCommand(context.Background(), "proxsave-command-does-not-exist")
 	if err == nil {
 		t.Fatalf("expected error for missing command")
 	}
@@ -859,6 +862,8 @@ func TestCloudStorageStorePrimaryFailure(t *testing.T) {
 		t: t,
 		queue: []queuedResponse{
 			{name: "rclone", args: []string{"copyto", backupFile, "remote:pbs1-backup.tar.zst"}, err: errors.New("boom")},
+			// What the failed copy left at the final name is deleted.
+			{name: "rclone", args: []string{"deletefile", "remote:pbs1-backup.tar.zst"}},
 		},
 	}
 	cs.execCommand = queue.exec
@@ -985,14 +990,14 @@ func TestCloudStorageSkipsCloudLogsWhenPathMissing(t *testing.T) {
 	}
 	cs.execCommand = queue.exec
 
-	if got := cs.countLogFiles(context.Background()); got != -1 {
+	if got := cs.countLogFiles(context.Background(), nil); got != -1 {
 		t.Fatalf("countLogFiles() = %d; want -1", got)
 	}
 	if len(queue.calls) != 1 {
 		t.Fatalf("expected 1 rclone call, got %d", len(queue.calls))
 	}
 
-	if got := cs.countLogFiles(context.Background()); got != -1 {
+	if got := cs.countLogFiles(context.Background(), nil); got != -1 {
 		t.Fatalf("countLogFiles() second call = %d; want -1", got)
 	}
 	if len(queue.calls) != 1 {
@@ -1025,9 +1030,10 @@ func TestCloudStorageCountLogFiles_NormalizesPathOnlyCloudLogPath(t *testing.T) 
 			},
 		},
 	}
+	cs.hostname = "host" // the log in the listing is this host's
 	cs.execCommand = queue.exec
 
-	if got := cs.countLogFiles(context.Background()); got != 1 {
+	if got := cs.countLogFiles(context.Background(), nil); got != 1 {
 		t.Fatalf("countLogFiles() = %d; want 1", got)
 	}
 }
@@ -1053,14 +1059,14 @@ func TestCloudStorageSkipsCloudLogsWhenPathOnlyLogDirMissing(t *testing.T) {
 	}
 	cs.execCommand = queue.exec
 
-	if got := cs.countLogFiles(context.Background()); got != -1 {
+	if got := cs.countLogFiles(context.Background(), nil); got != -1 {
 		t.Fatalf("countLogFiles() = %d; want -1", got)
 	}
 	if len(queue.calls) != 1 {
 		t.Fatalf("expected 1 rclone call, got %d", len(queue.calls))
 	}
 
-	if got := cs.countLogFiles(context.Background()); got != -1 {
+	if got := cs.countLogFiles(context.Background(), nil); got != -1 {
 		t.Fatalf("countLogFiles() second call = %d; want -1", got)
 	}
 	if len(queue.calls) != 1 {
@@ -1137,7 +1143,6 @@ func TestCloudStorageRemoteNormalizationVariants(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &config.Config{
 				CloudEnabled:    true,
@@ -1176,7 +1181,6 @@ func TestSplitRemoteRefAndBaseName(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.ref, func(t *testing.T) {
 			gotRemote, gotRel := splitRemoteRef(tt.ref)
 			if gotRemote != tt.wantRemote || gotRel != tt.wantRel {
@@ -1267,7 +1271,6 @@ func TestRemoteDirRef(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			if got := remoteDirRef(tt.ref); got != tt.want {
 				t.Fatalf("remoteDirRef(%q) = %q, want %q", tt.ref, got, tt.want)
@@ -1329,27 +1332,34 @@ func TestCloudStorageGetStatsSummarizesList(t *testing.T) {
 		CloudRemote:  "remote",
 	}
 	cs := newCloudStorageForTest(cfg)
-	queue := &commandQueue{
-		t: t,
-		queue: []queuedResponse{
-			{
-				name: "rclone",
-				args: []string{"lsl", "remote:", "--max-depth", "1"},
-				out: strings.TrimSpace(`
+	cs.hostname = "host"
+	// The manifests are read as retention reads them; another host's archive is
+	// listed and not counted.
+	lslCalls := 0
+	cs.execCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "lsl":
+			lslCalls++
+			return []byte(strings.TrimSpace(`
 10 2025-06-01 10:00:00 host-backup-20250601.tar.zst
+7 2025-05-31 09:00:00 other-backup-20250531.tar.zst
 5 2025-05-30 08:00:00 host-backup-20250530.tar.zst
-`),
-			},
-		},
+`)), nil
+		case "cat":
+			if strings.Contains(args[len(args)-1], "other-backup") {
+				return []byte(`{"hostname":"other"}`), nil
+			}
+			return []byte(`{"hostname":"host"}`), nil
+		}
+		return nil, nil
 	}
-	cs.execCommand = queue.exec
 
 	stats, err := cs.GetStats(context.Background())
 	if err != nil {
 		t.Fatalf("GetStats() error = %v", err)
 	}
-	if stats.TotalBackups != 2 {
-		t.Fatalf("TotalBackups = %d, want 2", stats.TotalBackups)
+	if stats.TotalBackups != 2 || stats.ListedBackups != 3 {
+		t.Fatalf("TotalBackups = %d of %d listed, want 2 of 3: only this host's backups are counted", stats.TotalBackups, stats.ListedBackups)
 	}
 	if stats.TotalSize != 15 {
 		t.Fatalf("TotalSize = %d, want 15", stats.TotalSize)
@@ -1366,8 +1376,8 @@ func TestCloudStorageGetStatsSummarizesList(t *testing.T) {
 	if stats.OldestBackup == nil || !stats.OldestBackup.Equal(oldest) {
 		t.Fatalf("OldestBackup = %v, want %v", stats.OldestBackup, oldest)
 	}
-	if len(queue.calls) != 1 {
-		t.Fatalf("expected a single lsl call, got %d", len(queue.calls))
+	if lslCalls != 1 {
+		t.Fatalf("expected a single lsl call, got %d", lslCalls)
 	}
 }
 
@@ -1572,8 +1582,7 @@ func TestCloudStorageCheckRemoteAccessiblePropagatesParentDeadline(t *testing.T)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("checkRemoteAccessible() error = %v, want context.DeadlineExceeded", err)
 	}
-	var rcErr *remoteCheckError
-	if errors.As(err, &rcErr) {
+	if _, ok := errors.AsType[*remoteCheckError](err); ok {
 		t.Fatalf("checkRemoteAccessible() error = %v, want parent deadline error, not remoteCheckError", err)
 	}
 	if len(queue.calls) != 1 {
@@ -1730,5 +1739,86 @@ func TestCloudStorageCheckFallbackWithRemotePath(t *testing.T) {
 	// Should have: lsf (root) + mkdir + lsf (path, fails) + touch + deletefile
 	if len(queue.calls) != 5 {
 		t.Fatalf("expected 5 rclone calls, got %d", len(queue.calls))
+	}
+}
+
+// A cloud destination without a log folder it can count, CLOUD_LOG_PATH empty or
+// a local log folder outside the CLOUD_REMOTE directory, has no count of logs,
+// not a count of zero: the retention summary then carries no logs remaining.
+func TestCloudCountLogFilesWithoutALogFolderIsNoCount(t *testing.T) {
+	remoteDir := t.TempDir()
+	cases := []struct {
+		name string
+		cfg  *config.Config
+	}{
+		{"no CLOUD_LOG_PATH", &config.Config{CloudEnabled: true, CloudRemote: "remote", RcloneRetries: 1}},
+		{"log folder outside CLOUD_REMOTE", &config.Config{CloudEnabled: true, CloudRemote: remoteDir, CloudLogPath: "../logs", RcloneRetries: 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := newCloudStorageForTest(tc.cfg)
+			queue := &commandQueue{t: t}
+			cs.execCommand = queue.exec
+			if got := cs.countLogFiles(context.Background(), nil); got != -1 {
+				t.Fatalf("countLogFiles() = %d; want -1 (no count)", got)
+			}
+			if len(queue.calls) != 0 {
+				t.Fatalf("no rclone call expected, got %v", queue.calls)
+			}
+		})
+	}
+}
+
+// The cloud log count counts this host's run logs only, like the orphan-log
+// pass: another host's log in a shared folder, or a file outside the
+// backup-<host>-<timestamp>.log form, is not one of this destination's logs.
+func TestCloudCountLogFilesCountsThisHostsRunLogsOnly(t *testing.T) {
+	cfg := &config.Config{CloudEnabled: true, CloudRemote: "remote", CloudLogPath: "remote:logs", RcloneRetries: 1}
+	cs := newCloudStorageForTest(cfg)
+	cs.hostname = "node"
+	queue := &commandQueue{
+		t: t,
+		queue: []queuedResponse{{
+			name: "rclone",
+			args: []string{"lsf", "remote:logs", "--files-only"},
+			out: "backup-node-20250101-010101.log\n" +
+				"backup-node-20250102-010101.log\n" +
+				"backup-other-20250101-010101.log\n" +
+				"backup-node-latest.log\n" +
+				"notes.txt\n",
+		}},
+	}
+	cs.execCommand = queue.exec
+	if got := cs.countLogFiles(context.Background(), nil); got != 2 {
+		t.Fatalf("countLogFiles() = %d; want 2", got)
+	}
+}
+
+// A cancellation landing between the loop's context check and the one at the
+// start of deleteBackupInternal stops the pass like the loop's own check: the
+// backup it had not touched is not counted as not deleted, and nothing is run.
+func TestCloudDeleteBatchedStopsOnACancelBeforeTheDelete(t *testing.T) {
+	cfg := &config.Config{CloudEnabled: true, CloudRemote: "remote", RcloneRetries: 1}
+	cs := newCloudStorageForTest(cfg)
+	queue := &commandQueue{t: t}
+	cs.execCommand = queue.exec
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logger, sink := newCharLogger()
+	sink.arm("Deleting old backup:", 1, cancel)
+	cs.logger = logger
+	backups := []*types.BackupMetadata{
+		{BackupFile: "node-backup-20240101-000000.tar.zst", Timestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{BackupFile: "node-backup-20240102-000000.tar.zst", Timestamp: time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)},
+	}
+	deleted, err := cs.deleteBatched(ctx, backups, backups)
+	if deleted != 0 || !errors.Is(err, context.Canceled) {
+		t.Fatalf("deleteBatched = %d, %v; want 0, context.Canceled", deleted, err)
+	}
+	if cs.retTally.notDeleted != 0 {
+		t.Fatalf("notDeleted = %d; the untouched backup must not be counted", cs.retTally.notDeleted)
+	}
+	if len(queue.calls) != 0 {
+		t.Fatalf("no rclone call expected, got %v", queue.calls)
 	}
 }

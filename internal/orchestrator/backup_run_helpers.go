@@ -2,10 +2,12 @@
 package orchestrator
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"filippo.io/age"
 	"github.com/tis24dev/proxsave/internal/backup"
@@ -34,8 +36,7 @@ func backupMetricsExitCode(stats *BackupStats, runErr error) int {
 		return stats.ExitCode
 	}
 
-	var backupErr *BackupError
-	if errors.As(runErr, &backupErr) {
+	if backupErr, ok := errors.AsType[*BackupError](runErr); ok {
 		return backupErr.Code.Int()
 	}
 	return types.ExitGenericError.Int()
@@ -45,6 +46,27 @@ func (o *Orchestrator) exportPrometheusBackupMetrics(stats *BackupStats) {
 	m := stats.toPrometheusMetrics()
 	if m == nil {
 		return
+	}
+	// Secondary and cloud lines follow backup.env. A destination that is on there and
+	// failed at startup is switched off for the run with a count never read (-1): its
+	// line stays, at 0, like PBS below.
+	m.SecEnabled = o.cfg.SecondaryEnabled
+	if o.cfg.SecondaryStartupFailed {
+		m.SecEnabled = true
+		m.SecBackups = 0
+	}
+	m.CloudEnabled = o.cfg.CloudEnabled
+	if o.cfg.CloudStartupFailed {
+		m.CloudEnabled = true
+		m.CloudBackups = 0
+	}
+	// The PBS line follows PBS_TARGET_ENABLED, not the PBS outcome: an early error has
+	// no outcome and still reports 0, as does a PBS block that never got a count.
+	if o.cfg.PBSTargetEnabled {
+		m.PBSEnabled = true
+		if r := stats.PBSTarget; r != nil && r.Backups > 0 {
+			m.PBSBackups = r.Backups
+		}
 	}
 
 	exporter := metrics.NewPrometheusExporter(o.cfg.MetricsPath, o.logger)
@@ -67,8 +89,7 @@ func (o *Orchestrator) parseFailedBackupLogCounts(stats *BackupStats) {
 }
 
 func backupFailureExitCode(runErr error) int {
-	var backupErr *BackupError
-	if errors.As(runErr, &backupErr) {
+	if backupErr, ok := errors.AsType[*BackupError](runErr); ok {
 		return backupErr.Code.Int()
 	}
 	return types.ExitBackupError.Int()
@@ -106,6 +127,7 @@ func (o *Orchestrator) applyBackupCollectionStats(stats *BackupStats, collStats 
 	stats.FilesIncluded = int(collStats.FilesProcessed)
 	stats.FilesMissing = int(collStats.FilesNotFound)
 	stats.UncompressedSize = collStats.BytesCollected
+	stats.IncompleteTargets = collector.IncompleteTargets()
 	if stats.ProxmoxType.SupportsPVE() {
 		stats.ClusterMode = standaloneClusterMode(collector)
 	}
@@ -125,10 +147,11 @@ func (o *Orchestrator) writeBackupCollectionMetadata(tempDir, hostname string, s
 	// while the embedded diagnostic metadata is incomplete (PS-BH-003). The backup
 	// data itself is unaffected, so a warning (not an error) is the right severity.
 	if err := o.writeBackupMetadata(tempDir, stats); err != nil {
-		o.logger.Warning("WARNING: Failed to write backup metadata: %v", err)
+		collector.NoteStagingWriteError(err)
+		o.logger.Warning("Failed to write backup metadata: %v", err)
 	}
 	if err := collector.WriteManifest(hostname); err != nil {
-		o.logger.Warning("WARNING: Failed to write backup manifest: %v", err)
+		o.logger.Warning("Failed to write backup manifest: %v", err)
 	}
 }
 
@@ -140,7 +163,7 @@ func (o *Orchestrator) logBackupCollectionSummary(collStats *backup.CollectionSt
 		collStats.DirsCreated)
 }
 
-func (o *Orchestrator) applyBackupOptimizations(ctx context.Context, tempDir string) (backup.OptimizationResult, error) {
+func (o *Orchestrator) applyBackupOptimizations(ctx context.Context, tempDir string, excludePatterns []string) (backup.OptimizationResult, error) {
 	if !o.optimizationCfg.Enabled() {
 		o.logger.Debug("Skipping optimization step (all features disabled)")
 		return backup.OptimizationResult{}, nil
@@ -148,7 +171,9 @@ func (o *Orchestrator) applyBackupOptimizations(ctx context.Context, tempDir str
 
 	fmt.Println()
 	o.logger.Step("Backup optimizations on collected data")
-	res, err := backup.ApplyOptimizations(ctx, o.logger, tempDir, o.optimizationCfg)
+	optCfg := o.optimizationCfg
+	optCfg.ExcludePatterns = excludePatterns
+	res, err := backup.ApplyOptimizations(ctx, o.logger, tempDir, optCfg)
 	if err != nil {
 		// ApplyOptimizations only returns an error for an unsafe deduplication state
 		// (a tree that would lose fidelity on restore); abort rather than ship it.
@@ -171,9 +196,7 @@ func backupDiskValidationError(message string, diskErr error) error {
 	if errMsg == "" && diskErr != nil {
 		errMsg = diskErr.Error()
 	}
-	if errMsg == "" {
-		errMsg = "insufficient disk space"
-	}
+	errMsg = cmp.Or(errMsg, "insufficient disk space")
 	if diskErr == nil {
 		diskErr = errors.New(errMsg)
 	}
@@ -236,21 +259,34 @@ func discardPartialArchive(fs FS, partialPath string) {
 	_ = fs.RemoveAll(partialPath)
 }
 
+// clearDiscardedArchiveStats forgets what the stats recorded about a partial
+// archive that was then discarded: its final name, its size and the figures
+// derived from it, and its checksum. No file ever existed under that name, so the
+// notifications, the dashboard and the metrics must report the run the way they
+// report a run whose archive was never created (a compression failure).
+func clearDiscardedArchiveStats(stats *BackupStats) {
+	stats.ArchivePath = ""
+	stats.ArchiveSize = 0
+	stats.CompressedSize = 0
+	stats.CompressionRatio = 0
+	stats.CompressionRatioPercent = 0
+	stats.CompressionSavingsPercent = 0
+	stats.Checksum = ""
+}
+
 func backupArchiveCreationError(err error) error {
 	phase := "archive"
 	code := types.ExitArchiveError
-	var compressionErr *backup.CompressionError
-	if errors.As(err, &compressionErr) {
+	if _, ok := errors.AsType[*backup.CompressionError](err); ok {
 		phase = "compression"
 		code = types.ExitCompressionError
 	}
 	return &BackupError{Phase: phase, Err: err, Code: code}
 }
 
-func (o *Orchestrator) skipDryRunArtifactVerification(stats *BackupStats, artifacts *backupArtifacts) error {
+func (o *Orchestrator) skipDryRunArtifactVerification(stats *BackupStats) error {
 	fmt.Println()
 	o.logStep(4, "Verification skipped (dry run mode)")
-	o.logger.Info("[DRY RUN] Would create archive: %s", artifacts.archivePath)
 	stats.EndTime = o.now()
 	return nil
 }
@@ -286,7 +322,7 @@ func (o *Orchestrator) generateArchiveChecksum(ctx context.Context, archivePath 
 
 func (o *Orchestrator) writeArchiveChecksum(workspace *backupWorkspace, artifacts *backupArtifacts, checksum string) error {
 	checksumContent := fmt.Sprintf("%s  %s\n", checksum, filepath.Base(artifacts.archivePath))
-	if err := workspace.fs.WriteFile(artifacts.checksumPath, []byte(checksumContent), 0o640); err != nil {
+	if err := workspace.fs.WriteFile(artifacts.checksumPath, []byte(checksumContent), backup.ArtifactFilePerm); err != nil {
 		return fmt.Errorf("write checksum file %s: %w", artifacts.checksumPath, err)
 	}
 	o.logger.Debug("Checksum file written to %s", artifacts.checksumPath)
@@ -328,23 +364,31 @@ func (o *Orchestrator) newArchiveManifest(stats *BackupStats, archivePath, check
 		return nil, err
 	}
 	return &backup.Manifest{
-		ArchivePath:      archivePath,
-		ArchiveSize:      stats.ArchiveSize,
-		SHA256:           checksum,
-		CreatedAt:        stats.Timestamp,
-		CompressionType:  string(stats.Compression),
-		CompressionLevel: stats.CompressionLevel,
-		CompressionMode:  stats.CompressionMode,
-		ProxmoxType:      string(stats.ProxmoxType),
-		ProxmoxTargets:   append([]string(nil), stats.ProxmoxTargets...),
-		ProxmoxVersion:   stats.ProxmoxVersion,
-		PVEVersion:       stats.PVEVersion,
-		PBSVersion:       stats.PBSVersion,
-		Hostname:         stats.Hostname,
-		ScriptVersion:    stats.ScriptVersion,
-		EncryptionMode:   o.archiveEncryptionMode(),
-		ClusterMode:      stats.ClusterMode,
-		PassphraseSalt:   passphraseSalt,
+		ArchivePath:       archivePath,
+		ArchiveSize:       stats.ArchiveSize,
+		SHA256:            checksum,
+		CreatedAt:         stats.Timestamp,
+		CompressionType:   string(stats.Compression),
+		CompressionLevel:  stats.CompressionLevel,
+		CompressionMode:   stats.CompressionMode,
+		ProxmoxType:       string(stats.ProxmoxType),
+		ProxmoxTargets:    append([]string(nil), stats.ProxmoxTargets...),
+		IncompleteTargets: append([]string(nil), stats.IncompleteTargets...),
+		ProxmoxVersion:    stats.ProxmoxVersion,
+		PVEVersion:        stats.PVEVersion,
+		PBSVersion:        stats.PBSVersion,
+		Hostname:          stats.Hostname,
+		// The one place the run's server identity reaches the archives. It is what
+		// lets a later run recognise this archive as its own after the machine stops
+		// resolving the name stamped beside it (discussion #292). Empty when this
+		// host could not determine its identity, which is safe: retention then falls
+		// back to the hostname rule alone, exactly as it behaved before the field
+		// existed.
+		ServerID:       strings.TrimSpace(stats.ServerID),
+		ScriptVersion:  stats.ScriptVersion,
+		EncryptionMode: o.archiveEncryptionMode(),
+		ClusterMode:    stats.ClusterMode,
+		PassphraseSalt: passphraseSalt,
 	}, nil
 }
 
@@ -357,7 +401,8 @@ func (o *Orchestrator) archiveEncryptionMode() string {
 
 func (o *Orchestrator) writeLegacyMetadataAlias(workspace *backupWorkspace, artifacts *backupArtifacts) {
 	metadataAlias := artifacts.archivePath + ".metadata"
-	if err := copyFile(workspace.fs, artifacts.manifestPath, metadataAlias); err != nil {
+	// Byte-identical to the manifest, so it gets the manifest's mode, not copyFile's.
+	if err := copyFileWithPerm(workspace.fs, artifacts.manifestPath, metadataAlias, backup.ArtifactFilePerm); err != nil {
 		o.logger.Warning("Failed to write legacy metadata file %s: %v", metadataAlias, err)
 	} else {
 		o.logger.Debug("Legacy metadata file written to %s", metadataAlias)

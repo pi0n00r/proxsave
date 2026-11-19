@@ -24,6 +24,15 @@ var ErrRestoreAborted = errors.New("restore workflow aborted by user")
 // (F06-08). It is NOT ErrRestoreAborted (a benign user cancel): it is a hard failure.
 var ErrRestoreInconsistentState = errors.New("restore left an inconsistent on-disk state; manual recovery required")
 
+// ErrRestoreDryRun is returned when a restore is asked to run under dry-run. A restore
+// cannot run without modifying the system: it stops services, unmounts /etc/pve in
+// RECOVERY, extracts the direct-write categories over the live files and writes a
+// safety backup, and only some of its later steps ever read the flag. A partial dry run
+// is worse than none, because it teaches the operator the flag is honoured here, so the
+// restore is refused instead, before any prompt, write or service stop. Mirrors the
+// refusal of --dry-run with --upgrade and --daemon in cmd/proxsave/main_modes.go.
+var ErrRestoreDryRun = errors.New("a restore cannot run without modifying the system, so it is refused while dry-run is active")
+
 // RestoreAbortInfo contains information about an aborted restore with network rollback.
 type RestoreAbortInfo struct {
 	NetworkRollbackArmed  bool
@@ -47,7 +56,12 @@ func ClearRestoreAbortInfo() {
 }
 
 // RunRestoreWorkflow runs the CLI restore workflow using stdin prompts and the provided configuration.
-func RunRestoreWorkflow(ctx context.Context, cfg *config.Config, logger *logging.Logger, version string) (err error) {
+//
+// runHostname is the name this run resolves as its own; it is what the access
+// control host check compares a restored bundle's hostname against, next to
+// os.Hostname(). Pass "" if it is not known: the check is then strict, which warns
+// more, never less.
+func RunRestoreWorkflow(ctx context.Context, cfg *config.Config, logger *logging.Logger, version, runHostname string) (err error) {
 	if cfg == nil {
 		return fmt.Errorf("configuration not available")
 	}
@@ -59,5 +73,5 @@ func RunRestoreWorkflow(ctx context.Context, cfg *config.Config, logger *logging
 	defer func() { done(err) }()
 
 	ui := newCLIWorkflowUI(bufio.NewReader(os.Stdin), logger)
-	return runRestoreWorkflowWithUI(ctx, cfg, logger, version, ui)
+	return runRestoreWorkflowWithUI(ctx, cfg, logger, version, ui, runHostname)
 }

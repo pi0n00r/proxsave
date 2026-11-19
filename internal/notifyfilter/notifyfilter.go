@@ -1,0 +1,246 @@
+// Package notifyfilter decides the NOTIFY_ON threshold a run applies. It is shared by the run
+// (cmd/proxsave), which filters the notifications with it, and by the Healthchecks check screen,
+// which shows the same decision, so the two can never give different answers.
+//
+// NOTIFY_ON below always lets a clean run go silent, and silence is only safe when something
+// else alarms when a run never happens: the Healthchecks monitor. So a run applies the threshold
+// only when that monitor is confirmed to reach the operator, and notifies every outcome
+// otherwise:
+//   - centralized: the relay reports the alive and backup checks covered by a verified DOWN
+//     route (state ready) and has applied this exact policy to the notify checks;
+//   - self: both ping URLs valid, the daemon transmitting, and no notify URL configured (a
+//     notify check the operator runs on a period would go DOWN on every filtered run).
+package notifyfilter
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/tis24dev/proxsave/internal/config"
+	"github.com/tis24dev/proxsave/internal/health"
+	"github.com/tis24dev/proxsave/internal/identity"
+	"github.com/tis24dev/proxsave/internal/logging"
+	"github.com/tis24dev/proxsave/internal/serverbot"
+	"github.com/tis24dev/proxsave/internal/ui/theme"
+)
+
+// Healthchecks status words shown on the run's INFO line (maintainer-approved set).
+const (
+	StatusReady           = "ready"
+	StatusNotConfigured   = "not configured"
+	StatusNotVerified     = "not verified"
+	StatusDegraded        = "degraded"
+	StatusUnknown         = "unknown"
+	StatusDisabled        = "disabled"
+	StatusNotTransmitting = "not transmitting"
+	StatusSelf            = "self"
+)
+
+// How the Healthchecks section stands when the decision is taken.
+const (
+	SectionDisabled        = "disabled"
+	SectionNotTransmitting = "not_transmitting"
+	SectionInitialized     = "initialized"
+	// SectionSelfUnconfirmed: self mode with healthchecks running, but the operator's
+	// monitor is not confirmed to receive (no backup check, or the last heartbeat did
+	// not reach it): NOTIFY_ON is not applied, every channel sends.
+	SectionSelfUnconfirmed = "self_unconfirmed"
+)
+
+// Reasons a decision falls back to always (DEBUG vocabulary).
+const (
+	ReasonHealthchecksDisabled = "healthchecks_disabled"
+	ReasonNotTransmitting      = "not_transmitting"
+	ReasonSelfNotifyChecks     = "self_notify_urls_configured"
+	ReasonStatusUnavailable    = "delivery_status_unavailable"
+	ReasonAlertsNotVerified    = "alerts_not_verified"
+	ReasonPolicyUnconfirmed    = "policy_unconfirmed"
+	ReasonSelfUnconfirmed      = "self_monitor_unconfirmed"
+)
+
+// Why the relay's delivery status could not be used (Decision.Unavailable).
+const (
+	// UnavailableUnreachable: no HTTP answer, the call failed at the dns, connect, request or
+	// response stage.
+	UnavailableUnreachable = "unreachable"
+	// UnavailableHTTPStatus: the relay answered with an HTTP status other than 200.
+	UnavailableHTTPStatus = "http_status"
+	// UnavailableUnusable: the relay answered 200 with bad JSON, a schema or state outside the
+	// contract, or an evaluation it no longer vouches for.
+	UnavailableUnusable = "unusable_answer"
+)
+
+// Validity is how long a relay answer may be reused for the decision before dispatch, at most: the
+// relay's own validity (valid_for_seconds less age_seconds) can make it shorter.
+const Validity = 120 * time.Second
+
+// Seams for tests.
+var (
+	FetchDeliveryStatus = health.FetchDeliveryStatus
+	// Now is the clock the relay answer's age is measured with.
+	Now = time.Now
+)
+
+// Decision is the threshold a run applies and why.
+type Decision struct {
+	Requested string // NOTIFY_ON as negotiated: the configured value when valid, always otherwise
+	Status    string // Healthchecks status word
+	Effective string // the threshold applied
+	Reason    string // why Effective differs from Requested, "" when it does not
+	// Unavailable is why the relay's delivery status could not be used (Unavailable*): "" when
+	// the relay was not asked, answered usably, or failed in a way none of them names.
+	Unavailable string
+	ReadAt      time.Time
+	ValidFor    time.Duration
+}
+
+// Applied reports whether the run applies the threshold it asked for.
+func (d Decision) Applied() bool { return d.Effective == d.Requested }
+
+// Outcome is the INFO line that closes a notification filter block, at initialization and
+// before dispatch. It is an INFO even when not applied: the run still notifies every outcome,
+// nothing needs the operator, and a WARNING would raise the run's exit code.
+func (d Decision) Outcome() string {
+	if d.Applied() {
+		return theme.SymbolSuccess + " Notification filter: applied"
+	}
+	return theme.SymbolWarning + " Notification filter: not applied"
+}
+
+// Negotiated is the NOTIFY_ON value the daemon sends to the relay and the run requests: the
+// configured one when valid, always otherwise.
+func Negotiated(cfg *config.Config) string {
+	if cfg == nil || !config.IsValidNotifyOn(cfg.NotifyOn) || cfg.NotifyOn == "" {
+		return config.NotifyOnAlways
+	}
+	return cfg.NotifyOn
+}
+
+// EnabledChannels returns the lowercased notification-channel names enabled in cfg, sorted: the
+// authoritative set the daemon sends to the relay. Always non-nil.
+func EnabledChannels(cfg *config.Config) []string {
+	out := []string{}
+	if cfg == nil {
+		return out
+	}
+	if cfg.EmailEnabled {
+		out = append(out, "email")
+	}
+	if cfg.TelegramEnabled {
+		out = append(out, "telegram")
+	}
+	if cfg.GotifyEnabled {
+		out = append(out, "gotify")
+	}
+	if cfg.WebhookEnabled {
+		out = append(out, "webhook")
+	}
+	slices.Sort(out)
+	return out
+}
+
+// SelfNotifyChecksConfigured reports whether any HEALTHCHECK_NOTIFY_* variable is set.
+func SelfNotifyChecksConfigured(cfg *config.Config) bool {
+	for _, v := range []string{cfg.HealthcheckNotifyEmailURL, cfg.HealthcheckNotifyEmailID,
+		cfg.HealthcheckNotifyTelegramURL, cfg.HealthcheckNotifyTelegramID,
+		cfg.HealthcheckNotifyGotifyURL, cfg.HealthcheckNotifyGotifyID,
+		cfg.HealthcheckNotifyWebhookURL, cfg.HealthcheckNotifyWebhookID} {
+		if strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func statusWord(state string) string {
+	switch state {
+	case "ready":
+		return StatusReady
+	case "not_configured":
+		return StatusNotConfigured
+	case "unverified":
+		return StatusNotVerified
+	case "degraded":
+		return StatusDegraded
+	default:
+		return StatusUnknown
+	}
+}
+
+// Decide takes the decision; op names the DEBUG operation ("notifications init" or
+// "notifications dispatch"). A nil logger writes no DEBUG line.
+func Decide(ctx context.Context, cfg *config.Config, logger *logging.Logger, section, op string) Decision {
+	d := Decision{Requested: Negotiated(cfg), Effective: config.NotifyOnAlways}
+	switch {
+	case cfg == nil || section == SectionDisabled:
+		d.Status, d.Reason = StatusDisabled, ReasonHealthchecksDisabled
+	case section == SectionNotTransmitting:
+		d.Status, d.Reason = StatusNotTransmitting, ReasonNotTransmitting
+	case section == SectionSelfUnconfirmed:
+		d.Status, d.Reason = StatusSelf, ReasonSelfUnconfirmed
+	case cfg.HealthcheckMode == config.HealthcheckModeSelf:
+		d.Status = StatusSelf
+		logging.DebugStep(logger, op, "self notify_urls=%t", SelfNotifyChecksConfigured(cfg))
+		if SelfNotifyChecksConfigured(cfg) {
+			d.Reason = ReasonSelfNotifyChecks
+		} else {
+			d.Effective = d.Requested
+		}
+	default:
+		secret, _ := identity.LoadNotifySecret(cfg.BaseDir)
+		st, err := FetchDeliveryStatus(ctx, nil, cfg.ServerAPIHost, cfg.ServerID, secret, logger, op)
+		d.ReadAt, d.ValidFor = Now(), Validity
+		if err != nil {
+			d.Status, d.Reason, d.Unavailable = StatusUnknown, ReasonStatusUnavailable, unavailable(err)
+			logging.DebugStep(logger, op, "delivery unavailable: %v", err)
+			break
+		}
+		d.Status = statusWord(st.State)
+		d.ValidFor = st.Remaining(Validity)
+		confirmed := st.PolicyConfirmed(d.Requested, EnabledChannels(cfg))
+		logging.DebugStep(logger, op, "delivery state=%s alive_routes=%d/%d backup_routes=%d/%d policy_confirmed=%t reasons=%s",
+			st.State, st.Checks.Alive.VerifiedDownRoutes, st.Checks.Alive.ConfiguredDownRoutes,
+			st.Checks.Backup.VerifiedDownRoutes, st.Checks.Backup.ConfiguredDownRoutes, confirmed,
+			strings.Join(st.ReasonCodes, ","))
+		switch {
+		case st.State != "ready":
+			d.Reason = ReasonAlertsNotVerified
+		case !confirmed:
+			d.Reason = ReasonPolicyUnconfirmed
+		default:
+			d.Effective = d.Requested
+		}
+	}
+	if d.Requested == config.NotifyOnAlways {
+		d.Effective, d.Reason = config.NotifyOnAlways, ""
+	}
+	if d.Effective != d.Requested {
+		logging.DebugStep(logger, op, "filter fallback=%s reason=%s", d.Effective, d.Reason)
+	}
+	return d
+}
+
+// unavailable names why FetchDeliveryStatus gave no usable answer, from the error it returned: a
+// transport failure once the call was on its way (serverbot's "request" and "read" failures, the
+// dns, connect, request and response stages), an HTTP status other than 200, or a 200 answer
+// that is not a usable status. It is "" for any other error, such as a request that could not
+// be built.
+func unavailable(err error) string {
+	var te *serverbot.TransportError
+	var he *health.DeliveryHTTPStatusError
+	var ae *health.DeliveryAnswerError
+	switch {
+	case errors.As(err, &te):
+		if te.Op == "request" || te.Op == "read" {
+			return UnavailableUnreachable
+		}
+	case errors.As(err, &he):
+		return UnavailableHTTPStatus
+	case errors.As(err, &ae):
+		return UnavailableUnusable
+	}
+	return ""
+}

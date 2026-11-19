@@ -23,8 +23,8 @@ type networkRollbackUIApplyFlow struct {
 	archivePath         string
 	timeout             time.Duration
 	systemType          SystemType
-	suppressPVEChecks   bool
 	diagnosticsDir      string
+	beforeSnapshot      string
 	iface               string
 	source              string
 	nicRepair           *nicRepairResult
@@ -39,20 +39,18 @@ type networkRollbackUIApplyRequest struct {
 	archivePath         string
 	timeout             time.Duration
 	systemType          SystemType
-	suppressPVEChecks   bool
 }
 
 func applyNetworkWithRollbackWithUI(ctx context.Context, ui RestoreWorkflowUI, logger *logging.Logger, req networkRollbackUIApplyRequest) (err error) {
 	done := logging.DebugStart(
 		logger,
 		"network safe apply (ui)",
-		"rollbackBackup=%s networkRollback=%s timeout=%s systemType=%s stage=%s suppressPVEChecks=%v",
+		"rollbackBackup=%s networkRollback=%s timeout=%s systemType=%s stage=%s",
 		strings.TrimSpace(req.rollbackBackupPath),
 		strings.TrimSpace(req.networkRollbackPath),
 		req.timeout,
 		req.systemType,
 		strings.TrimSpace(req.stageRoot),
-		req.suppressPVEChecks,
 	)
 	defer func() { done(err) }()
 
@@ -66,7 +64,6 @@ func applyNetworkWithRollbackWithUI(ctx context.Context, ui RestoreWorkflowUI, l
 		archivePath:         req.archivePath,
 		timeout:             req.timeout,
 		systemType:          req.systemType,
-		suppressPVEChecks:   req.suppressPVEChecks,
 	}
 	return flow.run()
 }
@@ -122,6 +119,7 @@ func (f *networkRollbackUIApplyFlow) captureBeforeDiagnostics() {
 	if snap, err := writeNetworkSnapshot(f.ctx, f.logger, f.diagnosticsDir, "before", 3*time.Second); err != nil {
 		f.debug("Network snapshot before apply failed: %v", err)
 	} else {
+		f.beforeSnapshot = snap
 		f.debug("Network snapshot (before): %s", snap)
 	}
 
@@ -279,7 +277,7 @@ func (f *networkRollbackUIApplyFlow) preflightFailureMessage(preflight networkPr
 
 func (f *networkRollbackUIApplyFlow) rollbackStagedPreflightFailure(preflight networkPreflightResult) error {
 	logging.DebugStep(f.logger, "network safe apply (ui)", "Preflight failed in staged mode: rolling back network files automatically")
-	rollbackLog, rbErr := rollbackNetworkFilesNow(f.ctx, f.logger, f.networkRollbackPath, f.diagnosticsDir)
+	rollbackLog, rbErr := rollbackNetworkFilesNow(f.ctx, f.logger, f.networkRollbackPath, "")
 	if strings.TrimSpace(rollbackLog) != "" {
 		f.info("Network rollback log: %s", rollbackLog)
 	}
@@ -288,6 +286,15 @@ func (f *networkRollbackUIApplyFlow) rollbackStagedPreflightFailure(preflight ne
 		return fmt.Errorf("network preflight validation failed; rollback attempt failed: %w", rbErr)
 	}
 	f.captureAfterRollbackDiagnostics()
+	if err := f.ctx.Err(); err != nil {
+		f.debug("Network preflight interrupted: %v (%s, error: %v)", err, preflight.Summary(), preflight.ExitError)
+		f.warning(
+			"Network apply interrupted before validation finished (%s). Rolled back the managed network configuration (/etc/network, /etc/netplan, /etc/systemd/network, /etc/NetworkManager/system-connections, /etc/hosts, /etc/hostname, /etc/resolv.conf) to the pre-restore state (rollback=%s).",
+			preflight.CommandLine(),
+			strings.TrimSpace(f.networkRollbackPath),
+		)
+		return fmt.Errorf("network apply interrupted; network files rolled back: %w", err)
+	}
 	f.warning(
 		"Network apply aborted: preflight validation failed (%s). Rolled back the managed network configuration (/etc/network, /etc/netplan, /etc/systemd/network, /etc/NetworkManager/system-connections, /etc/hosts, /etc/hostname, /etc/resolv.conf) to the pre-restore state (rollback=%s).",
 		preflight.CommandLine(),
@@ -312,7 +319,7 @@ func (f *networkRollbackUIApplyFlow) rollbackStagedApplyFailure(applyErr error) 
 		return applyErr
 	}
 	logging.DebugStep(f.logger, "network safe apply (ui)", "Staged apply failed: rolling back network files automatically")
-	rollbackLog, rbErr := rollbackNetworkFilesNow(f.ctx, f.logger, f.networkRollbackPath, f.diagnosticsDir)
+	rollbackLog, rbErr := rollbackNetworkFilesNow(f.ctx, f.logger, f.networkRollbackPath, "")
 	if strings.TrimSpace(rollbackLog) != "" {
 		f.info("Network rollback log: %s", rollbackLog)
 	}
@@ -361,7 +368,7 @@ func (f *networkRollbackUIApplyFlow) confirmPreflightRollback(message string) er
 
 func (f *networkRollbackUIApplyFlow) rollbackPreflightFailureNow() error {
 	logging.DebugStep(f.logger, "network safe apply (ui)", "Rollback network files now (backup=%s)", strings.TrimSpace(f.networkRollbackPath))
-	rollbackLog, rbErr := rollbackNetworkFilesNow(f.ctx, f.logger, f.networkRollbackPath, f.diagnosticsDir)
+	rollbackLog, rbErr := rollbackNetworkFilesNow(f.ctx, f.logger, f.networkRollbackPath, "")
 	if strings.TrimSpace(rollbackLog) != "" {
 		f.info("Network rollback log: %s", rollbackLog)
 	}
@@ -375,10 +382,14 @@ func (f *networkRollbackUIApplyFlow) rollbackPreflightFailureNow() error {
 
 func (f *networkRollbackUIApplyFlow) armRollbackAndApply() error {
 	logging.DebugStep(f.logger, "network safe apply (ui)", "Arm rollback timer BEFORE applying changes")
-	handle, err := armNetworkRollback(f.ctx, f.logger, f.rollbackBackupPath, f.timeout, f.diagnosticsDir)
+	// Work dir "" (/tmp/proxsave), not the diagnostics dir: marker and script only
+	// matter inside the rollback window, and the diagnostics dir lives in the
+	// restore's own directory, which is kept. The rollback log goes there anyway.
+	handle, err := armNetworkRollback(f.ctx, f.logger, f.rollbackBackupPath, f.timeout, "")
 	if err != nil {
 		return err
 	}
+	handle.beforeSnapshot = f.beforeSnapshot
 	f.handle = handle
 
 	logging.DebugStep(f.logger, "network safe apply (ui)", "Apply network configuration now")
@@ -417,14 +428,7 @@ func (f *networkRollbackUIApplyFlow) runPostApplyHealthChecks() {
 		EnableDNSResolve:   true,
 		LocalPortChecks:    defaultNetworkPortChecks(f.systemType),
 	}
-	if f.suppressPVEChecks {
-		healthOptions.SystemType = SystemTypeUnknown
-		healthOptions.LocalPortChecks = nil
-	}
 	f.health = runNetworkHealthChecks(f.ctx, healthOptions)
-	if f.suppressPVEChecks {
-		f.health.add("PVE service checks", networkHealthOK, "skipped (cluster database restore in progress; services will be restarted after restore completes)")
-	}
 	logNetworkHealthReport(f.logger, f.health)
 	if f.diagnosticsDir == "" {
 		return
@@ -549,25 +553,25 @@ func reconnectHostFromOriginalIP(original string) string {
 	return strings.TrimSpace(reconnectHost)
 }
 
-func (f *networkRollbackUIApplyFlow) debug(format string, args ...interface{}) {
+func (f *networkRollbackUIApplyFlow) debug(format string, args ...any) {
 	if f.logger != nil {
 		f.logger.Debug(format, args...)
 	}
 }
 
-func (f *networkRollbackUIApplyFlow) info(format string, args ...interface{}) {
+func (f *networkRollbackUIApplyFlow) info(format string, args ...any) {
 	if f.logger != nil {
 		f.logger.Info(format, args...)
 	}
 }
 
-func (f *networkRollbackUIApplyFlow) warning(format string, args ...interface{}) {
+func (f *networkRollbackUIApplyFlow) warning(format string, args ...any) {
 	if f.logger != nil {
 		f.logger.Warning(format, args...)
 	}
 }
 
-func (f *networkRollbackUIApplyFlow) logError(format string, args ...interface{}) {
+func (f *networkRollbackUIApplyFlow) logError(format string, args ...any) {
 	if f.logger != nil {
 		f.logger.Error(format, args...)
 	}

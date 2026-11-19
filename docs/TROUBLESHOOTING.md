@@ -4,6 +4,8 @@ Complete troubleshooting guide for Proxsave with common issues, solutions, and d
 
 ## Table of Contents
 
+- [Diagnose backup and restore failures](#diagnose-backup-and-restore-failures)
+- [Prepare a support request](#prepare-a-support-request)
 - [Overview](#overview)
 - [Common Issues](#common-issues)
   - [Build Failures](#1-build-failures)
@@ -21,14 +23,101 @@ Complete troubleshooting guide for Proxsave with common issues, solutions, and d
 
 ---
 
+
+
+<!-- site-region: diagnose-failures:start -->
+
+## Diagnose backup and restore failures
+
+Begin with the first failed stage and preserve its log before retrying. A restore retry, support session or debug backup can change the host or write to configured destinations. Determine what completed and what was skipped, especially after a partial restore, rather than treating the final summary as a transaction result.
+
+### Use the dashboard checks
+
+Run `proxsave` without arguments on a real terminal. Use **Daemon > Status** for scheduler/service state, **Diagnostic Checks > Healthchecks** for monitoring, **Diagnostic Checks > Telegram** for relay pairing, and **Maintenance > Upgrade > Check upgrade** for the installed/released version. **Maintenance > Upgrade > Check config** checks the configuration merge before you apply it; **Maintenance > Install > Edit install** is the configuration setup route. A custom configuration file path requires the [CLI reference](CLI_REFERENCE.md#all-flags) direct-entry options, because any argument bypasses the dashboard.
+
+Choose the diagnostic check that matches the failure. A clean backup with exit 1 may have warnings rather than a failed archive. The [exit-code reference](#exit-codes) distinguishes errors, warnings, benign skipped backups, cancelled runs and pending guard cleanup. Read the logged cause before deleting a lock, reinstalling or changing cluster settings.
+
+### Capture useful debug evidence
+
+`--log-level debug` is the principal diagnostic flag. This invocation bypasses the dashboard and enters the normal backup path with debug logging, subject to configuration and runtime checks:
+
+```bash
+proxsave --log-level debug
+```
+
+It can create archives, copy to destinations, apply retention and send notifications. It does not open a dashboard in debug mode. If you want preparation diagnostics first, use:
+
+```bash
+proxsave --dry-run --log-level debug
+```
+
+Dry-run skips storage, retention and notification delivery and does not create a complete backup. It cannot confirm that those stages work. For a restore-specific failure, the explicit diagnostic entry is:
+
+```bash
+proxsave --restore --log-level debug
+```
+
+This opens the interactive restore workflow with debug logging. Plan review and confirmations still apply; accepting them can change the host. Keep console/IPMI access and follow [Restore a host](RESTORE_GUIDE.md#restore-a-host). Cancel before overwrite when you only need selection/scan evidence.
+
+Find the newest relevant log in configured `LOG_PATH`, normally `/opt/proxsave/log`, or the restore log path printed at startup. Check your configuration for changed log paths rather than guessing a hostname-specific filename. Session logs, detailed extraction logs and stage warnings have different purposes. Record the first error, adjacent lines, version, invocation, time, destination/backend and which phase failed. Review secrets before sharing any output; registered-secret redaction does not guarantee arbitrary command output contains no sensitive information.
+
+### Triage by stage
+
+| Failed stage | What to establish | Detailed reference |
+| --- | --- | --- |
+| Build or launch | Repository/module location, binary availability and platform prerequisites. These are external build/install tasks. | [Build Failures](#1-build-failures) |
+| Configuration or permissions | Actual config path, parsed values, directory access and container privilege limits. Use Edit install for setup; do not assume a dashboard custom-path action exists. | [Configuration Issues](#2-configuration-issues) |
+| Archive, encryption or space | Complete archive and sidecars, correct recipient/key, source and destination capacity. A new key cannot decrypt an old archive. | [Encryption Issues](#4-encryption-issues), [Disk Space Issues](#5-disk-space-issues) |
+| Cloud discovery or transfer | Correct rclone remote/config, accessible directory, network/authentication and provider limits. Discovery is non-recursive. A single-file `copyto` does not gain file concurrency from `RCLONE_TRANSFERS`. | [Cloud Storage Issues](#3-cloud-storage-issues) |
+| Retention | Host attribution, identity and complete manifests before renaming or deleting anything. Different-host archives can be intentionally left untouched. | [Disk Space Issues](#5-disk-space-issues) |
+| Notification delivery | Backend selected, channel configuration and provider/API error, separately from successful archive creation. | [Email Notification Issues](#6-email-notification-issues) |
+| Restore preparation or apply | Integrity, decryption, compatibility, selected scope, quorum guard and exact successful/failed category operations. | [Restore Issues](#7-restore-issues), [Restore a host](RESTORE_GUIDE.md#restore-a-host) |
+| Scheduler or monitoring | Daemon alignment, configured checks, provisioning/connectivity and whether the warning preceded notification delivery. | [Backup Monitoring Issues](#8-backup-monitoring-issues) |
+
+### Handle restore warnings conservatively
+
+An incomplete sensitive stage is discarded and its consumers are skipped, but normal extraction, fstab changes or SAFE operations may already have changed the host. Skipping live network reload may still leave validated network files installed for the next restart. Inspect the actual paths and apply log before assuming the original configuration remains intact.
+
+For read-only storage after a restore, confirm the real mount or pool is online first. **Recovery > Cleanup guards** starts with a read-only check and offers Apply when guards exist. A real mount shadows a guard instead of removing it; legacy immutable flags may remain pending while masked. A failed bind guard is warning-only and leaves the target unguarded. Do not create empty datastore content on the root disk to mask a missing backing filesystem.
+
+For cluster problems, use the matching [cluster recovery scenario](CLUSTER_RECOVERY.md#recover-a-proxmox-cluster). Do not bypass a quorum refusal, kill HA LRM, rename a live node or blindly restore a safety archive. The [manual rollback prerequisites](RESTORE_GUIDE.md#manual-rollback-prerequisites) establish the conditions and scope for rollback.
+
+If a clean backup warns about unseen release notes after an upgrade, reopen bare `proxsave` on a real terminal and acknowledge the release-notes screen shown before the menu. There is no separate What's new dashboard action.
+
+### Verify the correction or request help
+
+After a configuration/preparation fix, rerun the relevant read-only check or dry-run first. Then exercise the affected real stage only when its writes and external effects are intended, and verify its resulting archive, transfer, notification or service state. Preserve the original and follow-up log excerpts so a successful retry can be compared with the failure.
+
+If the cause is still unclear, prepare a [support request](#prepare-a-support-request) with the reviewed evidence. **Recovery > Support** runs a debug backup and sends its full log after explicit initial consent; choose a normal debug run instead if you want to inspect the log before sending. Detailed log-reading and external component probes remain in [Debug Procedures](#debug-procedures).
+
+<!-- site-region: diagnose-failures:end -->
+
 ## Overview
 
 This guide covers the most common issues encountered when using Proxsave, along with step-by-step solutions and debugging procedures.
 
+**Start at the dashboard**. Running `proxsave` with no arguments on a terminal opens it, and the
+checks that answer most questions are already there. All of them except `Post-install` run the moment
+you open them, so they tell you the current state before you change anything; `Post-install` waits for
+you to press `Check`, because it has to run a full dry-run first:
+
+| Dashboard entry | What it answers |
+|-----------------|-----------------|
+| `Daemon` > `Status` | is the scheduler installed, running, beating, and on the binary now on disk |
+| `Diagnostic Checks` > `Healthchecks` | is backup monitoring provisioned, and is the daemon really transmitting |
+| `Maintenance` > `Upgrade` > `Check upgrade` / `Check config` | is this the latest release, and is `backup.env` missing variables the template added |
+| `Diagnostic Checks` > `Post-install` | which collectors are enabled here but have nothing to collect, so they warn on every run |
+
+`Recovery` > `Support` runs a debug backup and mails the log to the maintainer, and
+`Recovery` > `Cleanup guards` clears leftover restore mount guards. The dashboard opens only when
+`proxsave` is invoked with no flags at all on a real terminal; see [DASHBOARD.md](DASHBOARD.md).
+
+CLI equivalents and automation options are in [CLI reference](CLI_REFERENCE.md). External tools below investigate the host or provider directly; debug commands are explicit diagnostic exceptions.
+
 **Before troubleshooting**:
-1. Check you're running the latest version: `proxsave --version`
+1. Check you're running the latest version: the dashboard's `Maintenance` > `Upgrade` > `Check upgrade`
 2. Try dry-run mode first: `proxsave --dry-run --log-level debug`
-3. Review the newest log in `LOG_PATH` (default `/opt/proxsave/log`; use your own directory if `LOG_PATH` or `LOCAL_LOG_PATH` is set in `configs/backup.env`). The filename carries the FQDN, so glob the directory rather than guessing: `ls -t /opt/proxsave/log/backup-*.log | head -1`
+3. Review the newest log in `LOG_PATH` (default `/opt/proxsave/log`; use your own directory if `LOG_PATH` is set in `configs/backup.env`). The filename carries the FQDN, so glob the directory rather than guessing: `ls -t /opt/proxsave/log/backup-*.log | head -1`. The daemon's own logs are in `DAEMON_LOG_PATH` (default `/opt/proxsave/log/daemon`): `ls -t /opt/proxsave/log/daemon/daemon-*.log | head -1`
 
 ---
 
@@ -98,23 +187,14 @@ make build
 
 **Cause**: Configuration file doesn't exist or is in wrong location.
 
-**Solution**:
-```bash
-# Run installer to create config
-proxsave --install
-# For a clean reinstall (keeps build/, env/, and identity/), run:
-# proxsave --new-install
+**Solution**: open the dashboard and pick `Install` > `Edit install`. It re-runs the interactive
+installer against the current configuration and writes the file. `Wipe install` is the same
+installer after resetting the install directory (`build/`, `daemon_state/`, `env/`, `guards/`, `identity/` and `restore/` are preserved);
+it asks you to confirm the wipe first.
 
-# Or copy template manually
-cp internal/config/templates/backup.env configs/backup.env
-nano configs/backup.env
-```
+For the existing installation, choose **Maintenance > Install > Edit install**. CLI alternatives are in [CLI reference](CLI_REFERENCE.md#installation-wizard). Wipe install requires explicit confirmation and resets the installation while retaining the documented recovery/state directories; use it only for that intended task.
 
-**Using custom path**:
-```bash
-# Specify custom config location
-proxsave --config /etc/pbs/prod.env
-```
+**Using a custom path**: the dashboard does not select an arbitrary configuration file. A non-default configuration path needs the direct-entry options in [CLI reference](CLI_REFERENCE.md#all-flags), which bypass the dashboard.
 
 ---
 
@@ -205,6 +285,96 @@ cat /proc/self/gid_map
 
 ---
 
+#### A personal pre/post script seems not to run, and nothing is logged
+
+**Symptoms**:
+- `PERSONAL_SCRIPT_PRE_RUN` or `PERSONAL_SCRIPT_POST_RUN` is set, but the script's effect never
+  happens, and no log line, warning, notification or ping mentions it.
+
+**Cause**:
+- Silence is by design for what the script DOES: ProxSave discards its output, its exit code and
+  a timeout kill, so a script that ran and did nothing looks like one that ran and worked. The
+  usual reasons it never starts are a missing shebang, a value that is a command line rather
+  than a bare path (no shell is used, so arguments, pipes and redirections are not interpreted),
+  a path edited in `backup.env` without restarting the daemon, or a run that was not the
+  daemon's (a manual **Backup** in the dashboard and a cron-mode run start neither script).
+- **A script ProxSave refused to start is not silent.** Before every invocation the daemon
+  re-opens the configured file and re-checks the opened inode. If that gate refuses, the daemon
+  log carries one line per refusal:
+
+  ```text
+  WARNING  PERSONAL_SCRIPT_PRE_RUN was not started for this run: /home/me/scripts/pre.sh could not be opened
+  ```
+
+  The reason is specific: the file is gone, it lost its execute bit, it became group- or
+  other-writable, its owner changed, or the open did not return within five seconds (a path on a
+  dead NFS or CIFS mount). Look for it with
+  `journalctl -u proxsave-daemon.service | grep PERSONAL_SCRIPT`, not in the backup's own log:
+  the line belongs to the daemon.
+- The trusted-path gate is the one cause that DOES log. A symlinked path, a target that is not
+  executable or is not owned by root/the daemon UID, a target writable by group or others, or
+  a loosely writable non-sticky parent is `REFUSED` and disabled for that daemon. A
+  non-loosely-writable parent owned by another UID, including a mode-0700 user home, is
+  `READY WITH WARNING`: the configured path remains enabled because root selected it
+  explicitly, but that parent owner can replace descendants later executed with daemon
+  privileges. Each advisory or refusal produces one startup `WARNING` naming the setting and
+  reason.
+- **The value may never have reached the loader at all.** A variable assigned more than once in
+  `backup.env` is resolved last-wins, so a line you added above the template's own empty line is
+  discarded and the setting reads as empty. `--daemon-status` names this explicitly and so does
+  the integrity block on every run; see
+  [CONFIGURATION.md](CONFIGURATION.md#configuration-integrity-check).
+
+**Resolution**:
+```bash
+proxsave --daemon-status --log-level debug      # running/current state, sync, UID and path evidence
+journalctl -u proxsave-daemon.service | grep PERSONAL_SCRIPT   # startup advisory/refusal and reason
+namei -l /path/to/my-pre-run.sh         # inspect ownership and mode of every path component
+ls -l /path/to/my-pre-run.sh            # target owned by root/daemon UID, executable, not loosely writable
+head -1 /path/to/my-pre-run.sh          # a shebang, e.g. #!/bin/sh
+/path/to/my-pre-run.sh; echo $?         # runs by hand, as root
+grep PERSONAL_SCRIPT /opt/proxsave/configs/backup.env
+systemctl restart proxsave-daemon.service   # the paths are read at daemon start
+```
+- The status command is read-only: it does not execute either script, start a backup, acquire the
+  daemon lock, or send a healthcheck ping. Its four path states are `NOT CONFIGURED`, `READY`,
+  `READY WITH WARNING`, and `REFUSED`. Debug output lists the UID and owner/mode evidence. A script
+  refusal does not change the command's daemon-health exit code.
+- **Daemon now** is the state captured and applied at daemon startup. **Configuration** is what a
+  restart would load and how that path looks now.
+- On the `Configuration` line, `NOT CONFIGURED` says why, which is what tells a variable missing
+  from the file apart from one assigned an empty value and from one whose value a later line
+  overwrites:
+
+  ```text
+    Configuration: NOT CONFIGURED (PERSONAL_SCRIPT_PRE_RUN is not in the file)
+    Configuration: NOT CONFIGURED (PERSONAL_SCRIPT_PRE_RUN is on line 456 & is empty)
+    Configuration: NOT CONFIGURED (PERSONAL_SCRIPT_PRE_RUN is on lines 120 and 456 & line 456 wins and is empty)
+  ```
+
+  The `Daemon now` line never carries it: that daemon read its own copy of the file when it
+  started.
+- `OUT OF SYNC` means the personal-script path or config source changed; restart
+  `proxsave-daemon.service`.
+- `PATH STATE CHANGED SINCE STARTUP` means ownership, mode, or verdict differs from the startup
+  snapshot.
+- `RUNNING DAEMON STATE UNAVAILABLE` indicates an old/not-restarted daemon or a
+  runtime-publication failure. It does not mean the script is unconfigured; current configuration
+  remains a prospective verdict and synchronization is unknown.
+- Do not change a user's home directory to `root:root`. A mode-0700 home can remain owned by its
+  user; review the `READY WITH WARNING` trust decision, ensure the script target itself satisfies
+  the stricter ownership/mode rule, and restart the daemon after configuration changes. To clear
+  the advisory instead of living with it, see **Clearing a `READY WITH WARNING`** in
+  [DAEMON.md](DAEMON.md): moving the script, or hard-linking it into a root-owned directory,
+  removes its cause; a bind mount hides the cause without removing it. There is no setting that
+  suppresses the line.
+- Have the script write its own log if you want a record: ProxSave will not write one for you.
+- A script still running after 10 minutes is killed, silently, and the daemon carries on. The
+  one exception is the abandoned-child unwind, where the post script is started and left to
+  systemd's cgroup teardown (see [DAEMON.md](DAEMON.md)).
+
+---
+
 ### 3. Cloud Storage Issues
 
 #### Error: `rclone not found in PATH`
@@ -252,7 +422,7 @@ rclone lsf gdrive:
 **Verify remote in config**:
 ```bash
 # Check rclone config
-rclone config show gdrive
+rclone config redacted gdrive
 
 # Verify backup.env points to correct remote
 grep CLOUD_REMOTE configs/backup.env
@@ -329,7 +499,7 @@ RCLONE_TIMEOUT_CONNECTION=120
 proxsave --restore --log-level debug
 
 # Or use support mode to capture full diagnostics
-proxsave --restore --support
+# Dashboard action: Tools > Restore
 ```
 
 If it still fails, run the equivalent manual checks:
@@ -362,7 +532,7 @@ BACKUP_CLUSTER_CONFIG=false
 BACKUP_ROOT_HOME=false
 ```
 
-> Note: `BACKUP_CLUSTER_CONFIG=false` also skips cluster runtime collection (`pvecm status`, `pvecm nodes`, HA status), which helps avoid non-critical cluster warnings on standalone nodes.
+> Note: `BACKUP_CLUSTER_CONFIG=false` skips Corosync configuration and cluster-specific data/runtime collection (`pvecm status`, `pvecm nodes`, HA status). The pmxcfs database `config.db` is collected independently, including on standalone hosts. Missing Corosync files do not warn on a confirmed standalone host. To exclude the database and its sidecars explicitly, add `config.db*` to `BACKUP_EXCLUDE_PATTERNS`; this removes the database recovery artifact.
 
 ---
 
@@ -372,25 +542,25 @@ BACKUP_ROOT_HOME=false
 
 **Solution**:
 ```bash
-# Reduce parallel transfers
-nano configs/backup.env
-RCLONE_TRANSFERS=2
+# Edit configs/backup.env: reduce ProxSave workers for raw-file uploads
+CLOUD_UPLOAD_MODE=sequential
+CLOUD_PARALLEL_MAX_JOBS=1
 CLOUD_BATCH_SIZE=10
 CLOUD_BATCH_PAUSE=3  # Wait 3 seconds between batches
 ```
 
-**Provider-specific tuning**:
+**Provider-specific starting settings** (batch settings affect retention deletions, not upload chunks):
 
 **Google Drive**:
 ```bash
-RCLONE_TRANSFERS=2
+CLOUD_PARALLEL_MAX_JOBS=1
 CLOUD_BATCH_SIZE=10
 CLOUD_BATCH_PAUSE=2
 ```
 
 **Backblaze B2**:
 ```bash
-RCLONE_TRANSFERS=2
+CLOUD_PARALLEL_MAX_JOBS=1
 CLOUD_BATCH_SIZE=20
 CLOUD_BATCH_PAUSE=2
 ```
@@ -433,13 +603,7 @@ rm /tmp/test.txt
 **Cause**: Trying to run encryption wizard in non-interactive environment (cron, systemd).
 
 **Solution 1: Pre-generate keys**:
-```bash
-# Run key generation interactively first
-proxsave --newkey
-
-# Then run backup (uses existing keys)
-proxsave
-```
+Choose **Maintenance > New key** in the dashboard, then **Backup > Backup** once recipients are configured.
 
 **Solution 2: Set recipient directly**:
 ```bash
@@ -475,7 +639,7 @@ age --decrypt -i configs/age-keys.txt backup.tar.xz.age > test.tar.xz
 > **Passphrase-based backups**: the archive is encrypted to an X25519 recipient
 > *derived* from your passphrase, not with age's native passphrase (scrypt) mode,
 > so `age --decrypt` will not prompt for a passphrase and cannot decrypt it on its
-> own. Use `proxsave --decrypt` and enter the passphrase when prompted: proxsave
+> own. Use **Tools > Decrypt** in the dashboard and enter the passphrase when prompted: proxsave
 > re-derives the matching identity using the per-installation salt recorded in the
 > backup manifest (`passphrase_salt`).
 
@@ -551,11 +715,111 @@ COMPRESSION_LEVEL=3
 
 ---
 
+#### Warning: `Warning: Backups deleted: <K>, <N> named <name> not rotated`
+
+**Symptoms**: under `Applying retention policy...` the run prints `  Named <name>, not rotated: <N> backups`, then the warning above. The location can keep growing past `MAX_LOCAL_BACKUPS` / `MAX_SECONDARY_BACKUPS` / `MAX_CLOUD_BACKUPS`.
+
+**Cause**: retention deletes only this host's archives. An archive is this host's when its name (the `hostname` in its manifest, or the host token of its filename, `<host>-backup-<timestamp>`, when no manifest can be read) is a name this host answers to (`hostname`, and the name it stamps into what it writes, usually `hostname -f`), or when it records this host's **server identity**, whatever name it carries. The archives in this warning carry this host's short name under another spelling and do not record its server identity, so retention leaves them alone. Two reasons:
+
+1. **They belong to a second machine** with the same short name, writing to the same location. Nothing needs doing.
+2. **They are this machine's own work**, written before archives recorded the server identity, under a name this host no longer resolves.
+
+Related lines, no action needed:
+
+- `  Adopted: <N> backups named <name>, same server identity`: archives named for another host that record this host's server identity. They rotate with the others. A clone of this machine that kept its server identity and writes to the same location has its archives rotated here too. While that clone is still writing, the run also warns `Warning: Server identity shared with <name>` (next section).
+- `  Other server identity: <N> backups owned by name, still rotated`: archives with this host's name and a different server identity (reinstalling ProxSave or restoring `BASE_DIR` from elsewhere mints a new one). They rotate as before.
+- Archives of other hosts, and pre-Go archives that name no host, are not reported and are never deleted. A run with `--log-level debug` lists them on `retention out of scope` lines.
+
+**Tell the two apart**:
+```bash
+# What this host calls itself, both ways
+hostname
+hostname -f
+
+# What the archives are named (adjust the path to the location that warned)
+ls -1 /opt/proxsave/backup/*-backup-*.tar* | sed 's#.*/##'
+
+# What the newest run decided
+grep -E "not rotated|Adopted:|Backups: [0-9]+, limit" \
+  "$(ls -t /opt/proxsave/log/backup-*.log | head -1)"
+```
+If the names before `-backup-` are spellings of THIS host, you are in case 2.
+
+**Solution 1 (case 2, preferred): make the host resolve its own name again**:
+```bash
+# hostname -f reads /etc/hosts and then DNS. The usual regression is a rewritten
+# hosts line with the short name first, which makes hostname -f print the short name.
+grep -n "$(hostname)" /etc/hosts
+
+# Wrong: the short name comes first, so hostname -f returns "pve"
+# 192.168.1.10 pve pve.home.arpa
+# Right: the FQDN comes first
+# 192.168.1.10 pve.home.arpa pve
+
+# It must now print the spelling the archives carry, so compare it with the
+# prefix the filenames above carry. A dry run cannot confirm this: it stops
+# before storage dispatch, so retention never executes.
+hostname -f
+```
+The next real run recognises the stranded archives and brings the location down to its configured limit in a single pass, deleting nothing that belongs to another host.
+
+**Solution 2 (case 2, when the old name is gone for good): remove the stranded archives by hand**:
+```bash
+# List first, and read the list
+ls -1 /opt/proxsave/backup/pve.home.arpa-backup-*.tar*
+
+# Then delete the ones you chose, by name, with a trailing glob so the .sha256,
+# .metadata and .manifest.json sidecars go with the archive
+rm -f /opt/proxsave/backup/pve.home.arpa-backup-20260101-000000.tar.xz*
+```
+Never pipe the listing straight into `rm`: the same directory may hold another machine's archives.
+
+> **Renaming the archives does not get them rotating again**, whichever way it is done. Rename the archive alone and its `.sha256` is left behind, so the run stops treating the archive as complete and reports it as `  Skipped, no manifest: <file>`. Rename the sidecars with it and the `.metadata` travels too, and the `hostname` recorded inside it is what attribution reads, so the archive is still attributed to the old spelling. A `.bundle.tar` carries that manifest inside the archive, where a rename cannot reach it at all. Restore the name resolution, or delete the archives.
+
+**Case 1: give every host its own location**. Point each host at its own directory (`BACKUP_PATH`, `SECONDARY_PATH`) or its own `CLOUD_REMOTE_PATH` prefix. See the "Give every host its own prefix" note in [CLOUD_STORAGE.md](CLOUD_STORAGE.md) for the cloud side.
+
+**Pre-Go archives that name no host: remove them when you no longer need them**. Nothing will ever rotate them, so the only way the location comes back down is by hand.
+```bash
+# Name the files the run left alone. The per-file lines are DEBUG, so they are only
+# in the log of a run made at that level: set LOG_LEVEL=debug in backup.env, or run
+# one backup with --log-level debug, then read the newest log.
+grep "retention out of scope" "$(ls -t /opt/proxsave/log/backup-*.log | head -1)"
+
+# Check first whether the sidecar names a host. If it prints a name, that archive
+# still rotates on THAT machine and you should leave it where it is.
+grep -H "^HOSTNAME=" /opt/proxsave/backup/proxmox-backup-*.tar.*.metadata
+
+# List, read the list, then delete the ones you chose by name, with a trailing
+# glob so the .sha256 and .metadata sidecars go with the archive
+ls -1 /opt/proxsave/backup/proxmox-backup-*.tar.*
+rm -f /opt/proxsave/backup/proxmox-backup-20240101-000000.tar.gz*
+```
+Never pipe the listing straight into `rm`: the same directory may hold another machine's archives.
+
+> A host whose kernel hostname is literally `proxmox` writes archives with the same name shape (`proxmox-backup-<timestamp>`), so on that one host these are current backups, not a pre-Go backlog. Check the `HOSTNAME=` line before deleting anything there.
+
+**Verification**:
+```bash
+grep -E "not rotated|Backups: [0-9]+, limit|Backups deleted" \
+  "$(ls -t /opt/proxsave/log/backup-*.log | head -1)"
+```
+No `not rotated` line is left, and the run reports `  Backups: N, limit: M` and `Yes Backups deleted: K` with a `K` that matches what you expect.
+
+---
+
+#### Warning: `Warning: Server identity shared with <name>`
+
+**Symptoms**: under `Applying retention policy...` the run prints `  Adopted: <N> backups named <name>, same server identity` and `  Still writing here: <name>`, then the warning above, right after the backups outcome. The run ends with exit code 1 and the warning is listed in the notifications.
+
+**Cause**: archives named `<name>` record this host's server identity, and at least one of them is newer than this host's previous backup at that location, so a second machine with this host's server identity is still backing up there. This happens with a clone that kept the identity: a copied disk, a restored or templated container, an `/etc/machine-id` carried over. Both machines rotate the same set of archives against their own limit: the location keeps about `MAX_LOCAL_BACKUPS` / `MAX_SECONDARY_BACKUPS` / `MAX_CLOUD_BACKUPS` archives for the two together, and each machine deletes the other's oldest ones.
+
+**What ProxSave does**: rotation is unchanged. A renamed host does not trigger the warning: its archives under the old name are all older than its first archive under the new name. A host renamed back to a name it used before warns once, on its first run under that name, at each location that still keeps backups under that name: the archives it wrote under the other name are newer than its last backup under this one. The next run does not warn.
+
 ### 6. Email Notification Issues
 
 #### Symptom: No email notifications received
 
-First, confirm which delivery method you are using:
+First, confirm which delivery mode you are using:
 
 ```bash
 # configs/backup.env
@@ -591,8 +855,8 @@ This mode uses Proxmox Notifications via `proxmox-mail-forward`. It is the recom
   - Set `EMAIL_RECIPIENT=...`, or
   - Leave it empty and set an email for `root@pam` inside Proxmox (auto-detect).
 - Recipient auto-detection details (when `EMAIL_RECIPIENT` is empty):
-  - **PVE**: `pvesh get /access/users/root@pam` → fallback to `pveum user list` → fallback to `/etc/pve/user.cfg`
-  - **PBS**: `proxmox-backup-manager user list` → fallback to `/etc/proxmox-backup/user.cfg`
+  - **PVE**: `pvesh get /access/users/root@pam` -> fallback to `pveum user list` -> fallback to `/etc/pve/user.cfg`
+  - **PBS**: `proxmox-backup-manager user list` -> fallback to `/etc/proxmox-backup/user.cfg`
   - **Dual**: intentionally reuses the **PVE** path for `root@pam` email discovery
 - Relay blocks `root@...` recipients; use a real non-root mailbox for `EMAIL_RECIPIENT`.
 - If `EMAIL_FALLBACK_SENDMAIL=true`, ProxSave will fall back to local `/usr/sbin/sendmail` when relay delivery fails. If relay cannot start because no recipient is available, sendmail cannot help either; configure `EMAIL_RECIPIENT` or the `root@pam` email in Proxmox.
@@ -632,7 +896,7 @@ grep -n '^user:root@pam:' /etc/pve/user.cfg
 proxmox-backup-manager user list --output-format json
 
 # PBS (config file)
-grep -n '^user:root@pam:' /etc/proxmox-backup/user.cfg
+grep -A5 '^user: root@pam' /etc/proxmox-backup/user.cfg
 ```
 
 ##### If `EMAIL_DELIVERY_METHOD=sendmail`
@@ -651,14 +915,14 @@ This mode uses `/usr/sbin/sendmail`, so your node must have a working local MTA 
 
 ---
 
-#### Warning: `... storage may fail due to insufficient space`
+#### Warning: `Warning: <Destination> disk space: insufficient, copy may fail`
 
-**Cause**: a non-critical destination (secondary or cloud) is below its required free space, so the run warns and carries on. The primary destination is critical instead: if it is short of space the run stops with a disk-space error rather than warning.
+**Cause**: a non-critical destination (secondary or cloud) is below its required free space, so the run warns and carries on. The lines above the warning show `Available:`, `Required:` and, in the check after the collection, the `Rule:` that set the requirement. The primary destination is critical instead: if it is short of space the run stops with a disk-space error rather than warning.
 
 **Solution**:
 ```bash
 # The required space is max(MIN_DISK_SPACE_<TIER>_GB, estimated size x SAFETY_FACTOR),
-# so the MIN_DISK_SPACE_* keys are a FLOOR, not a warning threshold. Raising one makes
+# so the MIN_DISK_SPACE_* variables are a FLOOR, not a warning threshold. Raising one makes
 # the check stricter. The template ships 1 GB for the primary tier.
 nano configs/backup.env
 MIN_DISK_SPACE_SECONDARY_GB=1
@@ -686,11 +950,10 @@ pvesm status
 mount -t nfs <server>:<export> /mnt/pve/<id>   # or: pvesm activate <id>
 
 # 2. Remove the leftover guards (run as root; preview first)
-proxsave --cleanup-guards --dry-run
-proxsave --cleanup-guards
+# Dashboard action: Recovery > Cleanup guards
 ```
-- `--cleanup-guards` unmounts bind-mount guards and clears any **legacy** `chattr +i` flags, but only on mountpoints that are **not currently mounted**; it prints a summary of what was cleared vs left pending. To clear a flag while the storage is mounted: unmount it, run `--cleanup-guards` again (or `chattr -i <mountpoint>`), then remount.
-- If you already deleted `/var/lib/proxsave/guards` by hand and a mountpoint is still read-only, ProxSave has no record left to clear. Check for the immutable flag and remove it manually while the storage is unmounted:
+- `--cleanup-guards` unmounts bind-mount guards and clears any **legacy** `chattr +i` flags, but only on mountpoints that are **not currently mounted**; it prints a summary of what was cleared vs left pending. To clear a flag while the storage is mounted: unmount it, choose **Recovery > Cleanup guards** again (or `chattr -i <mountpoint>`), then remount.
+- If you already deleted the guard directory (`<BASE_DIR>/guards`, or `/var/lib/proxsave/guards` from an older version) by hand and a mountpoint is still read-only, ProxSave has no record left to clear. Check for the immutable flag and remove it manually while the storage is unmounted:
 ```bash
 lsattr -d /mnt/pve/<id>        # an 'i' in the flags means immutable
 chattr -i /mnt/pve/<id>
@@ -728,7 +991,7 @@ chattr -i /mnt/pve/<id>
 - If staged restore (or manual file copy) rewrites these files with the wrong owner/group/mode, the services cannot read them and may refuse to start.
 
 **What to do**:
-1. Ensure you're running the latest ProxSave build and rerun restore for the staged PBS categories you selected (e.g. `pbs_access_control`, `pbs_jobs`, `pbs_remotes`, `pbs_host`, `pbs_notifications`, `datastore_pbs`). ProxSave applies staged files atomically and enforces final permissions/ownership (not left to `umask`).
+1. Ensure you're running the latest ProxSave build and rerun restore for the staged PBS categories you selected (e.g. `pbs_access_control`, `pbs_jobs`, `pbs_remotes`, `pbs_host`, `pbs_notifications`, `datastore_pbs`). ProxSave uses individual file replacement for staged files, not a transaction across categories or API updates, and enforces final permissions/ownership (not left to `umask`).
 2. If PBS is already broken and you need a quick recovery:
    - Identify the blocking path component with `namei -l /etc/proxmox-backup/user.cfg`.
    - Restore package defaults (recommended): reinstall `proxmox-backup-server` and restart services. Example:
@@ -758,7 +1021,97 @@ chattr -i /mnt/pve/<id>
 
 ### 8. Backup Monitoring Issues
 
-The full status vocabulary, both the check-screen keywords and the per-sensor states, is documented in [HEALTHCHECKS.md](HEALTHCHECKS.md#troubleshooting). This section covers the cases that send people looking for a fix.
+Two dashboard screens cover this whole area, and both run when you open them: `Daemon` > `Status`
+says whether the daemon (the only process that ever pings) is alive and on the current binary, and
+`Diagnostic Checks` > `Healthchecks` says whether monitoring is provisioned and transmitting. Read
+those before changing a variable. The full status vocabulary, both the check-screen keywords and
+the per-sensor states, is documented in [HEALTHCHECKS.md](HEALTHCHECKS.md#troubleshooting). This
+section covers the cases that send people looking for a fix.
+
+#### A clean backup exits `1` and the log carries a `Healthchecks:` warning
+
+**Symptoms**:
+- A backup that collected everything and wrote its archive still finishes yellow, "completed with
+  warnings", and returns exit `1`.
+- Early in the run, under the `Initializing notification channels` step, the log carries one
+  warning and then a skip:
+
+  ```text
+  WARNING  Healthchecks: daemon not installed
+  SKIP     Healthchecks: disabled
+  ```
+
+  The reason varies: `no alive check configured` (self mode with neither `HEALTHCHECK_ALIVE_URL`
+  nor `HEALTHCHECK_ALIVE_ID` set), `no SERVER_ID` (centralized mode on a host with no server
+  identity), `daemon not installed`, `daemon not running`, `daemon running, not reporting`,
+  `daemon stale (last beat ...)`, or `status file unreadable`. On a host still scheduled by cron
+  the line names the engine as well: `Healthchecks: daemon not installed (cron mode: only the
+  resident daemon transmits)`.
+
+**Cause**:
+- `HEALTHCHECK_ENABLED=true` states that you want this host monitored. At the start of every run
+  ProxSave checks that the monitoring configuration names a destination it could ping, and that
+  the resident daemon, the only process that ever pings, is alive. If either check fails,
+  monitoring is switched off for that run and the reason is logged as a warning.
+- A warning promotes an otherwise clean run from exit `0` to exit `1`, and the daemon reports that
+  code to the backup check, so the monitor goes down on a backup that was fine. The warning is
+  deliberate: without it the host would report success on every run while transmitting nothing.
+
+**Resolution**: open `Daemon` > `Status` in the dashboard first. It gives the same verdict in
+words (`RUNNING`, `NOT INSTALLED`, `NOT RUNNING`, `RUNNING, NOT REPORTING`, `STALE`,
+`BEHIND - RESTART NEEDED`), which tells you which of the four fixes below applies.
+
+- **The daemon is missing or stopped and you want monitoring.** Install or start it:
+  ```bash
+# Dashboard action: Daemon > Status
+# Dashboard action: Daemon > Install
+  systemctl start proxsave-daemon.service
+  ```
+- **Self mode with nothing to ping** (`no alive check configured`). The service-alive check is the
+  mandatory one: a backup-only self configuration has no liveness signal.
+  ```bash
+  # configs/backup.env
+  HEALTHCHECK_ALIVE_URL=https://hc-ping.com/<uuid>
+  # or, with HEALTHCHECK_PING_ENDPOINT set:
+  HEALTHCHECK_ALIVE_ID=<uuid-or-slug>
+  ```
+- **Centralized mode reporting `no SERVER_ID`.** This host has no server identity. Re-run the
+  installer from the dashboard (`Install` > `Edit install`) to regenerate it.
+- **You do not want monitoring on this host.** Turn it off and the warning goes with it:
+  ```bash
+  # configs/backup.env
+  HEALTHCHECK_ENABLED=false
+  ```
+  **Daemon > Disable** in the dashboard writes that itself when it reverts a host to cron. A host reverted by
+  an older build still carries `HEALTHCHECK_ENABLED=true` and nothing rewrites it for you, which is
+  the usual reason a cron-scheduled host warns on every run.
+
+The `Healthchecks:` line at the END of a run is a different line with the same prefix. It reports
+what the daemon actually transmitted, and it is written after the run's exit code has already been
+decided, so it never changes it.
+
+#### The daemon still runs the old binary after an upgrade
+
+**Symptoms**:
+- `Daemon` > `Status` reads `BEHIND - RESTART NEEDED`, or **Daemon > Status** in the dashboard prints
+  `Binary alignment: BEHIND (restart needed)`.
+- A behaviour the release notes describe does not show up in scheduled runs, only in runs you
+  start by hand.
+
+**Cause**:
+- An in-place upgrade replaces the binary on disk without restarting the service, and systemd keeps
+  the old process alive. ProxSave detects it without hashing anything: Linux will not let a running
+  executable be overwritten, so the upgrade unlinks it and `/proc/<pid>/exe` ends in `" (deleted)"`.
+
+**Resolution**:
+- Dashboard: `Daemon` > `Restart`. It waits for an in-progress daemon-supervised backup to finish
+  before restarting, and reports `DEFERRED - BACKUP RUNNING` rather than killing it; run it again
+  once the backup ends. Success reads `RESTARTED, ALIGNED (v<version>)`.
+- Command line: `systemctl restart proxsave-daemon.service`, then **Daemon > Status** in the dashboard to
+  confirm.
+- **Upgrade** in the dashboard and the dashboard upgrade already do this restart-and-verify for you.
+  **Daemon > Install** in the dashboard does not wait: it restarts immediately and cancels a
+  daemon-supervised backup that is running at that moment. See [DAEMON.md](DAEMON.md).
 
 #### The monitoring check never leaves `PROVISIONING`
 
@@ -768,10 +1121,11 @@ The full status vocabulary, both the check-screen keywords and the per-sensor st
 **Cause**:
 - Centralized monitoring provisions this host's credential automatically on a daemon run. No Telegram pairing and no API key are involved. A state that never advances means the request is not getting through.
 
-**Resolution**:
+**Resolution**: check `Daemon` > `Status` in the dashboard first. Provisioning only happens on a
+daemon run, so a daemon that is not running explains the stall on its own.
 ```bash
 # 1. Is the daemon actually running? It is what provisions.
-proxsave --daemon-status
+# Dashboard action: Daemon > Status
 systemctl status proxsave-daemon.service
 
 # 2. Watch it try
@@ -806,7 +1160,10 @@ journalctl -u proxsave-daemon.service -f
 - It only bites unattended upgrades. `--upgrade` shows the screen for you on an interactive terminal, which clears the flag; an upgrade run from a script or over a pipe skips it.
 
 **Resolution**:
-- Run `proxsave --show-whatsnew` once on the host, or open the dashboard and page through the release-notes screen. Either clears the flag and the next run is green again.
+- Open the dashboard once on the host: the release-notes screen is shown before the menu, and
+  paging through it clears the flag. There is no separate release-notes menu action; direct-entry options are in [CLI reference](CLI_REFERENCE.md).
+- Acknowledgement needs a real terminal. A piped or automated invocation does not clear the flag, so
+  clear it from a session you are actually sitting at.
 
 #### A backup ran but `proxsave-backup` stayed silent
 
@@ -818,6 +1175,8 @@ journalctl -u proxsave-daemon.service -f
 
 **Resolution**:
 - Start the daemon before running standalone backups, or let the daemon run the scheduled backup.
+  `Daemon` > `Status` in the dashboard says whether it is up, and `Daemon` > `Install` puts this
+  host on the daemon scheduler if it is still on cron.
 
 #### Self mode: `UNREACHABLE`
 
@@ -885,7 +1244,7 @@ rclone copy /tmp/test.txt gdrive:pbs-backups/ --verbose
 rclone lsl gdrive:pbs-backups/test.txt
 
 # Test download
-rclone copy gdrive:pbs-backups/test.txt /tmp/test-download.txt
+rclone copyto gdrive:pbs-backups/test.txt /tmp/test-download.txt
 cat /tmp/test-download.txt
 
 # Cleanup
@@ -893,13 +1252,13 @@ rclone deletefile gdrive:pbs-backups/test.txt
 rm /tmp/test*.txt
 ```
 
-**Check rclone configuration**:
+**Check rclone configuration** (rclone 1.64 or newer for `config redacted`; review even redacted output before sharing):
 ```bash
 # List remotes
 rclone listremotes
 
 # Show remote details
-rclone config show gdrive
+rclone config redacted gdrive
 
 # Test connectivity
 rclone about gdrive:
@@ -918,10 +1277,10 @@ proxsave --dry-run --log-level debug
 # Check output for loaded config values
 ```
 
-Dry-run runs the full workflow at the chosen log level but makes no changes (no archive
-written, no upload, no retention delete). With `--log-level debug` the loaded
-configuration and the actions ProxSave *would* take are written to the log, so use it to
-confirm the config parsed as expected before a real run.
+Dry-run previews configuration and collection and still writes a run log. It skips
+archive creation, archive verification, storage dispatch and retention; it does not
+prove that a real upload or restore will succeed. See [Dry Run](CLI_REFERENCE.md)
+for the scope of this mode.
 
 ---
 
@@ -997,138 +1356,13 @@ tar -tzf /tmp/test-backup.tar.gz
 
 ---
 
-## Getting Help
-
-### Check Documentation
-
-Before reporting issues, review:
-
-- **[README](../README.md)** - Project overview
-- **[Configuration Guide](CONFIGURATION.md)** - All config variables
-- **[Cloud Storage Guide](CLOUD_STORAGE.md)** - rclone troubleshooting
-- **[Encryption Guide](ENCRYPTION.md)** - AGE encryption issues
-- **[Restore Guide](RESTORE_GUIDE.md)** - Restore troubleshooting
-
----
-
-### Enable Verbose Logging
-
-```bash
-# Capture full debug output
-proxsave --log-level debug 2>&1 | tee /tmp/pbs-debug.log
-```
-
----
-
-### Report Issues
-
-If problem persists:
-
-**1. Gather information**:
-```bash
-proxsave --version
-rclone version
-go version
-uname -a
-```
-
-**2. Collect logs**:
-```bash
-tar -czf /tmp/pbs-debug.tar.gz \
-    /opt/proxsave/log/backup-*.log \
-    /tmp/pbs-debug.log
-```
-
-**3. Sanitize config** (remove credentials):
-```bash
-cp configs/backup.env /tmp/backup.env.sanitized
-nano /tmp/backup.env.sanitized
-# Remove: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, EMAIL_*, WEBHOOK_*_URL, AGE_RECIPIENT
-```
-
-**4. Create GitHub issue**:
-- **Repository**: https://github.com/tis24dev/proxsave/issues
-- **Include**:
-  - Version information
-  - Sanitized configuration
-  - Relevant log excerpts
-  - Steps to reproduce
-- **Describe**:
-  - Expected behavior
-  - Actual behavior
-  - Environment details
-
-**Issue template**:
-```markdown
-**Version**:
-proxsave --version output here
-
-**Environment**:
-- OS: Proxmox VE 8.x / PBS 3.x / Debian 12
-- Go version:
-- rclone version:
-
-**Configuration** (sanitized):
-```bash
-CLOUD_ENABLED=true
-CLOUD_REMOTE=gdrive
-CLOUD_REMOTE_PATH=/pbs-backups
-COMPRESSION_TYPE=xz
-# ... other relevant settings
-```text
-
-**Issue description**:
-Brief description of the problem...
-
-**Steps to reproduce**:
-1. Configure X
-2. Run Y
-3. Observe error Z
-
-**Expected behavior**:
-What should happen...
-
-**Actual behavior**:
-What actually happens...
-
-**Logs** (relevant excerpts):
-```
-[ERROR] Cloud upload failed: connection timeout
-...
-```text
-
-**Additional context**:
-Any other relevant information...
-```
-
----
-
-### Use Support Mode
-
-For complex issues requiring developer assistance:
-
-```bash
-# Run in support mode (sends debug log to developer)
-proxsave --support
-```
-
-**Support mode workflow**:
-1. Requests GitHub username and issue number
-2. Runs backup with DEBUG logging
-3. Emails the log to the maintainer address baked into the build (injected at build time, not hardcoded; a dev build without it skips the email and logs a warning)
-4. Requires existing GitHub issue for tracking
-
-**Note**: Logs may contain file paths and hostnames. Credentials are never logged.
-
----
-
 ## Exit Codes
 
 `proxsave` returns a specific exit code so scripts and the daemon can react to the
 failure class. Four of them are not failures: `1` is also what a backup that succeeded
 with warnings returns, `16` means no backup was performed for a benign reason, `17`
 means a guard cleanup ran fine but the storage is still locked, and `130` means the run
-was cancelled by hand. Only `2` through `15` are unambiguous failures. A wrapper that
+was cancelled. Only `2` through `15` are unambiguous failures. A wrapper that
 treats "non-zero" as "page someone" raises false alarms on warning-only runs, on
 overlapping runs, on paused hosts, on a datastore that is simply still mounted, and on
 anything you Ctrl+C.
@@ -1153,39 +1387,31 @@ anything you Ctrl+C.
 | `15` | encryption error | Error during encryption setup or processing |
 | `16` | backup skipped | No backup was performed, for a benign reason: another backup already held the lock, or `BACKUP_ENABLED=false`. Not a failure |
 | `17` | guards still in place | `--cleanup-guards` only. The cleanup ran without error but guard mounts or immutable flags are left behind, or the remaining count could not be confirmed. Also returned by `--cleanup-guards --dry-run` when it finds guards. Not a failure: unmount the datastore and retry. A `1` from that mode means the cleanup itself failed |
-| `130` | interrupted | The run was cancelled with Ctrl+C (128 plus SIGINT) |
+| `130` | interrupted | The run was cancelled (Ctrl+C, SIGTERM, or an abort at a restore prompt) |
 
 A backup that finishes with warnings (no errors) is promoted from `0` to exit `1`
 (generic error) before the notification phase; a run that raised errors becomes `4`
 (backup error) when its code is still `0`/`1`, otherwise it keeps its more specific code.
 
----
+The log is read again after notification dispatch. Warnings and `NOTIFY-ERR` messages logged
+while sending can also promote an otherwise clean backup from `0` to `1`, even with
+`METRICS_ENABLED=false`. A notification failure does not invalidate the saved backup or,
+by itself, produce exit `4`.
 
-## Related Documentation
-
-### Configuration & Setup
-- **[Configuration Guide](CONFIGURATION.md)** - Complete variable reference
-- **[CLI Reference](CLI_REFERENCE.md)** - All command-line flags
-
-### Operations
-- **[Cloud Storage Guide](CLOUD_STORAGE.md)** - rclone configuration and troubleshooting
-- **[Encryption Guide](ENCRYPTION.md)** - AGE encryption setup
-- **[Restore Guide](RESTORE_GUIDE.md)** - Restore operations
-- **[Backup Monitoring](HEALTHCHECKS.md)** - Monitored checks, the monitoring portal, and status vocabulary
-- **[Resident Daemon](DAEMON.md)** - Scheduler engines, watchdog, and service management
-
-### Reference
-- **[Examples](EXAMPLES.md)** - Real-world scenarios
-- **[Developer Guide](DEVELOPER_GUIDE.md)** - Contributing and development
-
-### Main Documentation
-- **[README](../README.md)** - Project overview and quick start
+Other warnings that turn an otherwise clean backup into an exit `1` include the monitoring
+init warning (see [A clean backup exits `1` and the log carries a `Healthchecks:` warning](#a-clean-backup-exits-1-and-the-log-carries-a-healthchecks-warning))
+and the unseen release notes after an upgrade (see [Every backup reports warnings and the monitor went red right after an upgrade](#every-backup-reports-warnings-and-the-monitor-went-red-right-after-an-upgrade)).
 
 ---
 
 ## Quick Diagnostic Checklist
 
-Use this checklist for rapid troubleshooting:
+Start with the dashboard: run `proxsave` with no arguments on a terminal and read
+`Daemon` > `Status`, `Diagnostic Checks` > `Healthchecks` and `Maintenance` > `Upgrade` > `Check upgrade`. Those
+three cover the scheduler, the monitoring and the version without touching a file.
+
+Use the checklist below when there is no terminal to run the dashboard on, or when the dashboard
+itself will not start:
 
 ```bash
 # 1. Check binary exists and is executable
@@ -1197,7 +1423,7 @@ ls -lh /opt/proxsave/configs/backup.env
 # Should show: -rw------- ... backup.env
 
 # 3. Test configuration loading
-proxsave --dry-run
+# For read-only preparation diagnostics: proxsave --dry-run --log-level debug
 # Should NOT error on config parsing
 
 # 4. Check disk space
@@ -1234,7 +1460,10 @@ A: No. Cloud uploads are non-critical. Local backup succeeded, which is the prim
 A: Use `--dry-run` mode: `proxsave --dry-run --log-level debug`
 
 **Q: Logs show warnings about deprecated variables?**
-A: Update your configuration: `proxsave --upgrade-config`
+A: Merge the current template into your configuration. In the dashboard that is
+`Maintenance` > `Upgrade` > `Check config`, which lists what it would change before you apply it; CLI equivalents are in [CLI reference](CLI_REFERENCE.md). The
+merge adds the variables the template gained and removes a known set of obsolete or auto-managed
+ones, keeping your values and any custom variables you added.
 
 **Q: Can I run backup while another backup is in progress?**
 A: No. Proxsave uses a lock file (`.backup.lock` under `LOCK_PATH`, default `<BASE_DIR>/lock/.backup.lock`) to prevent concurrent runs. The lock stores `pid/host/time`; on the same host, proxsave checks PID liveness to avoid "stuck" locks after an interrupted run.
@@ -1249,4 +1478,159 @@ A: Delete the incomplete backup file and re-run. The system automatically handle
 A: AGE encryption is streaming and shouldn't significantly impact speed. Check compression settings instead.
 
 **Q: Cloud upload is very slow - how can I speed it up?**
-A: Increase `RCLONE_TRANSFERS`, use `parallel` mode, check network bandwidth, try different compression.
+A: Check bandwidth limits, archive size and provider-specific chunk settings. Each upload is a single-file `copyto`, so increasing `RCLONE_TRANSFERS` does not add file concurrency. ProxSave workers help only with multiple raw artifacts; see [Performance Tuning](CLOUD_STORAGE.md#performance-tuning).
+
+<!-- site-region: request-support:start -->
+
+## Prepare a support request
+
+Use [diagnose backup and restore failures](#diagnose-backup-and-restore-failures) to locate the failure, then prepare reviewed evidence. `--log-level debug` is the principal diagnostic flag: `proxsave --log-level debug` bypasses the dashboard and runs the normal backup path, including configured storage, retention and notifications. For preparation only, use `proxsave --dry-run --log-level debug`; it cannot validate the skipped storage and delivery phases.
+
+## Getting Help
+
+### Check Documentation
+
+Before reporting issues, review:
+
+- **[README](../README.md)** - Project overview
+- **[Configuration Guide](CONFIGURATION.md)** - All config variables
+- **[Cloud Storage Guide](CLOUD_STORAGE.md)** - rclone troubleshooting
+- **[Encryption Guide](ENCRYPTION.md)** - AGE encryption issues
+- **[Restore Guide](RESTORE_GUIDE.md)** - Restore troubleshooting
+
+---
+
+### Enable Verbose Logging
+
+```bash
+# Capture full debug output
+proxsave --log-level debug 2>&1 | tee /tmp/pbs-debug.log
+```
+
+---
+
+### Report Issues
+
+If problem persists:
+
+**1. Gather information**:
+```bash
+# Dashboard action: Maintenance > Upgrade > Check upgrade
+rclone version
+go version
+uname -a
+```
+
+**2. Collect logs**:
+```bash
+tar -czf /tmp/pbs-debug.tar.gz \
+    /opt/proxsave/log/backup-*.log \
+    /tmp/pbs-debug.log
+```
+
+**3. Sanitize config** (remove credentials):
+```bash
+cp configs/backup.env /tmp/backup.env.sanitized
+nano /tmp/backup.env.sanitized
+# Remove: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, EMAIL_*, WEBHOOK_*_URL, AGE_RECIPIENT
+```
+
+**4. Create GitHub issue**:
+- **Repository**: https://github.com/tis24dev/proxsave/issues
+- **Include**:
+  - Version information
+  - Sanitized configuration
+  - Relevant log excerpts
+  - Steps to reproduce
+- **Describe**:
+  - Expected behavior
+  - Actual behavior
+  - Environment details
+
+**Issue template**:
+````markdown
+**Version**:
+proxsave --version output here
+
+**Environment**:
+- OS: Proxmox VE 8.x / PBS 3.x / Debian 12
+- Go version:
+- rclone version:
+
+**Configuration** (sanitized):
+```bash
+CLOUD_ENABLED=true
+CLOUD_REMOTE=gdrive
+CLOUD_REMOTE_PATH=/pbs-backups
+COMPRESSION_TYPE=xz
+# ... other relevant settings
+```
+
+**Issue description**:
+Brief description of the problem...
+
+**Steps to reproduce**:
+1. Configure X
+2. Run Y
+3. Observe error Z
+
+**Expected behavior**:
+What should happen...
+
+**Actual behavior**:
+What actually happens...
+
+**Logs** (relevant excerpts):
+```text
+[ERROR] Cloud upload failed: connection timeout
+...
+```
+
+**Additional context**:
+Any other relevant information...
+````
+
+---
+
+### Use Support Mode
+
+For complex issues requiring developer assistance, open the dashboard and choose
+`Recovery` > `Support`. It shows the consent note, asks for your GitHub nickname and the issue
+number, then requires both consent acknowledgements, each initially No: `I accept and continue` and `Issue already open on GitHub`. Continue is blocked until both are Yes. Cancel returns to the menu. After consent, Support runs a backup with debug logging inside the dashboard frame; it is not a read-only diagnostic collection.
+
+Direct entry and terminal options are in [CLI reference](CLI_REFERENCE.md).
+
+**Support mode workflow**:
+1. Requests GitHub username and issue number
+2. Runs backup with DEBUG logging
+3. Emails the log to the maintainer address baked into the build (injected at build time, not hardcoded; a dev build without it skips the email and logs a warning)
+4. Requires existing GitHub issue for tracking
+
+**Note**: Logs may contain sensitive data. Registered secrets are redacted, but review is still needed before sharing arbitrary diagnostic output. Support mode sends automatically after initial consent; to review first, run with `--log-level debug` without `--support` and share the inspected log manually.
+
+---
+
+<!-- site-region: request-support:end -->
+
+## Related Documentation
+
+### Configuration & Setup
+- **[Dashboard](DASHBOARD.md)** - The interactive menu, its checks, and what each screen reports
+- **[Configuration Guide](CONFIGURATION.md)** - Complete variable reference
+- **[CLI Reference](CLI_REFERENCE.md)** - All command-line flags
+
+### Operations
+- **[Cloud Storage Guide](CLOUD_STORAGE.md)** - rclone configuration and troubleshooting
+- **[Encryption Guide](ENCRYPTION.md)** - AGE encryption setup
+- **[Restore Guide](RESTORE_GUIDE.md)** - Restore operations
+- **[Backup Monitoring](HEALTHCHECKS.md)** - Monitored checks, the monitoring portal, and status vocabulary
+- **[Resident Daemon](DAEMON.md)** - Scheduler engines, watchdog, and service management
+
+### Reference
+- **[Examples](EXAMPLES.md)** - Real-world scenarios
+- **[Developer Guide](DEVELOPER_GUIDE.md)** - Contributing and development
+
+### Main Documentation
+- **[README](../README.md)** - Project overview and quick start
+
+---

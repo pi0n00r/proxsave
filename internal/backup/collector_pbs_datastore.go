@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,7 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +30,6 @@ const (
 
 var (
 	pbsDatastoreNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-	listNamespacesFunc      = pbs.ListNamespaces
 	discoverNamespacesFunc  = pbs.DiscoverNamespacesFromFilesystem
 )
 
@@ -180,9 +180,7 @@ func assignUniquePBSOutputKeys[T any](items []T, identityFn func(T) string, base
 	baseKeys := make([]string, 0, len(items))
 	for idx, item := range items {
 		baseKey := strings.TrimSpace(baseKeyFn(item))
-		if baseKey == "" {
-			baseKey = "entry"
-		}
+		baseKey = cmp.Or(baseKey, "entry")
 
 		identity := strings.TrimSpace(identityFn(item))
 		if identity == "" {
@@ -200,21 +198,19 @@ func assignUniquePBSOutputKeys[T any](items []T, identityFn func(T) string, base
 		})
 	}
 
-	sort.Strings(baseKeys)
+	slices.Sort(baseKeys)
 
 	usedKeys := make(map[string]string, len(items))
 	identityKeys := make(map[string]string, len(items))
 
 	for _, baseKey := range baseKeys {
 		assignments := grouped[baseKey]
-		sort.SliceStable(assignments, func(i, j int) bool {
-			if assignments[i].Priority != assignments[j].Priority {
-				return assignments[i].Priority < assignments[j].Priority
-			}
-			if assignments[i].Identity != assignments[j].Identity {
-				return assignments[i].Identity < assignments[j].Identity
-			}
-			return assignments[i].Index < assignments[j].Index
+		slices.SortStableFunc(assignments, func(a, b pbsOutputKeyAssignment) int {
+			return cmp.Or(
+				cmp.Compare(a.Priority, b.Priority),
+				strings.Compare(a.Identity, b.Identity),
+				cmp.Compare(a.Index, b.Index),
+			)
 		})
 
 		for pos, assignment := range assignments {
@@ -376,13 +372,6 @@ func (c *Collector) collectPBSDatastoreNamespaces(ctx context.Context, state *pb
 	return nil
 }
 
-// collectDatastoreNamespaces collects namespace information for a datastore
-// using CLI first, then filesystem fallback.
-func (c *Collector) collectDatastoreNamespaces(ctx context.Context, ds pbsDatastore, datastoreDir string) error {
-	_, err := c.collectDatastoreNamespacesSnapshot(ctx, ds, datastoreDir)
-	return err
-}
-
 func (c *Collector) collectDatastoreNamespacesSnapshot(ctx context.Context, ds pbsDatastore, datastoreDir string) ([]pbs.Namespace, error) {
 	c.logger.Debug("Collecting namespaces for datastore %s (path: %s)", ds.Name, ds.Path)
 	// Write location is deterministic; if excluded, skip the whole operation.
@@ -397,17 +386,11 @@ func (c *Collector) collectDatastoreNamespacesSnapshot(ctx context.Context, ds p
 		ioTimeout = time.Duration(c.config.FsIoTimeoutSeconds) * time.Second
 	}
 
-	var (
-		namespaces   []pbs.Namespace
-		fromFallback bool
-		err          error
-	)
+	path := ds.Path
 	if ds.isOverride() {
-		namespaces, err = discoverNamespacesFunc(ctx, ds.normalizedPath(), ioTimeout)
-		fromFallback = true
-	} else {
-		namespaces, fromFallback, err = listNamespacesFunc(ctx, ds.cliName(), ds.Path, ioTimeout)
+		path = ds.normalizedPath()
 	}
+	namespaces, err := discoverNamespacesFunc(ctx, path, ioTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -422,11 +405,7 @@ func (c *Collector) collectDatastoreNamespacesSnapshot(ctx context.Context, ds p
 		return nil, fmt.Errorf("failed to write namespaces file: %w", err)
 	}
 
-	if fromFallback {
-		c.logger.Debug("Successfully collected %d namespaces for datastore %s via filesystem fallback", len(namespaces), ds.Name)
-	} else {
-		c.logger.Debug("Successfully collected %d namespaces for datastore %s via CLI", len(namespaces), ds.Name)
-	}
+	c.logger.Debug("Successfully collected %d namespaces for datastore %s from the datastore directory %s", len(namespaces), ds.Name, path)
 	return namespaces, nil
 }
 
@@ -559,10 +538,7 @@ func (c *Collector) runPBSPXARStep(ctx context.Context, state *pbsPxarState, fn 
 	)
 
 	for _, ds := range state.eligible {
-		ds := ds
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
@@ -583,7 +559,7 @@ func (c *Collector) runPBSPXARStep(ctx context.Context, state *pbsPxarState, fn 
 				errs = append(errs, err)
 				errMu.Unlock()
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -796,7 +772,7 @@ func (c *Collector) getDatastoreList(ctx context.Context) ([]pbsDatastore, error
 	} else {
 		// stdout only: warnings printed on stderr would otherwise break the JSON parse
 		// below and silently drop the whole datastore list.
-		output, stderr, err := c.depRunCommandCaptured(ctx, nil, "proxmox-backup-manager", "datastore", "list", "--output-format=json")
+		output, stderr, err := c.depRunCommandCaptured(ctx, "proxmox-backup-manager", "datastore", "list", "--output-format=json")
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr

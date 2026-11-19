@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,6 +16,8 @@ import (
 	"github.com/tis24dev/proxsave/internal/environment"
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/orchestrator"
+	"github.com/tis24dev/proxsave/internal/safefs"
+	"github.com/tis24dev/proxsave/internal/storage"
 	"github.com/tis24dev/proxsave/internal/support"
 	"github.com/tis24dev/proxsave/internal/types"
 )
@@ -29,9 +33,14 @@ type backupModeOptions struct {
 	toolVersion      string
 	dryRun           bool
 	startTime        time.Time
+	cpuProfilePath   string
 	heapProfilePath  string
 	serverIDValue    string
 	serverMACValue   string
+	// hostname is the name this run writes under, resolved once at
+	// initializeRunLogFile (main_runtime.go) so the archives, the session log name
+	// and retention all carry one value instead of resolving it again per consumer.
+	hostname string
 	// support arms support mode for this run: when set, the STREAMED path sends the
 	// maintainer email inside the viewport (see runBackupStreamed) instead of after
 	// the screen closes. supportMeta carries the GitHub nickname + issue the
@@ -86,6 +95,14 @@ func runBackupMode(opts backupModeOptions) backupModeResult {
 }
 
 func runBackupModeSteps(opts backupModeOptions) backupModeResult {
+	// Repaired HERE, before initializeBackupStorage below, because that is the frame
+	// where an empty name does the damage: it hands "" to the three storage
+	// constructors, which lose the alias retention needs and scope this machine's own
+	// archives out (discussion #292). Doing it later, inside runConfiguredBackup,
+	// would only have reported a loss that had already happened. opts is a value, so
+	// the repair reaches every step below it.
+	opts.hostname = runHostnameOrReport(opts.logger, opts.hostname)
+
 	orch, earlyErrorState, exitCode := initializeBackupOrchestrator(opts)
 	if earlyErrorState != nil {
 		return finishBackupMode(orch, earlyErrorState, nil, exitCode)
@@ -156,8 +173,10 @@ func configureBackupOrchestrator(opts backupModeOptions, orch *orchestrator.Orch
 	orch.SetIdentity(opts.serverIDValue, opts.serverMACValue)
 	orch.SetEnvironmentInfo(opts.envInfo)
 	orch.SetStartTime(opts.startTime)
+	orch.SetRunProfilePaths(opts.cpuProfilePath, opts.heapProfilePath)
 	if opts.updateInfo != nil {
 		orch.SetUpdateInfo(opts.updateInfo.NewVersion, opts.updateInfo.Current, opts.updateInfo.Latest)
+		orch.SetUpdateNoticeLogged(opts.updateInfo.NoticeLogged)
 	}
 
 	orch.SetBackupConfig(
@@ -203,7 +222,7 @@ func ensureBackupAgeRecipientsReady(opts backupModeOptions, orch *orchestrator.O
 		return backupAgeRecipientEarlyError(err, types.ExitConfigError), types.ExitConfigError.Int()
 	}
 
-	logging.Error("ERROR: %v", err)
+	logging.Error("%v", err)
 	return backupAgeRecipientEarlyError(err, types.ExitConfigError), types.ExitConfigError.Int()
 }
 
@@ -230,24 +249,111 @@ func buildBackupExcludePatterns(cfg *config.Config) []string {
 
 func verifyBackupDirectories(cfg *config.Config, logger *logging.Logger) {
 	logging.Step("Verifying directory structure")
+	timeout := fsIoTimeoutDuration(cfg)
 	checkDir := func(name, path string) {
-		ensureDirectoryExists(logger, name, path)
+		ensureDirectoryExists(logger, name, path, timeout)
 	}
 
 	checkDir("Backup directory", cfg.BackupPath)
 	checkDir("Log directory", cfg.LogPath)
+	disableSecondarySharingLocalDirectories(cfg, logger)
 	if cfg.SecondaryEnabled {
 		secondaryLogPath := strings.TrimSpace(cfg.SecondaryLogPath)
-		if secondaryLogPath != "" {
+		switch {
+		case secondaryLogPath != "" && cfg.DryRun:
+			// A dry run creates no destination directory: a missing one is reported.
+			reportDirectoryDryRun(logger, "Secondary log directory", secondaryLogPath, timeout)
+		case secondaryLogPath != "":
 			checkDir("Secondary log directory", secondaryLogPath)
-		} else {
+		default:
 			logging.Warning("✗ Secondary log directory not configured (secondary storage enabled)")
 		}
 	}
+	disableCloudSharingLocalDirectories(cfg, logger)
 	if cfg.CloudEnabled {
 		logCloudLogDirectory(cfg)
 	}
 	checkDir("Lock directory", cfg.LockPath)
+}
+
+// disableSecondarySharingLocalDirectories turns the secondary destination off for this
+// run when its backup or log directory IS the local one, by path or as the same folder
+// reached through a link or a mount. A secondary that is the primary copies every file
+// onto itself (the run log ends up empty) and rotates the same archives twice, so it is
+// a configuration error, not a second copy. It is reported and switched off, not failed:
+// the backup itself still runs, and the step [6] and log copy skip the secondary.
+func disableSecondarySharingLocalDirectories(cfg *config.Config, logger *logging.Logger) {
+	if !cfg.SecondaryEnabled {
+		return
+	}
+	timeout := fsIoTimeoutDuration(cfg)
+	sameData := sameDirectory(logger, "secondary directory", cfg.SecondaryPath, cfg.BackupPath, timeout)
+	sameLog := sameDirectory(logger, "secondary log directory", cfg.SecondaryLogPath, cfg.LogPath, timeout)
+	if sameData {
+		logging.Warning("✗ Secondary directory same as Backup directory (secondary storage disabled)")
+	}
+	if sameLog {
+		logging.Warning("✗ Secondary log directory same as Log directory (secondary storage disabled)")
+	}
+	if sameData || sameLog {
+		cfg.SecondaryEnabled = false
+		cfg.SecondaryLogPath = ""
+	}
+}
+
+// disableCloudSharingLocalDirectories is disableSecondarySharingLocalDirectories for a
+// cloud that is a local directory (CLOUD_REMOTE a path): its backup or log directory
+// must be neither the local one nor, while the secondary is on, the secondary's. A
+// cloud on a remote has no folder here to compare.
+func disableCloudSharingLocalDirectories(cfg *config.Config, logger *logging.Logger) {
+	if !cfg.CloudEnabled {
+		return
+	}
+	dataDir, local := storage.LocalCloudRemoteDir(cfg.CloudRemote, cfg.CloudRemotePath)
+	if !local {
+		return
+	}
+	logDir, _ := storage.LocalCloudLogDir(cfg.CloudLogPath, cfg.CloudRemote)
+	timeout := fsIoTimeoutDuration(cfg)
+	var lines []string
+	if sameDirectory(logger, "cloud directory", dataDir, cfg.BackupPath, timeout) {
+		lines = append(lines, "✗ Cloud directory same as Backup directory (cloud storage disabled)")
+	}
+	if cfg.SecondaryEnabled && sameDirectory(logger, "cloud directory", dataDir, cfg.SecondaryPath, timeout) {
+		lines = append(lines, "✗ Cloud directory same as Secondary directory (cloud storage disabled)")
+	}
+	if sameDirectory(logger, "cloud log directory", logDir, cfg.LogPath, timeout) {
+		lines = append(lines, "✗ Cloud log directory same as Log directory (cloud storage disabled)")
+	}
+	if cfg.SecondaryEnabled && sameDirectory(logger, "cloud log directory", logDir, cfg.SecondaryLogPath, timeout) {
+		lines = append(lines, "✗ Cloud log directory same as Secondary log directory (cloud storage disabled)")
+	}
+	for _, line := range lines {
+		logging.Warning("%s", line)
+	}
+	if len(lines) > 0 {
+		cfg.CloudEnabled = false
+		cfg.CloudLogPath = ""
+	}
+}
+
+// sameDirectory reports whether two configured directories are one: the same path once
+// cleaned, or two paths to the same folder (a link, a bind mount). A folder that cannot
+// be read yet, such as one not created, is compared by path only.
+func sameDirectory(logger *logging.Logger, what, a, b string, timeout time.Duration) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if filepath.Clean(a) == filepath.Clean(b) {
+		logging.DebugStep(logger, "directory check", "%s=%s same=true by=path", what, a)
+		return true
+	}
+	infoA, errA := safefs.Stat(context.Background(), a, timeout)
+	infoB, errB := safefs.Stat(context.Background(), b, timeout)
+	same := errA == nil && errB == nil && os.SameFile(infoA, infoB)
+	logging.DebugStep(logger, "directory check", "%s=%s other=%s same=%v by=file stat_err=%v/%v", what, a, b, same, errA, errB)
+	return same
 }
 
 func logCloudLogDirectory(cfg *config.Config) {
@@ -296,6 +402,7 @@ func configurePreBackupChecker(opts backupModeOptions, orch *orchestrator.Orches
 	checkerConfig.MinDiskSecondaryGB = cfg.MinDiskSecondaryGB
 	checkerConfig.MinDiskCloudGB = cfg.MinDiskCloudGB
 	checkerConfig.FsIoTimeout = time.Duration(cfg.FsIoTimeoutSeconds) * time.Second
+	checkerConfig.SkipPermissionCheck = cfg.SkipPermissionCheck
 	checkerConfig.DryRun = opts.dryRun
 	checkerDone := logging.DebugStart(logger, "pre-backup check config", "dry_run=%v", opts.dryRun)
 	if err := checkerConfig.Validate(); err != nil {

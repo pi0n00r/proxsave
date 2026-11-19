@@ -99,8 +99,10 @@ func editedExistingConfig() string {
 func TestInstallWizardCharacterization_FreshDeclineAll(t *testing.T) {
 	// No existing config: overwrite mode is implicit (no prompt); every
 	// toggle declined via bare Enter; default scheduler (daemon), default
-	// healthchecks mode (centralized, daemon-only prompt), + run-at accepted.
-	run := runWizardCharacterization(t, "", strings.Repeat("\n", 9))
+	// healthchecks mode (centralized, daemon-only prompt), default notify level
+	// (warning, asked only with a monitor), + run-at accepted.
+	// The HC initial account email is required with centralized: typed after the mode answer.
+	run := runWizardCharacterization(t, "", strings.Repeat("\n", 8)+"ops@example.org\n"+strings.Repeat("\n", 3))
 	if run.err != nil {
 		t.Fatalf("wizard error: %v", run.err)
 	}
@@ -129,6 +131,8 @@ func TestInstallWizardCharacterization_FreshEnableAll(t *testing.T) {
 		"y",     // encryption
 		"",      // scheduler engine: default daemon
 		"self",  // healthchecks mode (daemon-only): self
+		"",      // notify level: default warning
+		"",      // frequency: default daily
 		"03:30", // run at
 	}, "\n") + "\n"
 	run := runWizardCharacterization(t, "", script)
@@ -150,7 +154,7 @@ func TestInstallWizardCharacterization_EditExistingNoOp(t *testing.T) {
 	// setting (including BOT_TELEGRAM_TYPE=personal and
 	// EMAIL_DELIVERY_METHOD=pmf, which the wizard must not reset).
 	existing := editedExistingConfig()
-	script := "2\n" + strings.Repeat("\n", 15)
+	script := "2\n" + strings.Repeat("\n", 16)
 	run := runWizardCharacterization(t, existing, script)
 	if run.err != nil {
 		t.Fatalf("wizard error: %v", run.err)

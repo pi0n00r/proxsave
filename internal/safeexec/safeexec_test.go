@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
-	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -41,33 +43,60 @@ func TestCommandContextAllowlist(t *testing.T) {
 	}
 }
 
-func TestCommandWrappers(t *testing.T) {
-	ctx := context.Background()
+// The commands the PBS datastore inventory runs, with its arguments
+// (internal/backup/collector_pbs_datastore_inventory.go). Missing from the
+// allowlist, each one was recorded as "command not allowed" in every backup and
+// its mount, device-mapper, RAID, multipath, iSCSI or NFS data never collected.
+func TestCommandContextAllowsThePBSInventoryCommands(t *testing.T) {
+	for _, args := range [][]string{
+		{"findmnt", "-J"},
+		{"findmnt", "-J", "-T", "/mnt/datastore"},
+		{"dmsetup", "ls", "--tree"},
+		{"mdadm", "--detail", "--scan"},
+		{"multipath", "-ll"},
+		{"iscsiadm", "-m", "session"},
+		{"iscsiadm", "-m", "node"},
+		{"iscsiadm", "-m", "iface"},
+		{"nfsstat", "-m"},
+	} {
+		cmd, err := CommandContext(context.Background(), args[0], args[1:]...)
+		if err != nil {
+			t.Fatalf("CommandContext(%q) error = %v", args, err)
+		}
+		if got := cmd.Args; !reflect.DeepEqual(got, args) {
+			t.Fatalf("CommandContext(%q) args = %q", args, got)
+		}
+	}
+}
 
-	out, err := Output(ctx, "echo", "safeexec-output")
+// The restore validates the staged /etc/sudoers with "visudo -c -f <file>"
+// (internal/orchestrator/restore_accounts.go). Missing from the allowlist, the
+// validation always failed and /etc/sudoers was never restored.
+func TestCommandContextAllowsVisudoCheck(t *testing.T) {
+	args := []string{"visudo", "-c", "-f", "/tmp/stage/etc/sudoers"}
+	cmd, err := CommandContext(context.Background(), args[0], args[1:]...)
 	if err != nil {
-		t.Fatalf("Output valid command error: %v", err)
+		t.Fatalf("CommandContext(visudo) error = %v", err)
 	}
-	if got := strings.TrimSpace(string(out)); got != "safeexec-output" {
-		t.Fatalf("Output()=%q; want %q", got, "safeexec-output")
+	if got := cmd.Args; !reflect.DeepEqual(got, args) {
+		t.Fatalf("CommandContext(visudo) args = %q", got)
 	}
+}
 
-	combined, err := CombinedOutput(ctx, "echo", "safeexec-combined")
+func TestCommandContextAllowsSQLiteSnapshot(t *testing.T) {
+	args := []string{
+		"-cmd",
+		".timeout 5000",
+		"/var/lib/pve-cluster/config.db",
+		`.backup "/tmp/config.db"`,
+	}
+	cmd, err := CommandContext(context.Background(), "sqlite3", args...)
 	if err != nil {
-		t.Fatalf("CombinedOutput valid command error: %v", err)
+		t.Fatalf("CommandContext(sqlite3) error = %v", err)
 	}
-	if got := strings.TrimSpace(string(combined)); got != "safeexec-combined" {
-		t.Fatalf("CombinedOutput()=%q; want %q", got, "safeexec-combined")
-	}
-
-	if _, err := Output(ctx, "false"); err == nil {
-		t.Fatalf("Output(false) expected exit error")
-	}
-	if _, err := Output(ctx, "not-allowed-command"); !errors.Is(err, ErrCommandNotAllowed) {
-		t.Fatalf("Output disallowed command error = %v, want ErrCommandNotAllowed", err)
-	}
-	if _, err := CombinedOutput(ctx, "not-allowed-command"); !errors.Is(err, ErrCommandNotAllowed) {
-		t.Fatalf("CombinedOutput disallowed command error = %v, want ErrCommandNotAllowed", err)
+	want := append([]string{"sqlite3"}, args...)
+	if got := cmd.Args; !reflect.DeepEqual(got, want) {
+		t.Fatalf("CommandContext(sqlite3) args = %q, want %q", got, want)
 	}
 }
 
@@ -172,25 +201,54 @@ func TestValidateRemoteRelativePath(t *testing.T) {
 	}
 }
 
-func TestProcPath(t *testing.T) {
-	valid := map[string]string{
-		"status": "/proc/123/status",
-		"comm":   "/proc/123/comm",
-		"exe":    "/proc/123/exe",
-	}
-	for leaf, want := range valid {
-		got, err := ProcPath(123, leaf)
-		if err != nil {
-			t.Fatalf("ProcPath(%s) valid error: %v", leaf, err)
-		}
-		if got != want {
-			t.Fatalf("ProcPath(%s) = %q; want %q", leaf, got, want)
+func TestOpenProcDirRejectsNonPositivePIDs(t *testing.T) {
+	for _, pid := range []int{0, -1} {
+		root, err := OpenProcDir(pid)
+		if err == nil || root != nil {
+			t.Fatalf("OpenProcDir(%d) = (%v, %v), want (nil, error)", pid, root, err)
 		}
 	}
-	if _, err := ProcPath(0, "status"); err == nil {
-		t.Fatalf("expected pid 0 to be rejected")
+}
+
+func TestOpenProcDirReadsThisProcess(t *testing.T) {
+	root, err := OpenProcDir(os.Getpid())
+	if err != nil {
+		t.Fatalf("OpenProcDir(self): %v", err)
 	}
-	if _, err := ProcPath(123, "../status"); err == nil {
-		t.Fatalf("expected unsupported leaf to be rejected")
+	defer func() { _ = root.Close() }()
+	got, err := root.ReadFile("comm")
+	if err != nil {
+		t.Fatalf("read comm: %v", err)
+	}
+	want, err := os.ReadFile("/proc/self/comm")
+	if err != nil {
+		t.Fatalf("read /proc/self/comm: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("comm = %q, want %q", got, want)
+	}
+}
+
+// The handle stays bound to the process it was opened for: after that process
+// exits, reads through it fail with ESRCH.
+func TestOpenProcDirStaysBoundToItsProcess(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("sleep not runnable: %v", err)
+	}
+	root, err := OpenProcDir(cmd.Process.Pid)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("OpenProcDir(child): %v", err)
+	}
+	defer func() { _ = root.Close() }()
+	if _, err := root.ReadFile("status"); err != nil {
+		t.Fatalf("read status while alive: %v", err)
+	}
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+	if _, err := root.ReadFile("status"); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("read status after exit: err=%v, want ESRCH", err)
 	}
 }

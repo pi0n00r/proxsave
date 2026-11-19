@@ -35,121 +35,6 @@ func TestGetAllCategories(t *testing.T) {
 	}
 }
 
-func TestGetPVECategories(t *testing.T) {
-	categories := GetPVECategories()
-
-	for _, cat := range categories {
-		if cat.Type != CategoryTypePVE {
-			t.Errorf("GetPVECategories returned non-PVE category: %s (type=%s)", cat.ID, cat.Type)
-		}
-	}
-
-	// Should have at least pve_cluster
-	found := false
-	for _, cat := range categories {
-		if cat.ID == "pve_cluster" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("GetPVECategories should include pve_cluster")
-	}
-}
-
-func TestGetPBSCategories(t *testing.T) {
-	categories := GetPBSCategories()
-
-	for _, cat := range categories {
-		if cat.Type != CategoryTypePBS {
-			t.Errorf("GetPBSCategories returned non-PBS category: %s (type=%s)", cat.ID, cat.Type)
-		}
-	}
-
-	// Should have at least pbs_config
-	found := false
-	for _, cat := range categories {
-		if cat.ID == "pbs_config" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("GetPBSCategories should include pbs_config")
-	}
-}
-
-func TestGetCommonCategories(t *testing.T) {
-	categories := GetCommonCategories()
-
-	for _, cat := range categories {
-		if cat.Type != CategoryTypeCommon {
-			t.Errorf("GetCommonCategories returned non-common category: %s (type=%s)", cat.ID, cat.Type)
-		}
-	}
-
-	// Should have network, ssl, ssh
-	expectedIDs := []string{"network", "ssl", "ssh"}
-	for _, expectedID := range expectedIDs {
-		found := false
-		for _, cat := range categories {
-			if cat.ID == expectedID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("GetCommonCategories should include %s", expectedID)
-		}
-	}
-}
-
-func TestGetCategoriesForSystem(t *testing.T) {
-	tests := []struct {
-		name       string
-		systemType string
-		wantPVE    bool
-		wantPBS    bool
-		wantCommon bool
-	}{
-		{"pve system", "pve", true, false, true},
-		{"pbs system", "pbs", false, true, true},
-		{"dual system", "dual", true, true, true},
-		{"unknown system", "unknown", false, false, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			categories := GetCategoriesForSystem(tt.systemType)
-
-			hasPVE := false
-			hasPBS := false
-			hasCommon := false
-
-			for _, cat := range categories {
-				switch cat.Type {
-				case CategoryTypePVE:
-					hasPVE = true
-				case CategoryTypePBS:
-					hasPBS = true
-				case CategoryTypeCommon:
-					hasCommon = true
-				}
-			}
-
-			if hasPVE != tt.wantPVE {
-				t.Errorf("PVE categories: got %v, want %v", hasPVE, tt.wantPVE)
-			}
-			if hasPBS != tt.wantPBS {
-				t.Errorf("PBS categories: got %v, want %v", hasPBS, tt.wantPBS)
-			}
-			if hasCommon != tt.wantCommon {
-				t.Errorf("Common categories: got %v, want %v", hasCommon, tt.wantCommon)
-			}
-		})
-	}
-}
-
 func TestPathMatchesCategory(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -489,7 +374,7 @@ func TestResolveCloudPath(t *testing.T) {
 		// New style WITH leading slash
 		{"new style simple", "/logs", "gdrive", "gdrive:/logs"},
 		{"new style subpath", "/proxmox-backup/log", "gdrive", "gdrive:/proxmox-backup/log"},
-		{"new style with leading slash stripped", "/logs", "gdrive", "gdrive:/logs"},
+		{"new style with leading slash kept", "/logs", "gdrive", "gdrive:/logs"},
 		{"new style remote has legacy path", "/logs", "gdrive:base", "gdrive:/logs"},
 
 		// New style WITHOUT leading slash (rclone accepts both formats)
@@ -507,6 +392,12 @@ func TestResolveCloudPath(t *testing.T) {
 		{"empty remote", "/logs", "", "/logs"},
 		{"spaces trimmed", "  /logs  ", "gdrive", "gdrive:/logs"},
 		{"spaces in remote", "/logs", "  gdrive  ", "gdrive:/logs"},
+
+		// CLOUD_REMOTE a local directory: the path lives inside it; a path with ":"
+		// stays as-is.
+		{"local remote", "/proxsave/log", "/mnt/cloud", "/mnt/cloud/proxsave/log"},
+		{"local remote no leading slash", "proxsave/log/", "/mnt/cloud", "/mnt/cloud/proxsave/log"},
+		{"local remote legacy path", "gdrive:/logs", "/mnt/cloud", "gdrive:/logs"},
 	}
 
 	for _, tt := range tests {
@@ -549,6 +440,11 @@ func TestBuildCloudLogDestination(t *testing.T) {
 		// Edge cases
 		{"empty remote new style", "/logs", "backup.log", "", "/logs/backup.log"},
 		{"empty all", "", "", "", ""},
+
+		// CLOUD_REMOTE a local directory
+		{"local remote", "/proxsave/log", "backup.log", "/mnt/cloud", "/mnt/cloud/proxsave/log/backup.log"},
+		{"local remote root", "/", "backup.log", "/mnt/cloud", "/mnt/cloud/backup.log"},
+		{"local remote legacy path", "gdrive:/logs", "backup.log", "/mnt/cloud", "gdrive:/logs/backup.log"},
 	}
 
 	for _, tt := range tests {

@@ -111,7 +111,7 @@ func TestResolveExistingConfig(t *testing.T) {
 	resCh := make(chan result, 1)
 	ask := func() {
 		go func() {
-			action, err := ResolveExistingConfig(context.Background(), d.session, configPath)
+			action, err := ResolveExistingConfig(t.Context(), d.session, configPath)
 			resCh <- result{action, err}
 		}()
 	}
@@ -148,15 +148,21 @@ func TestCollectWizardDataDeclineAll(t *testing.T) {
 	}
 	resCh := make(chan result, 1)
 	go func() {
-		data, err := CollectWizardData(context.Background(), d.session, "")
+		data, err := CollectWizardData(t.Context(), d.session, "")
 		resCh <- result{data, err}
 	}()
 
 	// Single aligned form: inactive dependent rows are skipped. Fresh install
-	// defaults to the daemon, so the Healthchecks row is active too: Enter through
-	// the 9 active rows reaches Continue; the final Enter submits.
+	// defaults to the daemon, so the Healthchecks, HC initial account email and Notify
+	// level rows are active too: Enter through the 12 active rows (Frequency included;
+	// Weekday and Day of month are inactive on daily) reaches Continue; the final Enter
+	// submits. The email, required with the ProxSave HC Server, is typed on its row (9th).
 	d.waitScreen("Configuration")
-	for i := 0; i < 10; i++ {
+	for range 8 {
+		d.keys("enter")
+	}
+	d.typeText("ops@example.org")
+	for range 5 {
 		d.keys("enter")
 	}
 
@@ -171,6 +177,12 @@ func TestCollectWizardDataDeclineAll(t *testing.T) {
 	// Fresh daemon default: Healthchecks defaults to centralized.
 	if data.SchedulerMode != "daemon" || data.HealthcheckMode != "centralized" {
 		t.Fatalf("fresh daemon must default Healthchecks to centralized: mode=%q hc=%q", data.SchedulerMode, data.HealthcheckMode)
+	}
+	if data.NotifyOn != "warning" {
+		t.Fatalf("fresh install must default Notify level to warning, got %q", data.NotifyOn)
+	}
+	if data.HealthcheckAccountInitialEmail != "ops@example.org" {
+		t.Fatalf("HC initial account email = %q", data.HealthcheckAccountInitialEmail)
 	}
 	if data.NotificationMode != "none" {
 		t.Fatalf("notification mode = %q, want none", data.NotificationMode)
@@ -226,14 +238,14 @@ func TestCollectWizardDataPrefillNoOp(t *testing.T) {
 	}
 	resCh := make(chan result, 1)
 	go func() {
-		data, err := CollectWizardData(context.Background(), d.session, template)
+		data, err := CollectWizardData(t.Context(), d.session, template)
 		resCh <- result{data, err}
 	}()
 
 	// Single aligned form, everything prefilled/active: Enter through all
-	// 13 rows plus the Continue button is the no-op edit.
+	// 14 rows (Frequency included) plus the Continue button is the no-op edit.
 	d.waitScreen("Configuration")
-	for i := 0; i < 14; i++ {
+	for range 15 {
 		d.keys("enter")
 	}
 
@@ -290,10 +302,10 @@ func TestCollectWizardDataLeavesEmailFallbackToTheEngine(t *testing.T) {
 
 	resCh := collectWizardAsync(t, d, template)
 
-	// Same no-op-edit gesture as TestCollectWizardDataPrefillNoOp: 13 active rows
+	// Same no-op-edit gesture as TestCollectWizardDataPrefillNoOp: 14 active rows
 	// plus Continue. No form row is added or removed by leaving the field nil.
 	d.waitScreen("Configuration")
-	for i := 0; i < 14; i++ {
+	for range 15 {
 		d.keys("enter")
 	}
 
@@ -329,7 +341,7 @@ func TestCollectWizardDataLeavesEmailFallbackToTheEngine(t *testing.T) {
 // the CLI's schedulerEngineDefault).
 func TestCollectWizardDataEditWithoutSchedulerModeDefaultsCron(t *testing.T) {
 	d := newDriver(t)
-	template := installer.UnsetEnvValueInTemplate(config.DefaultEnvTemplate(), "SCHEDULER_MODE")
+	template := config.RemoveEnvKeys(config.DefaultEnvTemplate(), "SCHEDULER_MODE")
 
 	type result struct {
 		data *installer.InstallWizardData
@@ -337,13 +349,13 @@ func TestCollectWizardDataEditWithoutSchedulerModeDefaultsCron(t *testing.T) {
 	}
 	resCh := make(chan result, 1)
 	go func() {
-		data, err := CollectWizardData(context.Background(), d.session, template)
+		data, err := CollectWizardData(t.Context(), d.session, template)
 		resCh <- result{data, err}
 	}()
 
-	// All toggles default off -> 8 active rows + Continue.
+	// All toggles default off -> 9 active rows (Frequency included) + Continue.
 	d.waitScreen("Configuration")
-	for i := 0; i < 9; i++ {
+	for range 10 {
 		d.keys("enter")
 	}
 
@@ -386,9 +398,9 @@ func TestCollectWizardDataHealthcheckSelect(t *testing.T) {
 		d := newDriver(t)
 		resCh := collectWizardAsync(t, d, "")
 		d.waitScreen("Configuration")
-		d.keys("down down down down down down down")  // 7 downs -> Healthchecks row
-		d.keys("right")                               // centralized -> self
-		d.keys("down down down down down down enter") // to Continue, submit
+		d.keys("down down down down down down down")       // 7 downs -> Healthchecks row
+		d.keys("right")                                    // centralized -> self
+		d.keys("down down down down down down down enter") // Notify level is active: to Continue, submit
 		res := <-resCh
 		if res.err != nil {
 			t.Fatalf("unexpected error: %v", res.err)
@@ -410,8 +422,8 @@ func TestCollectWizardDataHealthcheckSelect(t *testing.T) {
 		if res.err != nil {
 			t.Fatalf("unexpected error: %v", res.err)
 		}
-		if res.data.HealthcheckMode != "off" {
-			t.Fatalf("hc=%q, want off", res.data.HealthcheckMode)
+		if res.data.HealthcheckMode != "off" || res.data.NotifyOn != "always" {
+			t.Fatalf("hc=%q notify=%q, want off/always: no monitor, no level below every run", res.data.HealthcheckMode, res.data.NotifyOn)
 		}
 	})
 
@@ -428,8 +440,8 @@ func TestCollectWizardDataHealthcheckSelect(t *testing.T) {
 		if res.err != nil {
 			t.Fatalf("unexpected error: %v", res.err)
 		}
-		if res.data.SchedulerMode != "cron" || res.data.HealthcheckMode != "off" {
-			t.Fatalf("mode=%q hc=%q, want cron/off", res.data.SchedulerMode, res.data.HealthcheckMode)
+		if res.data.SchedulerMode != "cron" || res.data.HealthcheckMode != "off" || res.data.NotifyOn != "always" {
+			t.Fatalf("mode=%q hc=%q notify=%q, want cron/off/always", res.data.SchedulerMode, res.data.HealthcheckMode, res.data.NotifyOn)
 		}
 	})
 
@@ -458,7 +470,7 @@ func TestCollectWizardDataEscCancels(t *testing.T) {
 	d := newDriver(t)
 	resCh := make(chan error, 1)
 	go func() {
-		_, err := CollectWizardData(context.Background(), d.session, "")
+		_, err := CollectWizardData(t.Context(), d.session, "")
 		resCh <- err
 	}()
 	d.waitScreen("Configuration")
@@ -477,7 +489,7 @@ func TestConfirmNewInstall(t *testing.T) {
 	resCh := make(chan result, 1)
 	ask := func() {
 		go func() {
-			ok, err := ConfirmNewInstall(context.Background(), d.session, "/opt/proxsave", []string{"build", "env"})
+			ok, err := ConfirmNewInstall(t.Context(), d.session, "/opt/proxsave", []string{"build", "env"})
 			resCh <- result{ok, err}
 		}()
 	}
@@ -522,7 +534,7 @@ func TestRunPostInstallAudit(t *testing.T) {
 	}
 	resCh := make(chan result, 1)
 	go func() {
-		res, err := RunPostInstallAudit(context.Background(), d.session, "/fake/proxsave", configPath, false)
+		res, err := RunPostInstallAudit(t.Context(), d.session, "/fake/proxsave", configPath, false)
 		resCh <- result{res, err}
 	}()
 
@@ -585,7 +597,7 @@ func TestRunPostInstallAuditNoSuggestions(t *testing.T) {
 	}
 	resCh := make(chan result, 1)
 	go func() {
-		res, err := RunPostInstallAudit(context.Background(), d.session, "/fake/proxsave", "/tmp/nonexistent.env", false)
+		res, err := RunPostInstallAudit(t.Context(), d.session, "/fake/proxsave", "/tmp/nonexistent.env", false)
 		resCh <- result{res, err}
 	}()
 
@@ -613,7 +625,7 @@ func TestRunPostInstallAuditSkipAndEsc(t *testing.T) {
 	}
 	resCh := make(chan result, 1)
 	go func() {
-		res, err := RunPostInstallAudit(context.Background(), d.session, "/fake/proxsave", "/tmp/nonexistent.env", false)
+		res, err := RunPostInstallAudit(t.Context(), d.session, "/fake/proxsave", "/tmp/nonexistent.env", false)
 		resCh <- result{res, err}
 	}()
 	d.waitScreen("Post-install check")
@@ -626,7 +638,7 @@ func TestRunPostInstallAuditSkipAndEsc(t *testing.T) {
 	// Ctrl+C on the selector is a non-blocking skip too (parity with the
 	// CLI, where a prompt EOF abandons the optional step).
 	go func() {
-		res, err := RunPostInstallAudit(context.Background(), d.session, "/fake/proxsave", "/tmp/nonexistent.env", false)
+		res, err := RunPostInstallAudit(t.Context(), d.session, "/fake/proxsave", "/tmp/nonexistent.env", false)
 		resCh <- result{res, err}
 	}()
 	d.waitScreen("Post-install check")
@@ -712,7 +724,7 @@ func TestRunTelegramSetup(t *testing.T) {
 	resCh := make(chan result, 1)
 	ask := func() {
 		go func() {
-			res, err := RunTelegramSetup(context.Background(), d.session, t.TempDir(), "/tmp/backup.env", false)
+			res, err := RunTelegramSetup(t.Context(), d.session, t.TempDir(), "/tmp/backup.env", false)
 			resCh <- result{res, err}
 		}()
 	}
@@ -751,5 +763,70 @@ func TestRunTelegramSetup(t *testing.T) {
 	notShown, err := RunTelegramSetup(context.Background(), d.session, t.TempDir(), "/tmp/backup.env", false)
 	if err != nil || notShown.Shown {
 		t.Fatalf("not-eligible must be silent: %+v err=%v", notShown, err)
+	}
+}
+
+// The Notify level row: an Edit prefills the stored level and a no-op edit keeps it; right/left
+// move through Every run, Warnings and failures, Failures only.
+func TestCollectWizardDataNotifyLevel(t *testing.T) {
+	daemonCentralized := func(level string) string {
+		template := config.DefaultEnvTemplate()
+		template = installer.SetEnvValueInTemplate(template, "SCHEDULER_MODE", "daemon")
+		template = installer.SetEnvValueInTemplate(template, "HEALTHCHECK_ENABLED", "true")
+		template = installer.SetEnvValueInTemplate(template, "HEALTHCHECK_MODE", "centralized")
+		template = installer.SetEnvValueInTemplate(template, "HEALTHCHECK_ACCOUNT_INITIAL_EMAIL", "ops@example.org")
+		return installer.SetEnvValueInTemplate(template, "NOTIFY_ON", level)
+	}
+	t.Run("prefill_failure_roundtrip", func(t *testing.T) {
+		d := newDriver(t)
+		resCh := collectWizardAsync(t, d, daemonCentralized("failure"))
+		d.waitScreen("Configuration")
+		d.keys("down down down down down down down down down down down down down enter") // the stored email prefills its row
+		res := <-resCh
+		if res.err != nil || res.data.NotifyOn != "failure" {
+			t.Fatalf("notify=%q err=%v, want the stored failure kept", res.data.NotifyOn, res.err)
+		}
+	})
+	t.Run("fresh_right_is_failures_only", func(t *testing.T) {
+		d := newDriver(t)
+		resCh := collectWizardAsync(t, d, "")
+		d.waitScreen("Configuration")
+		d.keys("down down down down down down down down") // 8 downs -> HC initial account email (required)
+		d.typeText("ops@example.org")
+		d.keys("down")                 // -> Notify level row
+		d.keys("right")                // warning -> failure
+		d.keys("down down down enter") // Frequency, Run at, Continue, submit
+		res := <-resCh
+		if res.err != nil || res.data.NotifyOn != "failure" {
+			t.Fatalf("notify=%q err=%v, want failure", res.data.NotifyOn, res.err)
+		}
+	})
+}
+
+// Frequency and Weekday reach the wizard data; Day of month keeps its default while inactive.
+func TestCollectWizardDataScheduleWeekly(t *testing.T) {
+	d := newDriver(t)
+	resCh := collectWizardAsync(t, d, "")
+	d.waitScreen("Configuration")
+	d.keys("down down down down down down down down") // 8 downs -> HC initial account email (required)
+	d.typeText("ops@example.org")
+	d.keys("down down")                    // -> Frequency row
+	d.keys("right")                        // daily -> weekly
+	d.keys("down right right right right") // Weekday: mon -> fri
+	d.keys("down down enter")              // Run at, Continue, submit
+	res := <-resCh
+	if res.err != nil {
+		t.Fatalf("unexpected error: %v", res.err)
+	}
+	if res.data.ScheduleFrequency != "weekly" || res.data.ScheduleWeekday != "fri" || res.data.ScheduleMonthDay != "1" {
+		t.Fatalf("schedule = %q %q %q; want weekly fri 1", res.data.ScheduleFrequency, res.data.ScheduleWeekday, res.data.ScheduleMonthDay)
+	}
+}
+
+// A colored status without a label renders the generic "STATUS" keyword.
+func TestBuildTelegramPromptDefaultsABlankStatusLabel(t *testing.T) {
+	v := ansi.Strip(buildTelegramPrompt("1", "", false, "", "", orchestrator.TelegramSeveritySuccess, 0))
+	if !strings.Contains(v, "✓ STATUS") {
+		t.Fatalf("blank label must render as STATUS: %q", v)
 	}
 }

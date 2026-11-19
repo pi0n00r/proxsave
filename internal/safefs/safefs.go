@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -62,6 +64,50 @@ func (e *TimeoutError) Error() string {
 
 func (e *TimeoutError) Unwrap() error { return ErrTimeout }
 
+// CancelError is returned when a bounded filesystem operation is abandoned because its
+// context was CANCELLED (as opposed to timed out). It names the operation and the path the
+// caller asked for, and unwraps to context.Canceled.
+//
+// It exists because the cancelled shape was the only one that did not name the file. The
+// other three all do - "remove /x: permission denied" from the syscall, "remove /x: timeout
+// after 30s" and "remove /x: timeout" from TimeoutError - so a caller wanting the file in a
+// log line had to repeat it from its own arguments, printing it twice on the three shapes
+// that already carried it. Callers can now let the error speak.
+//
+// "remove /x: canceled" names the operation the caller REQUESTED and then abandoned, not a
+// syscall that ran. That is deliberate and it is not a claim about the disk: runBounded's
+// select picks uniformly among ready cases, so a cancelled Remove may have issued no syscall
+// and left the file, or issued one whose abandoned worker deletes the file after the caller
+// returned. Neither branch can predict its own disk state, so no wording can promise one.
+// The timeout shape has always said the same thing under the same conditions, and the
+// standard library does it too (net.Dial renders "dial tcp 10.0.0.1:80: operation was
+// canceled" from the same kind of guard).
+type CancelError struct {
+	Op   string
+	Path string
+}
+
+func (e *CancelError) Error() string {
+	if e == nil {
+		return "filesystem operation canceled"
+	}
+	return fmt.Sprintf("%s %s: canceled", e.Op, e.Path)
+}
+
+// Unwrap keeps the identity every consumer already reads: 19 production sites ask
+// errors.Is(err, context.Canceled), and IsAbandoned answers from the same chain.
+func (e *CancelError) Unwrap() error { return context.Canceled }
+
+// cancelErrorFrom reuses the Op and Path the caller already supplied for the timeout shape,
+// so the two abandonment errors name the operation identically. A nil bound (a caller that
+// passed no descriptor) keeps the bare context error rather than inventing one.
+func cancelErrorFrom(bound *TimeoutError) error {
+	if bound == nil {
+		return context.Canceled
+	}
+	return &CancelError{Op: bound.Op, Path: bound.Path}
+}
+
 func effectiveTimeout(ctx context.Context, timeout time.Duration) time.Duration {
 	if timeout <= 0 {
 		return 0
@@ -85,6 +131,15 @@ func normalizeContextErr(ctx context.Context, deadlineErr error) error {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return deadlineErr
+	}
+	// Only a genuine cancellation is renamed. A context whose Err() is neither of the two
+	// standard causes passes through untouched: turning it into a CancelError would make
+	// IsAbandoned answer true, and that answer tells a caller to SKIP closing its file
+	// handles (see copy.go and internal/backup/checksum.go).
+	if errors.Is(err, context.Canceled) {
+		if bound, ok := deadlineErr.(*TimeoutError); ok {
+			return cancelErrorFrom(bound)
+		}
 	}
 	return err
 }
@@ -122,10 +177,6 @@ func (l *operationLimiter) release() {
 	}
 }
 
-func (l *operationLimiter) inflight() int {
-	return len(l.slots)
-}
-
 func runLimited[T any](ctx context.Context, timeout time.Duration, timeoutErr *TimeoutError, run func() (T, error)) (T, error) {
 	return runBounded(ctx, fsOpLimiter, timeout, timeoutErr, run)
 }
@@ -158,6 +209,12 @@ func runBounded[T any](ctx context.Context, limiter *operationLimiter, timeout t
 		if err := limiter.acquire(ctx, timer.C); err != nil {
 			if errors.Is(err, ErrTimeout) {
 				return zero, timeoutErr
+			}
+			// acquire hands back the bare context error; name it the same way the
+			// select below does, so waiting for a slot and waiting for the worker
+			// are indistinguishable to the caller.
+			if errors.Is(err, context.Canceled) {
+				return zero, cancelErrorFrom(timeoutErr)
 			}
 			return zero, err
 		}
@@ -245,6 +302,58 @@ func Lchmod(ctx context.Context, path string, mode os.FileMode, timeout time.Dur
 		return struct{}{}, lchmod(path, mode)
 	})
 	return err
+}
+
+// LchmodInRoot is Lchmod confined to root, for a path in a directory other hosts can write to:
+// every directory component of path is resolved through an *os.Root on root, so a symlink that
+// leaves root (or an absolute one) is refused there too, not only at the final component. The
+// final component is opened with O_NOFOLLOW, as Lchmod does, and the mode is applied with fchmod
+// on that descriptor. path is absolute under root, or relative to it. Bounded like Lchmod.
+func LchmodInRoot(ctx context.Context, root, path string, mode os.FileMode, timeout time.Duration) error {
+	_, err := runLimited(ctx, timeout, &TimeoutError{Op: "lchmod", Path: path, Timeout: effectiveTimeout(ctx, timeout)}, func() (struct{}, error) {
+		return struct{}{}, lchmodInRoot(root, path, mode)
+	})
+	return err
+}
+
+// lchmodInRoot opens the parent directory of path through os.Root (os.Root.OpenFile follows a
+// final-component symlink that stays inside root even with O_NOFOLLOW, so the file itself is
+// opened with openat on that directory, O_NOFOLLOW honoured) and fchmods it.
+func lchmodInRoot(root, path string, mode os.FileMode) error {
+	rel := filepath.Clean(path)
+	if filepath.IsAbs(rel) {
+		r, err := filepath.Rel(filepath.Clean(root), rel)
+		if err != nil {
+			return &os.PathError{Op: "lchmod", Path: path, Err: err}
+		}
+		rel = r
+	}
+	if rel == ".." || strings.HasPrefix(rel, "../") {
+		return &os.PathError{Op: "lchmod", Path: path, Err: errors.New("path escapes from root")}
+	}
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = r.Close() }()
+	dir, base := filepath.Split(rel)
+	if dir == "" {
+		dir = "."
+	}
+	parent, err := r.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = parent.Close() }()
+	fd, err := syscall.Openat(int(parent.Fd()), base, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return &os.PathError{Op: "openat", Path: path, Err: err}
+	}
+	defer func() { _ = syscall.Close(fd) }() // fchmod already applied; a close error on the fd is not meaningful
+	if err := syscall.Fchmod(fd, chmodSyscallMode(mode)); err != nil {
+		return &os.PathError{Op: "fchmod", Path: path, Err: err}
+	}
+	return nil
 }
 
 // lchmodNoFollow opens path with O_NOFOLLOW (a symlink final component fails with
@@ -338,11 +447,12 @@ func CreateTemp(ctx context.Context, dir, pattern string, timeout time.Duration)
 // actually-used byte counts. "Available" tracks Bavail (space a non-root user can
 // allocate), while "used" tracks Blocks-Bfree (space already consumed).
 func SpaceUsageFromStatfs(stat syscall.Statfs_t) (totalBytes, availableBytes, usedBytes int64) {
-	totalBytes = statfsBlocksToBytes(stat.Blocks, stat.Bsize)
-	availableBytes = statfsBlocksToBytes(stat.Bavail, stat.Bsize)
+	blockSize := int64(stat.Bsize)
+	totalBytes = statfsBlocksToBytes(stat.Blocks, blockSize)
+	availableBytes = statfsBlocksToBytes(stat.Bavail, blockSize)
 
 	if stat.Blocks > stat.Bfree {
-		usedBytes = statfsBlocksToBytes(stat.Blocks-stat.Bfree, stat.Bsize)
+		usedBytes = statfsBlocksToBytes(stat.Blocks-stat.Bfree, blockSize)
 	}
 	if availableBytes > totalBytes {
 		availableBytes = totalBytes

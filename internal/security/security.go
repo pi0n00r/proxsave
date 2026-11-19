@@ -3,6 +3,7 @@ package security
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/tis24dev/proxsave/internal/config"
 	"github.com/tis24dev/proxsave/internal/environment"
+	"github.com/tis24dev/proxsave/internal/health"
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/safeexec"
 	"github.com/tis24dev/proxsave/internal/safefs"
@@ -48,15 +50,6 @@ func (r *Result) add(sev issueSeverity, msg string) {
 	r.Issues = append(r.Issues, Issue{Severity: sev, Message: msg})
 }
 
-func (r *Result) HasErrors() bool {
-	for _, issue := range r.Issues {
-		if issue.Severity == severityError {
-			return true
-		}
-	}
-	return false
-}
-
 func (r *Result) ErrorCount() int {
 	count := 0
 	for _, issue := range r.Issues {
@@ -75,10 +68,6 @@ func (r *Result) WarningCount() int {
 		}
 	}
 	return count
-}
-
-func (r *Result) TotalIssues() int {
-	return len(r.Issues)
 }
 
 type Checker struct {
@@ -225,7 +214,7 @@ func (c *Checker) checkDependencies() {
 
 	c.logger.Warning("Dependencies check: missing required dependencies")
 	for _, dep := range missing {
-		c.logger.Warning(" - %s (%s)", dep.Name, dep.Reason)
+		c.logger.Warning("  - %s (%s)", dep.Name, dep.Reason)
 		c.addError("Required dependency %s missing: %s", dep.Name, dep.Reason)
 	}
 }
@@ -251,6 +240,9 @@ func (c *Checker) buildDependencyList() []dependencyEntry {
 	if c.cfg.CloudEnabled && strings.TrimSpace(c.cfg.CloudRemote) != "" {
 		deps = append(deps, c.binaryDependency("rclone", []string{"rclone"}, false, "cloud storage uploads enabled"))
 	}
+	if c.cfg.PBSTargetEnabled {
+		deps = append(deps, c.binaryDependency("proxmox-backup-client", []string{"proxmox-backup-client"}, false, "PBS storage uploads enabled"))
+	}
 
 	if c.cfg.EmailEnabled {
 		emailMethod := config.NormalizeEmailDeliveryMethod(c.cfg.EmailDeliveryMethod)
@@ -259,7 +251,7 @@ func (c *Checker) buildDependencyList() []dependencyEntry {
 				"proxmox-mail-forward",
 				[]string{"/usr/libexec/proxmox-mail-forward", "/usr/bin/proxmox-mail-forward", "proxmox-mail-forward"},
 				true,
-				"email delivery method set to pmf (Proxmox Notifications via proxmox-mail-forward)",
+				"email delivery mode set to pmf (Proxmox Notifications via proxmox-mail-forward)",
 			))
 			if c.cfg.EmailFallbackSendmail {
 				deps = append(deps, c.binaryDependency(
@@ -274,7 +266,7 @@ func (c *Checker) buildDependencyList() []dependencyEntry {
 				"sendmail",
 				[]string{"/usr/sbin/sendmail", "sendmail"},
 				true,
-				"email delivery method set to sendmail (/usr/sbin/sendmail)",
+				"email delivery mode set to sendmail (/usr/sbin/sendmail)",
 			))
 		} else if emailMethod == "relay" && c.cfg.EmailFallbackSendmail {
 			deps = append(deps, c.binaryDependency(
@@ -336,13 +328,13 @@ func (c *Checker) binaryDependency(name string, binaries []string, required bool
 	}
 }
 
-func (c *Checker) addWarning(format string, args ...interface{}) {
+func (c *Checker) addWarning(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	c.logger.Warning("%s", msg)
 	c.result.add(severityWarning, msg)
 }
 
-func (c *Checker) addError(format string, args ...interface{}) {
+func (c *Checker) addError(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	c.logger.Error("%s", msg)
 	c.result.add(severityError, msg)
@@ -535,6 +527,9 @@ func (c *Checker) verifyConfigFile(ctx context.Context) {
 	c.ensureOwnershipAndPerm(ctx, c.configPath, info, 0o600, fmt.Sprintf("Config file %s", c.configPath))
 }
 
+// pbsTokenFilesFn is a seam so the tests never stat the real /root/.pbs-token.
+var pbsTokenFilesFn = config.PBSTokenFiles
+
 func (c *Checker) verifySensitiveFiles(ctx context.Context) {
 	files := []struct {
 		path        string
@@ -559,6 +554,20 @@ func (c *Checker) verifySensitiveFiles(ctx context.Context) {
 			path:        ageRecipientPath,
 			perm:        0o600,
 			description: "AGE recipient file",
+			optional:    true,
+		})
+	}
+
+	for _, path := range pbsTokenFilesFn(c.cfg.SecureAccount) {
+		files = append(files, struct {
+			path        string
+			perm        os.FileMode
+			description string
+			optional    bool
+		}{
+			path:        path,
+			perm:        0o600,
+			description: "PBS token file " + path,
 			optional:    true,
 		})
 	}
@@ -622,6 +631,10 @@ func (c *Checker) verifySecureAccountFiles(ctx context.Context) {
 }
 
 func (c *Checker) verifyDirectories(ctx context.Context) {
+	// A disabled secondary keeps its configured paths: checking them created the
+	// directories (on the root filesystem when the mount was absent) and chowned them
+	// root:root 0755 for a destination the backup does not use.
+	secondaryPath, secondaryLogPath := c.cfg.ActiveSecondaryPaths()
 	dirs := []struct {
 		path        string
 		perm        os.FileMode
@@ -629,12 +642,13 @@ func (c *Checker) verifyDirectories(ctx context.Context) {
 	}{
 		{c.cfg.BackupPath, 0o755, true},
 		{c.cfg.LogPath, 0o755, true},
-		{c.cfg.SecondaryPath, 0o755, true},
-		{c.cfg.SecondaryLogPath, 0o755, true},
+		{secondaryPath, 0o755, true},
+		{secondaryLogPath, 0o755, true},
 		{c.cfg.LockPath, 0o755, false},
 		{c.cfg.SecureAccount, 0o700, false},
 		{filepath.Join(c.cfg.BaseDir, "identity"), 0o700, false},
 		{filepath.Join(c.cfg.BaseDir, "identity", "age"), 0o700, false},
+		{health.DaemonStateDir(c.cfg.BaseDir), health.DaemonStateDirPerm, false},
 	}
 
 	for _, dir := range dirs {
@@ -811,6 +825,15 @@ func (c *Checker) checkFirewall(ctx context.Context) {
 		c.addWarning("Failed to prepare iptables command: %v", err)
 		return
 	}
+	// The preflight runs before every backup, and it shells out to four system tools
+	// it does not control. Any one of them that leaves a background child holding
+	// stdout stalls the whole run here, before the archive is even started: the tool
+	// exits 0, so the context deadline never fires and there is nothing for a timeout
+	// to bound. The budget cannot cost output at these sites, because Output captures
+	// into an in-memory buffer that never blocks, so everything the tool wrote is
+	// already there when the timer starts. See safeexec.CommandWaitDelay for the shapes
+	// where that is NOT true.
+	safeexec.ApplyWaitDelay(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		c.addWarning("Failed to run iptables -L -n: %v", err)
@@ -845,6 +868,7 @@ func (c *Checker) checkOpenPorts(ctx context.Context) {
 		c.addWarning("Failed to prepare 'ss -tulnap': %v", err)
 		return
 	}
+	safeexec.ApplyWaitDelay(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		c.addWarning("Failed to execute 'ss -tulnap': %v", err)
@@ -884,6 +908,7 @@ func (c *Checker) checkOpenPortsAgainstSuspiciousList(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	safeexec.ApplyWaitDelay(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		return
@@ -909,6 +934,7 @@ func (c *Checker) checkSuspiciousProcesses(ctx context.Context) {
 		c.addWarning("Failed to prepare 'ps' for process inspection: %v", err)
 		return
 	}
+	safeexec.ApplyWaitDelay(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		c.addWarning("Failed to execute 'ps' for process inspection: %v", err)
@@ -987,11 +1013,12 @@ func (c *Checker) shouldSkipOwnershipChecks(path string) bool {
 	}
 
 	target := filepath.Clean(path)
+	secondaryPath, secondaryLogPath := c.cfg.ActiveSecondaryPaths()
 	paths := []string{
 		c.cfg.BackupPath,
 		c.cfg.LogPath,
-		c.cfg.SecondaryPath,
-		c.cfg.SecondaryLogPath,
+		secondaryPath,
+		secondaryLogPath,
 	}
 
 	for _, candidate := range paths {
@@ -1112,9 +1139,7 @@ func extractPort(address string) (int, string) {
 	}
 
 	ip := addr[:lastColon]
-	if ip == "" {
-		ip = "0.0.0.0"
-	}
+	ip = cmp.Or(ip, "0.0.0.0")
 
 	return port, ip
 }
@@ -1171,8 +1196,8 @@ func matchesSafeProcessPattern(pattern, name string) bool {
 	// Exact or prefix match (case-insensitive)
 	lower := strings.ToLower(name)
 	pattern = strings.ToLower(pattern)
-	if strings.HasSuffix(pattern, "*") {
-		prefix := strings.TrimSuffix(pattern, "*")
+	if before, ok := strings.CutSuffix(pattern, "*"); ok {
+		prefix := before
 		return strings.HasPrefix(lower, prefix)
 	}
 	return lower == pattern
@@ -1192,7 +1217,7 @@ func commandLineMatches(signature, commandLine string) bool {
 		return false
 	}
 	usesPattern := strings.HasPrefix(sig, "regex:") || strings.Contains(sig, "*")
-	for _, tok := range strings.Fields(commandLine) {
+	for tok := range strings.FieldsSeq(commandLine) {
 		candidates := [2]string{tok, ""}
 		if base := filepath.Base(tok); base != tok {
 			candidates[1] = base
@@ -1350,9 +1375,7 @@ func (c *Checker) ensureOwnershipAndPermFromFD(f *os.File, info os.FileInfo, exp
 	}
 
 	path := f.Name()
-	if path == "" {
-		path = "<opened file>"
-	}
+	path = cmp.Or(path, "<opened file>")
 
 	var err error
 	if info == nil {
@@ -1415,9 +1438,7 @@ func (c *Checker) ensureExecutableOwnerWriteOnly(f *os.File, info os.FileInfo, d
 	}
 
 	path := f.Name()
-	if path == "" {
-		path = "<opened file>"
-	}
+	path = cmp.Or(path, "<opened file>")
 	fixed := perm &^ 0o022
 	c.bannerWarning(fmt.Sprintf("group/other-writable executable %s (current %o)", path, perm))
 	if c.cfg.AutoFixPermissions {

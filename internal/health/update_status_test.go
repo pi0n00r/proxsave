@@ -11,7 +11,7 @@ import (
 // leaves a pre-existing heartbeat intact (shared file, read-modify-write).
 func TestRecordUpdateRoundTrip(t *testing.T) {
 	base := t.TempDir()
-	if err := RecordPing(base, "self", KindHeartbeat, 500, true, nil); err != nil {
+	if err := RecordOutcomePing(base, "self", KindHeartbeat, 500, true, false, nil); err != nil {
 		t.Fatalf("seed heartbeat: %v", err)
 	}
 	if err := RecordUpdate(base, "self", 1234, true, "v9.9.9", true, nil); err != nil {
@@ -80,7 +80,7 @@ func TestLoadStatusToleratesOldFileWithoutUpdate(t *testing.T) {
 	base := t.TempDir()
 	path := StatusPath(base)
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		t.Fatalf("mkdir identity: %v", err)
+		t.Fatalf("mkdir daemon_state: %v", err)
 	}
 	old := `{"mode":"centralized","heartbeat":{"ts":777,"ok":true}}`
 	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {

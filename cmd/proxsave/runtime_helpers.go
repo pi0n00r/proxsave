@@ -1,9 +1,11 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,10 +22,11 @@ import (
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/orchestrator"
 	"github.com/tis24dev/proxsave/internal/safeexec"
+	"github.com/tis24dev/proxsave/internal/safefs"
 	"github.com/tis24dev/proxsave/internal/serverbot"
 	"github.com/tis24dev/proxsave/internal/storage"
 	"github.com/tis24dev/proxsave/internal/types"
-	"github.com/tis24dev/proxsave/pkg/utils"
+	"github.com/tis24dev/proxsave/internal/ui/theme"
 )
 
 type ExecInfo struct {
@@ -33,18 +36,8 @@ type ExecInfo struct {
 	HasBase  bool
 }
 
-var (
-	execInfo     = &ExecInfo{}
-	execInfoOnce = &sync.Once{}
-)
-
-func getExecInfo() ExecInfo {
-	execInfoOnce.Do(func() {
-		info := detectExecInfo()
-		execInfo = &info
-	})
-	return *execInfo
-}
+// getExecInfo detects the running executable once per process.
+var getExecInfo = sync.OnceValue(detectExecInfo)
 
 func detectExecInfo() ExecInfo {
 	candidates := collectExecPathCandidates()
@@ -202,8 +195,11 @@ func collectExecPathCandidates() []string {
 }
 
 func warnExecPathMissing() {
-	msg := "WARNING: Unable to determine proxsave/proxmox-backup executable path; symlink and cron setup skipped"
-	fmt.Fprintln(os.Stderr, msg)
+	// The stderr copy keeps the word: that stream has no level column, so the
+	// prefix is its only severity marker (same call as the JSON-mode stderr
+	// lines in main_config_modes). The logger line drops it - its column says it.
+	msg := "Unable to determine proxsave/proxmox-backup executable path; symlink and cron setup skipped"
+	fmt.Fprintln(os.Stderr, "WARNING: "+msg)
 	logging.Warning("%s", msg)
 }
 
@@ -291,6 +287,21 @@ func logMonitoringPortalLink(stats *orchestrator.BackupStats) {
 	}
 }
 
+// runHostnameWaitDelay bounds how long the "hostname -f" probe below waits, after
+// its own deadline has fired or the process has exited, for stdout to drain before
+// the pipe is force-closed and Wait is released. It is the reaping half of the
+// WithTimeout+WaitDelay pair, and without it the 2 second timeout below bounds
+// nothing: CommandContext kills the direct child, but Output waits on the PIPE, and
+// any grandchild that inherited stdout still holds it open. Measured at 20 seconds
+// on a "hostname" that forks a sleeper and exits at once, where the context never
+// even fires. This probe is the first statement of initializeRunLogFile, before the
+// run log file exists, so a stall here is invisible on every single run.
+//
+// 3s mirrors orchestrator.defaultCommandWaitDelay and storage.cloudExecWaitDelay,
+// so the worst case is 5 seconds rather than unbounded. A var, not a const, so a
+// test can shrink it, matching the idiom in cloud_timeout_test.go.
+var runHostnameWaitDelay = safeexec.CommandWaitDelay
+
 func resolveHostname() string {
 	if path, err := exec.LookPath("hostname"); err == nil {
 		cmdCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -298,6 +309,7 @@ func resolveHostname() string {
 
 		cmd, cmdErr := safeexec.TrustedCommandContext(cmdCtx, path, "-f")
 		if cmdErr == nil {
+			cmd.WaitDelay = runHostnameWaitDelay
 			if out, err := cmd.Output(); err == nil {
 				if fqdn := strings.TrimSpace(string(out)); fqdn != "" {
 					return fqdn
@@ -330,6 +342,7 @@ func validateFutureFeatures(cfg *config.Config) error {
 	if cfg.CloudEnabled && cfg.CloudRemote == "" {
 		logging.Warning("Cloud backup enabled but CLOUD_REMOTE is empty, disabling cloud storage for this run")
 		cfg.CloudEnabled = false
+		cfg.CloudStartupFailed = true
 		cfg.CloudRemote = ""
 		cfg.CloudLogPath = ""
 	}
@@ -344,6 +357,10 @@ func validateFutureFeatures(cfg *config.Config) error {
 	return nil
 }
 
+// detectFilesystemInfo runs the backend's filesystem detection and returns its error
+// as is: the caller decides what a failure means for that destination (fatal for the
+// Primary, "not initialized" for an unreachable cloud or a secondary directory that
+// cannot be created). The ownership consequence is printed by logStorageFilesystem.
 func detectFilesystemInfo(ctx context.Context, backend storage.Storage, path string, logger *logging.Logger) (*storage.FilesystemInfo, error) {
 	if backend == nil || !backend.IsEnabled() {
 		return nil, nil
@@ -351,22 +368,12 @@ func detectFilesystemInfo(ctx context.Context, backend storage.Storage, path str
 
 	fsInfo, err := backend.DetectFilesystem(ctx)
 	if err != nil {
-		if backend.IsCritical() {
-			return nil, err
-		}
-		logger.Debug("WARNING: %s filesystem detection failed: %v", backend.Name(), err)
-		if backend.Location() == storage.LocationCloud {
-			return nil, err
-		}
-		return nil, nil
+		logger.Debug("%s filesystem detection failed: %v", backend.Name(), err)
+		return nil, err
 	}
 
 	if !fsInfo.SupportsOwnership {
-		if backend != nil && backend.Location() == storage.LocationCloud {
-			logger.Debug("%s [%s] does not support ownership changes (cloud remote); chown/chmod already disabled", path, fsInfo.Type)
-		} else {
-			logger.Info("%s [%s] does not support ownership changes; chown/chmod will be skipped", path, fsInfo.Type)
-		}
+		logger.Debug("%s [%s] does not support ownership changes; chown/chmod will be skipped", path, fsInfo.Type)
 	}
 
 	return fsInfo, nil
@@ -385,8 +392,14 @@ func formatDetailedFilesystemLabel(path string, info *storage.FilesystemInfo) st
 	if cleanPath == "" {
 		return "disabled"
 	}
+	return fmt.Sprintf("%s -> Filesystem: %s", cleanPath, formatFilesystemDetail(info))
+}
+
+// formatFilesystemDetail is the value of the "  Filesystem:" fact line under a storage
+// path: the type, whether it takes ownership, [network] when it is one, and the mount.
+func formatFilesystemDetail(info *storage.FilesystemInfo) string {
 	if info == nil {
-		return fmt.Sprintf("%s -> Filesystem: unknown (detection unavailable)", cleanPath)
+		return "unknown (detection unavailable)"
 	}
 
 	ownership := "no ownership"
@@ -400,17 +413,77 @@ func formatDetailedFilesystemLabel(path string, info *storage.FilesystemInfo) st
 	}
 
 	mount := info.MountPoint
-	if mount == "" {
-		mount = "unknown"
+	mount = cmp.Or(mount, "unknown")
+
+	link := ""
+	if info.LinkTarget != "" {
+		link = " [link to: " + info.LinkTarget + "]"
 	}
 
-	return fmt.Sprintf("%s -> Filesystem: %s (%s)%s [mount: %s]",
-		cleanPath,
-		info.Type,
-		ownership,
-		network,
-		mount,
-	)
+	return fmt.Sprintf("%s (%s)%s [mount: %s]%s", info.Type, ownership, network, mount, link)
+}
+
+// logStoragePath opens a storage-init block: the path line, then the configuration
+// under it. "The path is read first, then checked": what the run finds there follows.
+// A GFS policy has no configuration line: its tiers are the facts the block closes on
+// (formatStorageInitSummary), and the configured limits stay in DEBUG.
+func logStoragePath(label, path string, cfg *config.Config, location storage.BackupLocation) {
+	cleanPath := strings.TrimSpace(path)
+	if cleanPath == "" {
+		logging.Info("Path %s: disabled", label)
+		return
+	}
+	logging.Info("Path %s: %s", label, cleanPath)
+	if rc := storage.NewRetentionConfigFromConfig(cfg, location); rc.Policy == "gfs" {
+		rc = storage.EffectiveGFSRetentionConfig(rc)
+		logging.Debug("storage init: %s retention policy=gfs daily=%d weekly=%d monthly=%d yearly=%d",
+			strings.ToLower(label), rc.Daily, rc.Weekly, rc.Monthly, rc.Yearly)
+	}
+	if line := formatRetentionPolicyLine(cfg, location); line != "" {
+		logging.Info("%s", line)
+	}
+}
+
+// formatRetentionPolicyLine is the configuration fact of a storage-init block, in the
+// words step [6] uses for the same policy. It is empty for GFS, which prints none.
+func formatRetentionPolicyLine(cfg *config.Config, location storage.BackupLocation) string {
+	rc := storage.NewRetentionConfigFromConfig(cfg, location)
+	if rc.Policy == "gfs" {
+		return ""
+	}
+	return fmt.Sprintf("  Retention policy: simple (keep %d newest)", rc.MaxBackups)
+}
+
+// logStorageFilesystem prints what the detection found, and returns the problem the
+// outcome has to name ("filesystem unknown") or "". detectErr is why the detection
+// fell back to an unknown filesystem.
+func logStorageFilesystem(info *storage.FilesystemInfo, detectErr error) string {
+	if info == nil || detectErr != nil {
+		cause := "unavailable"
+		if detectErr != nil {
+			cause = safefs.SystemErrorText(detectErr)
+		}
+		logging.Debug("storage init: filesystem detection failed: %v", detectErr)
+		logging.Info("  Filesystem: unknown, detection failed: %s", cause)
+		logging.Info("  Permissions: skipped, filesystem unknown")
+		return "filesystem unknown"
+	}
+	logging.Info("  Filesystem: %s", formatFilesystemDetail(info))
+	if !info.SupportsOwnership && info.Device != "cloud" {
+		logging.Info("  Permissions: skipped, no ownership")
+	}
+	return ""
+}
+
+// logStorageNotInitialized closes the block of a destination the run cannot use: the
+// cause when the caller has one to print, the "✗" outcome and the SKIP. causeLine is
+// printed as is ("  Directory not created: ...", "  Invalid CLOUD_REMOTE: ...").
+func logStorageNotInitialized(label, name, causeLine string) {
+	if causeLine != "" {
+		logging.Info("%s", causeLine)
+	}
+	logging.Warning("%s %s: not initialized", theme.SymbolError, name)
+	logging.Skip("Path %s: disabled", label)
 }
 
 func fetchStorageStats(ctx context.Context, backend storage.Storage, logger *logging.Logger, label string) *storage.StorageStats {
@@ -425,76 +498,106 @@ func fetchStorageStats(ctx context.Context, backend storage.Storage, logger *log
 	return stats
 }
 
-func formatStorageInitSummary(name string, cfg *config.Config, location storage.BackupLocation, stats *storage.StorageStats, backups []*types.BackupMetadata) string {
+// formatStorageInitSummary builds the lines that close a storage-init block, below the
+// path, the configuration and the filesystem lines, and returns whether its OUTCOME -
+// the last line - is a WARNING. The level used to travel inside the string as a
+// leading "⚠" that logStorageInitSummary read back with strings.HasPrefix, which made a
+// glyph that reads as decoration load-bearing: deleting it downgraded the line to INFO
+// in silence, dropping it from warningCount and from the exit-code promotion in
+// applyIssueExitCode. It is a value now, and the string carries no severity of its
+// own. The glyph STAYS on the line - it is part of how this screen reads - but nothing
+// downstream depends on it.
+//
+// With stats the block closes on the count and the outcome:
+//
+//	  Backups: 3
+//	✓ Secondary storage: initialized
+//
+// GFS lists the tiers under the count. Without stats the count is unknown and the
+// outcome is "⚠ <Name>: initialized, statistics unavailable"; problems the caller
+// found earlier in the block ("filesystem unknown") join the same outcome.
+func formatStorageInitSummary(name string, cfg *config.Config, location storage.BackupLocation, stats *storage.StorageStats, backups []*types.BackupMetadata, problems ...string) (string, bool) {
 	retentionConfig := storage.NewRetentionConfigFromConfig(cfg, location)
 	if retentionConfig.Policy == "gfs" {
 		retentionConfig = storage.EffectiveGFSRetentionConfig(retentionConfig)
 	}
 
+	var result string
 	if stats == nil {
-		reason := "unable to gather stats"
+		result = "  Backups: unknown, statistics unavailable"
+		problems = append(problems, "statistics unavailable")
+	} else {
+		result = fmt.Sprintf("  Backups: %d", stats.TotalBackups)
 		if retentionConfig.Policy == "gfs" {
-			return fmt.Sprintf("⚠ %s initialized with warnings (%s; GFS retention: daily=%d, weekly=%d, monthly=%d, yearly=%d)",
-				name, reason, retentionConfig.Daily, retentionConfig.Weekly,
-				retentionConfig.Monthly, retentionConfig.Yearly)
+			result += formatGFSTierLines(retentionConfig, stats.TotalBackups, backups)
 		}
-		return fmt.Sprintf("⚠ %s initialized with warnings (%s; retention %s)", name, reason, formatBackupNoun(retentionConfig.MaxBackups))
 	}
 
-	if retentionConfig.Policy == "gfs" {
-		result := fmt.Sprintf("✓ %s initialized (present %s)", name, formatBackupNoun(stats.TotalBackups))
-		if stats.TotalBackups > 0 && backups != nil && len(backups) > 0 {
-			classification := storage.ClassifyBackupsGFS(backups, retentionConfig)
-			gfsStats := storage.GetRetentionStats(classification)
-
-			total := stats.TotalBackups
-			kept := total - gfsStats[storage.CategoryDelete]
-
-			result += fmt.Sprintf("\n  Total: %d/-", total)
-			result += fmt.Sprintf("\n  Daily: %d/%d", gfsStats[storage.CategoryDaily], retentionConfig.Daily)
-			result += fmt.Sprintf("\n  Weekly: %d/%d", gfsStats[storage.CategoryWeekly], retentionConfig.Weekly)
-			result += fmt.Sprintf("\n  Monthly: %d/%d", gfsStats[storage.CategoryMonthly], retentionConfig.Monthly)
-			result += fmt.Sprintf("\n  Yearly: %d/%d", gfsStats[storage.CategoryYearly], retentionConfig.Yearly)
-			result += fmt.Sprintf("\n  Kept (est.): %d, To delete (est.): %d", kept, gfsStats[storage.CategoryDelete])
-		} else {
-			result += fmt.Sprintf("\n  Daily: 0/%d, Weekly: 0/%d, Monthly: 0/%d, Yearly: 0/%d",
-				retentionConfig.Daily, retentionConfig.Weekly,
-				retentionConfig.Monthly, retentionConfig.Yearly)
-		}
-		return result
+	if len(problems) > 0 {
+		result += fmt.Sprintf("\n%s %s: initialized, %s", theme.SymbolWarning, name, strings.Join(problems, ", "))
+		return result, true
 	}
+	result += fmt.Sprintf("\n%s %s: initialized", theme.SymbolSuccess, name)
+	return result, false
+}
 
-	result := fmt.Sprintf("✓ %s initialized (present %s)", name, formatBackupNoun(stats.TotalBackups))
-	result += fmt.Sprintf("\n  Policy: simple (keep %d newest)", retentionConfig.MaxBackups)
+// formatGFSTierLines are the GFS lines under "  Backups: <N>" of a storage-init block:
+// one per tier and the estimate (which logStorageInitSummary keeps at DEBUG), or the
+// single empty-tiers line when there is no backup. rc is the effective GFS policy.
+func formatGFSTierLines(rc storage.RetentionConfig, total int, backups []*types.BackupMetadata) string {
+	if total <= 0 || len(backups) == 0 {
+		return fmt.Sprintf("\n  Daily: 0/%d, Weekly: 0/%d, Monthly: 0/%d, Yearly: 0/%d",
+			rc.Daily, rc.Weekly, rc.Monthly, rc.Yearly)
+	}
+	classification := storage.ClassifyBackupsGFS(backups, rc)
+	gfsStats := storage.GetRetentionStats(classification)
+	kept := total - gfsStats[storage.CategoryDelete]
+	result := fmt.Sprintf("\n  Daily: %d/%d", gfsStats[storage.CategoryDaily], rc.Daily)
+	result += fmt.Sprintf("\n  Weekly: %d/%d", gfsStats[storage.CategoryWeekly], rc.Weekly)
+	result += fmt.Sprintf("\n  Monthly: %d/%d", gfsStats[storage.CategoryMonthly], rc.Monthly)
+	result += fmt.Sprintf("\n  Yearly: %d/%d", gfsStats[storage.CategoryYearly], rc.Yearly)
+	result += fmt.Sprintf("\n  Kept (est.): %d, To delete (est.): %d", kept, gfsStats[storage.CategoryDelete])
 	return result
 }
 
-func logStorageInitSummary(summary string) {
+// formatNotCheckedInitSummary closes the block of a cloud remote a dry run could not
+// check (listing not permitted, write test skipped): the facts formatStorageInitSummary
+// prints ("  Backups: ..."), then the outcome "⚠ <Name>: initialized, not checked" in
+// place of its own. The outcome is always a WARNING.
+func formatNotCheckedInitSummary(name string, cfg *config.Config, location storage.BackupLocation, stats *storage.StorageStats, backups []*types.BackupMetadata) (string, bool) {
+	summary, _ := formatStorageInitSummary(name, cfg, location, stats, backups)
+	facts := ""
+	if i := strings.LastIndex(summary, "\n"); i >= 0 {
+		facts = summary[:i+1]
+	}
+	return facts + fmt.Sprintf("%s %s: initialized, not checked", theme.SymbolWarning, name), true
+}
+
+// logStorageInitSummary prints a storage-init summary. warn selects the level of the
+// OUTCOME - the last non-empty line - and nothing else: the fact lines above it are
+// always Info, except the GFS estimate, which stays at Debug so it never reaches the
+// run footer. See formatStorageInitSummary for why the level is a parameter and not a
+// glyph read back out of the text.
+func logStorageInitSummary(summary string, warn bool) {
 	if summary == "" {
 		return
 	}
-	for _, line := range strings.Split(summary, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
+	lines := make([]string, 0, 8)
+	for line := range strings.SplitSeq(summary, "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
 		}
-		if strings.HasPrefix(trimmed, "⚠") {
-			logging.Warning("%s", line)
-			continue
-		}
-		if strings.Contains(trimmed, "Kept (est.):") {
+	}
+	for i, line := range lines {
+		switch {
+		case strings.Contains(line, "Kept (est.):"):
 			logging.Debug("%s", line)
-		} else {
+		case i == len(lines)-1 && warn:
+			logging.Warning("%s", line)
+		default:
 			logging.Info("%s", line)
 		}
 	}
-}
-
-func formatBackupNoun(n int) string {
-	if n == 1 {
-		return "1 backup"
-	}
-	return fmt.Sprintf("%d backups", n)
 }
 
 // cleanupGlobalProxmoxBackupEntrypoints performs a best-effort cleanup of any existing
@@ -525,7 +628,7 @@ func cleanupGlobalProxmoxBackupEntrypoints(execPath string, bootstrap *logging.B
 		// from the ones to remove, and ensureGoSymlink cannot recreate a
 		// replacement either. Removing here would leave the host with no working
 		// proxsave/proxmox-backup command, so do nothing.
-		logBootstrapWarning(bootstrap, "WARNING: current executable path is unknown; skipping proxsave/proxmox-backup entrypoint cleanup to avoid removing a working entrypoint that cannot be recreated")
+		logBootstrapWarning(bootstrap, "current executable path is unknown; skipping proxsave/proxmox-backup entrypoint cleanup to avoid removing a working entrypoint that cannot be recreated")
 		return
 	}
 
@@ -543,6 +646,14 @@ func cleanupGlobalProxmoxBackupEntrypoints(execPath string, bootstrap *logging.B
 	for _, dir := range filepath.SplitList(pathEnv) {
 		dir = strings.TrimSpace(dir)
 		if dir == "" {
+			continue
+		}
+		// A relative entry names a directory under wherever the installer was
+		// started, not a global entrypoint location: cleaning it would remove a
+		// symlink from the working directory. Go's own command lookup refuses
+		// relative PATH entries for the same reason.
+		if !filepath.IsAbs(dir) {
+			logBootstrapDebug(bootstrap, "Skipping relative PATH entry %q: only absolute directories are scanned for proxsave/proxmox-backup entrypoints", dir)
 			continue
 		}
 		for _, name := range names {
@@ -575,48 +686,12 @@ func cleanupGlobalProxmoxBackupEntrypoints(execPath string, bootstrap *logging.B
 		}
 		seen[cand] = struct{}{}
 
-		info, err := os.Lstat(cand)
-		if err != nil {
-			continue
-		}
-
-		// If this entry *is* the current Go executable, keep it.
-		if execPath != "" {
-			if cand == execPath {
-				bootstrap.Info("Keeping proxsave/proxmox-backup entrypoint (current Go binary): %s", cand)
-				kept++
-				continue
-			}
-			if info.Mode()&os.ModeSymlink != 0 {
-				if target, err := os.Readlink(cand); err == nil {
-					if !filepath.IsAbs(target) {
-						target = filepath.Join(filepath.Dir(cand), target)
-					}
-					if resolved, err := filepath.EvalSymlinks(target); err == nil && resolved == execPath {
-						bootstrap.Info("Keeping proxsave/proxmox-backup symlink pointing to Go binary: %s -> %s", cand, resolved)
-						kept++
-						continue
-					}
-				}
-			}
-		}
-
-		// cand is an existing entrypoint that does not resolve to the current Go
-		// binary. Only remove it if it is a SYMLINK (the form proxsave creates).
-		// A real file may be a distro/package-managed binary (e.g. a packaged
-		// /usr/bin/proxsave) that recreation never restores, so removing it would
-		// permanently break the command — leave it in place and log it.
-		if info.Mode()&os.ModeSymlink == 0 {
-			logBootstrapInfo(bootstrap, "Leaving %s in place: not a symlink created by proxsave (a real/package-managed file is never removed)", cand)
+		switch cleanupEntrypointCandidate(cand, execPath, bootstrap) {
+		case entrypointKept:
 			kept++
-			continue
+		case entrypointRemoved:
+			removed++
 		}
-		if err := os.Remove(cand); err != nil {
-			logBootstrapWarning(bootstrap, "WARNING: Failed to remove existing proxsave/proxmox-backup symlink %s: %v", cand, err)
-			continue
-		}
-		bootstrap.Info("Removed existing proxsave/proxmox-backup symlink: %s", cand)
-		removed++
 	}
 
 	if removed == 0 && kept == 0 {
@@ -626,10 +701,89 @@ func cleanupGlobalProxmoxBackupEntrypoints(execPath string, bootstrap *logging.B
 	}
 }
 
+// entrypointOutcome is what cleanupEntrypointCandidate did with one candidate.
+type entrypointOutcome int
+
+const (
+	// entrypointAbsent: nothing there, or its directory could not be opened.
+	entrypointAbsent entrypointOutcome = iota
+	entrypointKept
+	entrypointRemoved
+	// entrypointFailed: a stale symlink that could not be removed (warned).
+	entrypointFailed
+)
+
+// cleanupEntrypointCandidate inspects one candidate entrypoint path and keeps or
+// removes it. Every filesystem call goes through the candidate's directory opened
+// as an os.Root, with the bare entry name: the directory comes from PATH, and the
+// Lstat, Readlink and Remove all act on that one directory entry.
+func cleanupEntrypointCandidate(cand, execPath string, bootstrap *logging.BootstrapLogger) entrypointOutcome {
+	// os.OpenRoot opens its argument without O_DIRECTORY, so a PATH entry that is a FIFO
+	// would block until a writer comes. The trailing "/." makes the kernel resolve the
+	// entry as a directory first: anything else fails at once with ENOTDIR, as the plain
+	// Lstat of "<entry>/<name>" did.
+	root, err := os.OpenRoot(filepath.Dir(cand) + string(os.PathSeparator) + ".")
+	if err != nil {
+		return entrypointAbsent
+	}
+	defer func() { _ = root.Close() }()
+	name := filepath.Base(cand)
+
+	info, err := root.Lstat(name)
+	if err != nil {
+		return entrypointAbsent
+	}
+
+	// If this entry *is* the current Go executable, keep it.
+	if execPath != "" {
+		if cand == execPath {
+			bootstrap.Info("Keeping proxsave/proxmox-backup entrypoint (current Go binary): %s", cand)
+			return entrypointKept
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if target, err := root.Readlink(name); err == nil {
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(filepath.Dir(cand), target)
+				}
+				if resolved, err := filepath.EvalSymlinks(target); err == nil && resolved == execPath {
+					bootstrap.Info("Keeping proxsave/proxmox-backup symlink pointing to Go binary: %s -> %s", cand, resolved)
+					return entrypointKept
+				}
+			}
+		}
+	}
+
+	// cand is an existing entrypoint that does not resolve to the current Go
+	// binary. Only remove it if it is a SYMLINK (the form proxsave creates).
+	// A real file may be a distro/package-managed binary (e.g. a packaged
+	// /usr/bin/proxsave) that recreation never restores, so removing it would
+	// permanently break the command — leave it in place and log it.
+	if info.Mode()&os.ModeSymlink == 0 {
+		logBootstrapInfo(bootstrap, "Leaving %s in place: not a symlink created by proxsave (a real/package-managed file is never removed)", cand)
+		return entrypointKept
+	}
+	if err := root.Remove(name); err != nil {
+		logBootstrapWarning(bootstrap, "Failed to remove existing proxsave/proxmox-backup symlink %s: %v", cand, entrypointRemoveError(cand, err))
+		return entrypointFailed
+	}
+	bootstrap.Info("Removed existing proxsave/proxmox-backup symlink: %s", cand)
+	return entrypointRemoved
+}
+
+// entrypointRemoveError reports a failed root.Remove the way os.Remove does: the
+// os.Root error names only the bare entry, while the warning must name the full
+// path of the entry that could not be removed.
+func entrypointRemoveError(cand string, err error) error {
+	if pathErr, ok := errors.AsType[*os.PathError](err); ok {
+		return &os.PathError{Op: "remove", Path: cand, Err: pathErr.Err}
+	}
+	return err
+}
+
 func ensureGoSymlink(execPath string, bootstrap *logging.BootstrapLogger) {
 	execPath = strings.TrimSpace(execPath)
 	if execPath == "" {
-		logBootstrapWarning(bootstrap, "WARNING: Unable to update the proxsave entrypoint: executable path is unknown")
+		logBootstrapWarning(bootstrap, "Unable to update the proxsave entrypoint: executable path is unknown")
 		return
 	}
 
@@ -666,25 +820,25 @@ func installEntrypointSymlink(execPath, dest string, bootstrap *logging.Bootstra
 			// backup fails, refuse to replace it rather than clobber it.
 			backup, err := backupRealFile(dest)
 			if err != nil {
-				logBootstrapWarning(bootstrap, "WARNING: Not replacing real file %s: failed to back it up: %v", dest, err)
+				logBootstrapWarning(bootstrap, "Not replacing real file %s: failed to back it up: %v", dest, err)
 				return
 			}
-			logBootstrapWarning(bootstrap, "WARNING: Backed up existing real file %s to %s before installing the proxsave symlink", dest, backup)
+			logBootstrapWarning(bootstrap, "Backed up existing real file %s to %s before installing the proxsave symlink", dest, backup)
 		}
 	} else if !os.IsNotExist(err) {
-		logBootstrapWarning(bootstrap, "WARNING: Unable to inspect %s: %v", dest, err)
+		logBootstrapWarning(bootstrap, "Unable to inspect %s: %v", dest, err)
 		return
 	}
 
 	tmp := dest + ".proxsave-new"
 	_ = os.Remove(tmp) // clear any leftover from a previous interrupted run
 	if err := os.Symlink(execPath, tmp); err != nil {
-		logBootstrapWarning(bootstrap, "WARNING: Failed to create symlink %s -> %s: %v", dest, execPath, err)
+		logBootstrapWarning(bootstrap, "Failed to create symlink %s -> %s: %v", dest, execPath, err)
 		return
 	}
 	if err := os.Rename(tmp, dest); err != nil {
 		_ = os.Remove(tmp)
-		logBootstrapWarning(bootstrap, "WARNING: Failed to install symlink %s -> %s: %v", dest, execPath, err)
+		logBootstrapWarning(bootstrap, "Failed to install symlink %s -> %s: %v", dest, execPath, err)
 		return
 	}
 	logBootstrapInfo(bootstrap, "Created symlink: %s -> %s", dest, execPath)
@@ -732,7 +886,7 @@ func removeLegacyEntrypoint(dest string, bootstrap *logging.BootstrapLogger) {
 	info, err := os.Lstat(dest)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			logBootstrapWarning(bootstrap, "WARNING: Unable to inspect legacy entrypoint %s: %v", dest, err)
+			logBootstrapWarning(bootstrap, "Unable to inspect legacy entrypoint %s: %v", dest, err)
 		}
 		return
 	}
@@ -741,17 +895,20 @@ func removeLegacyEntrypoint(dest string, bootstrap *logging.BootstrapLogger) {
 		return
 	}
 	if err := os.Remove(dest); err != nil {
-		logBootstrapWarning(bootstrap, "WARNING: Failed to remove legacy entrypoint %s: %v", dest, err)
+		logBootstrapWarning(bootstrap, "Failed to remove legacy entrypoint %s: %v", dest, err)
 		return
 	}
 	logBootstrapInfo(bootstrap, "Removed legacy 'proxmox-backup' entrypoint: %s", dest)
 }
 
-func migrateLegacyCronEntries(ctx context.Context, baseDir, execPath string, bootstrap *logging.BootstrapLogger, cronSchedule string) {
+// migrateLegacyCronEntries rewrites the root crontab with a single proxsave entry at cronSchedule
+// and returns that entry with ok=true once crontab accepted the table; "" and false when it gave
+// up (each early return logs its WARNING) or the write failed.
+func migrateLegacyCronEntries(ctx context.Context, baseDir, execPath string, bootstrap *logging.BootstrapLogger, cronSchedule, configPath string) (written string, ok bool) {
 	execPath = strings.TrimSpace(execPath)
 	if execPath == "" {
-		logBootstrapWarning(bootstrap, "WARNING: Unable to update cron entry: executable path is unknown")
-		return
+		logBootstrapWarning(bootstrap, "Unable to update cron entry: executable path is unknown")
+		return "", false
 	}
 
 	newCommandToken := "/usr/local/bin/proxsave"
@@ -761,8 +918,8 @@ func migrateLegacyCronEntries(ctx context.Context, baseDir, execPath string, boo
 		// PBS binary and we must never schedule that as root in cron.
 		fallback := strings.TrimSpace(execPath)
 		if fallback == "" {
-			logBootstrapWarning(bootstrap, "WARNING: Unable to locate Go binary for cron migration")
-			return
+			logBootstrapWarning(bootstrap, "Unable to locate Go binary for cron migration")
+			return "", false
 		}
 		logBootstrapInfo(bootstrap, "proxsave symlink not found; falling back to %s for cron entries", fallback)
 		newCommandToken = fallback
@@ -773,6 +930,7 @@ func migrateLegacyCronEntries(ctx context.Context, baseDir, execPath string, boo
 		if err != nil {
 			return "", err
 		}
+		safeexec.ApplyWaitDelay(cmd)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			lower := strings.ToLower(string(output))
@@ -789,6 +947,13 @@ func migrateLegacyCronEntries(ctx context.Context, baseDir, execPath string, boo
 		if err != nil {
 			return err
 		}
+		// DELIBERATELY NOT safeexec.ApplyWaitDelay, unlike readCron above. See the note on
+		// crontabWriteLines in daemon_setup.go for the measurements. This writer establishes
+		// the cron fallback that replaces the daemon on install and on --daemon-remove. Both
+		// callers read the written line back and keep the daemon when it is not there, so a
+		// bound that killed a working descendant here would no longer strand the host
+		// unscheduled, but it would abandon a revert or an install whose write may well have
+		// landed.
 		cmd.Stdin = strings.NewReader(content)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
@@ -799,8 +964,8 @@ func migrateLegacyCronEntries(ctx context.Context, baseDir, execPath string, boo
 
 	current, err := readCron()
 	if err != nil {
-		logBootstrapWarning(bootstrap, "WARNING: Unable to inspect existing cron entries: %v", err)
-		return
+		logBootstrapWarning(bootstrap, "Unable to inspect existing cron entries: %v", err)
+		return "", false
 	}
 
 	normalized := strings.ReplaceAll(current, "\r\n", "\n")
@@ -818,24 +983,23 @@ func migrateLegacyCronEntries(ctx context.Context, baseDir, execPath string, boo
 	}
 
 	schedule := strings.TrimSpace(cronSchedule)
-	if schedule == "" {
-		schedule = "0 2 * * *"
-	}
+	schedule = cmp.Or(schedule, "0 2 * * *")
 
 	// (Re)install resets proxsave's schedule to the chosen one: every
 	// proxsave-managed entry is dropped and a single fresh entry is written at the
 	// chosen schedule, while unrelated operator cron lines are preserved. Upgrades
 	// no longer call this, so it only runs on install (CRON-INSTALL-002 /
 	// CRON-MIXED-001).
-	updatedLines := buildReinstallCronLines(lines, baseDir, correctPaths, schedule, newCommandToken, bootstrap)
+	updatedLines := buildReinstallCronLines(lines, baseDir, correctPaths, schedule, newCommandToken+cronConfigArgs(baseDir, configPath), bootstrap)
 
 	newCron := strings.Join(updatedLines, "\n") + "\n"
 	if err := writeCron(newCron); err != nil {
-		logBootstrapWarning(bootstrap, "WARNING: Failed to update cron entries: %v", err)
-		return
+		logBootstrapWarning(bootstrap, "Failed to update cron entries: %v", err)
+		return "", false
 	}
 
 	logBootstrapDebug(bootstrap, "Reinstalled proxsave cron entry at schedule %s: %s", schedule, newCommandToken)
+	return updatedLines[len(updatedLines)-1], true
 }
 
 // dropLegacyBashCronLines removes crontab lines whose command is the old Bash
@@ -950,16 +1114,60 @@ func repointLegacyCronLines(lines []string) ([]string, bool) {
 	out := make([]string, len(lines))
 	changed := false
 	for i, line := range lines {
-		if strings.Trim(cronCommandToken(line), "\"'") == legacy {
-			// cronCommandToken already excluded comments/env lines, and a schedule field
-			// is never a path, so the command is the first occurrence of legacy on the line.
-			out[i] = strings.Replace(line, legacy, canonical, 1)
-			changed = true
-			continue
+		tok := cronCommandToken(line)
+		if strings.Trim(tok, "\"'") == legacy {
+			// Replace the legacy path inside the command field itself, not its first
+			// occurrence on the line. A leading assignment is stepped over by
+			// cronCommandToken, so "TAG=/usr/local/bin/proxmox-backup.old
+			// /usr/local/bin/proxmox-backup --backup" reaches this branch with the legacy
+			// path appearing first inside TAG: replacing the first occurrence rewrote TAG
+			// and left the command on the symlink removed right after. The command field
+			// is located by cronFieldOffset: a schedule field is never a path, and an
+			// assignment contains '=' while the token does not, so no preceding field can
+			// equal it. Schedule, assignments, whitespace and arguments are byte-preserved.
+			//
+			// The assignment form is NOT repointed. The guard above is exact equality, so
+			// "BIN=/usr/local/bin/proxmox-backup $BIN --backup" fails it and the line is
+			// left alone: cronCommandWord answers with the whole assignment WORD for that
+			// shape, never with the path inside it. That line keeps pointing at the legacy
+			// symlink, which the upgrade removes right after this repoint, so it is left
+			// orphaned.
+			if at := cronFieldOffset(line, tok); at >= 0 {
+				out[i] = line[:at] + strings.Replace(tok, legacy, canonical, 1) + line[at+len(tok):]
+				changed = true
+				continue
+			}
 		}
 		out[i] = line
 	}
 	return out, changed
+}
+
+// cronFieldOffset returns the byte offset in line of the first whitespace-separated
+// field equal to word, splitting exactly as strings.Fields does (unicode.IsSpace), or -1
+// when no field equals it. It lets a caller edit one field in place while every other
+// byte of the line, whitespace included, stays as it was.
+func cronFieldOffset(line, word string) int {
+	if word == "" {
+		return -1
+	}
+	start := -1
+	for i, r := range line {
+		if unicode.IsSpace(r) {
+			if start >= 0 && line[start:i] == word {
+				return start
+			}
+			start = -1
+			continue
+		}
+		if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 && line[start:] == word {
+		return start
+	}
+	return -1
 }
 
 // repointLegacyCronEntries reads the crontab, repoints legacy proxmox-backup entries, and
@@ -988,16 +1196,44 @@ func repointLegacyCronEntries(ctx context.Context, bootstrap *logging.BootstrapL
 // entry at the chosen schedule. Unrelated operator lines, comments and blanks are
 // preserved. This deliberately resets proxsave's schedule to the chosen one
 // (CRON-INSTALL-002) and removes stale/duplicate entries (CRON-MIXED-001).
-func buildReinstallCronLines(lines []string, baseDir string, correctPaths []string, schedule, commandToken string, bootstrap *logging.BootstrapLogger) []string {
+func buildReinstallCronLines(lines []string, baseDir string, correctPaths []string, schedule, command string, bootstrap *logging.BootstrapLogger) []string {
 	lines = dropLegacyBashCronLines(lines, baseDir, bootstrap)
 	updated := filterCronLines(lines, correctPaths)
 	updated = dropCanonicalCronLines(updated, correctPaths)
 	// --backup pins the non-interactive behavior: even if a scheduler ever
 	// allocates a pty, the run can never land on the interactive dashboard.
-	return append(updated, fmt.Sprintf("%s %s --backup", schedule, commandToken))
+	token, configArgs, _ := strings.Cut(command, " ")
+	if configArgs != "" {
+		configArgs = " " + configArgs
+	}
+	return append(updated, fmt.Sprintf("%s %s --backup%s", schedule, token, configArgs))
 }
 
-func logBootstrapWarning(bootstrap *logging.BootstrapLogger, format string, args ...interface{}) {
+// cronConfigArgs returns the arguments that pin the cron run to configPath when it is
+// not the default BASE_DIR/configs/backup.env: no environment variable names the
+// config, so without them the cron run read the default file, not the one the
+// daemon or the install used. Empty for the default, so that line is unchanged.
+func cronConfigArgs(baseDir, configPath string) string {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" || filepath.Clean(configPath) == filepath.Join(baseDir, "configs", "backup.env") {
+		return ""
+	}
+	// cron turns an unescaped '%' into a newline and feeds the rest to stdin, quotes or
+	// not (crontab(5)): the shell then got "--config '/a" and stopped on an unterminated
+	// quote, so no backup ran. cron drops the backslash of "\%" and the shell sees '%'
+	// (measured with cron 3.0pl1-197).
+	return " --config " + strings.ReplaceAll(cronShellQuote(filepath.Clean(configPath)), "%", `\%`)
+}
+
+// cronShellQuote quotes a path for the shell cron runs the line with, when it needs it.
+func cronShellQuote(path string) string {
+	if !strings.ContainsAny(path, " \t'\"\\$`;&|<>()*?[]#~%") {
+		return path
+	}
+	return "'" + strings.ReplaceAll(path, "'", `'\''`) + "'"
+}
+
+func logBootstrapWarning(bootstrap *logging.BootstrapLogger, format string, args ...any) {
 	if bootstrap != nil {
 		bootstrap.Warning(format, args...)
 		return
@@ -1005,7 +1241,7 @@ func logBootstrapWarning(bootstrap *logging.BootstrapLogger, format string, args
 	logging.Warning(format, args...)
 }
 
-func logBootstrapInfo(bootstrap *logging.BootstrapLogger, format string, args ...interface{}) {
+func logBootstrapInfo(bootstrap *logging.BootstrapLogger, format string, args ...any) {
 	if bootstrap != nil {
 		bootstrap.Info(format, args...)
 		return
@@ -1013,7 +1249,7 @@ func logBootstrapInfo(bootstrap *logging.BootstrapLogger, format string, args ..
 	logging.Info(format, args...)
 }
 
-func logBootstrapDebug(bootstrap *logging.BootstrapLogger, format string, args ...interface{}) {
+func logBootstrapDebug(bootstrap *logging.BootstrapLogger, format string, args ...any) {
 	if bootstrap != nil {
 		bootstrap.Debug(format, args...)
 		return
@@ -1046,16 +1282,91 @@ func cronCommandToken(line string) string {
 	}
 
 	if strings.HasPrefix(first, "@") {
-		if len(fields) >= 2 {
-			return fields[1]
-		}
-		return ""
+		return cronCommandWordAt(fields, 1)
 	}
+	return cronCommandWordAt(fields, 5)
+}
 
-	if len(fields) <= 5 {
+// cronCommandWordAt is the command word of a crontab line whose command starts at
+// field n: 5 in the user format (1 after an @nickname), 6 in the system format (2), one
+// later for its USER field. Both extractors go through it: the system one took the field
+// as it was, so "root TZ=UTC /usr/local/bin/proxsave" in /etc/cron.d was invisible to the
+// duplicate-schedule checks while the same job in the root crontab was seen.
+func cronCommandWordAt(fields []string, n int) string {
+	if len(fields) <= n {
 		return ""
 	}
-	return fields[5]
+	return cronCommandWord(fields[n:])
+}
+
+// cronCommandWord picks the token to judge out of the words that follow the schedule.
+// cron accepts VAR=value in front of a job's command (TZ=, PATH=, LANG=): the shell runs
+// it as an assignment for that job only. It does not move the job's hour - cron(8) fires
+// every job in its own single timezone, from /etc/timezone - but it hides the command
+// behind it. Without this the whole line was invisible - to the detector, to the
+// removal, and to the schedule adoption alike.
+//
+// It is deliberately ADDITIVE, because four of this function's callers WRITE the root
+// crontab and a token invented here is a line ProxSave deletes. Every line that answers
+// something today keeps answering exactly that; the only new answers are for lines whose
+// real COMMAND is the one we were looking for:
+//
+//   - the first word is not an assignment: unchanged, it is the command;
+//   - the first word is an assignment whose value names the binary
+//     ("BIN=/usr/local/bin/proxsave $BIN --backup"): kept as the answer. That line really
+//     does run ProxSave and is removed as ours today; reporting "$BIN" instead would
+//     leave it in place and add a second entry beside it, which is #298 itself;
+//   - otherwise the assignments are stepped over and the command behind them answers.
+//
+// The step-over stops at the first assignment this parser cannot lex whole, and the line
+// then answers what it answers today. strings.Fields splits on the space inside
+// "MSG=hello\ proxsave /usr/bin/rsync", so the word after the assignment is the second
+// half of a VALUE and not a command at all: promoting it would name that job "proxsave"
+// and delete an operator's rsync entry.
+func cronCommandWord(words []string) string {
+	if !looksLikeEnvAssignment(words[0]) {
+		return words[0]
+	}
+	if commandTokenMatchesTarget(words[0]) {
+		return words[0]
+	}
+	i := 0
+	for i < len(words) && looksLikeEnvAssignment(words[i]) {
+		if !cronAssignmentIsWhole(words[i]) {
+			return words[0]
+		}
+		i++
+	}
+	if i == len(words) {
+		// Assignments and nothing else. cron would run no command, and there is no word
+		// here that is one.
+		return words[0]
+	}
+	return words[i]
+}
+
+// cronAssignmentIsWhole reports whether an assignment word carries its whole value, so
+// the word after it is the next WORD of the line rather than the rest of that value.
+// It answers no for the two ways a value reaches past a space: a trailing backslash
+// escaping it, and a quote left open. Nothing here interprets the value - the question is
+// only whether the line can be split at all.
+func cronAssignmentIsWhole(word string) bool {
+	inSingle, inDouble, escaped := false, false, false
+	for _, r := range word {
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch {
+		case r == '\\' && !inSingle:
+			escaped = true
+		case r == '\'' && !inDouble:
+			inSingle = !inSingle
+		case r == '"' && !inSingle:
+			inDouble = !inDouble
+		}
+	}
+	return !escaped && !inSingle && !inDouble
 }
 
 func looksLikeEnvAssignment(token string) bool {
@@ -1082,14 +1393,19 @@ func commandTokenMatchesTarget(token string) bool {
 }
 
 func fetchBackupList(ctx context.Context, backend storage.Storage) []*types.BackupMetadata {
-	listable, ok := backend.(interface {
-		List(context.Context) ([]*types.BackupMetadata, error)
-	})
-	if !ok {
+	// Called through the interface, not through a runtime type assertion.
+	// storage.Storage declares List and this parameter is already that type, so the
+	// assertion that used to sit here could never fail, while its !ok branch returned
+	// nil: any future rename or signature change on List would have degraded the
+	// startup summary to "no backups found" with a clean build and no log line.
+	//
+	// The nil check is what that assertion did as a side effect. No caller passes nil
+	// today, every one of the three bails on its constructor error first, but the
+	// assertion used to absorb a nil interface and this call would panic on one.
+	if backend == nil {
 		return nil
 	}
-
-	backups, err := listable.List(ctx)
+	backups, err := backend.List(ctx)
 	if err != nil {
 		return nil
 	}
@@ -1230,9 +1546,30 @@ func addPathExclusion(excludes []string, path string) []string {
 	return excludes
 }
 
+// dirCheckStat and dirCheckMkdirAll are the bounded operations of the directory
+// checks; only tests replace them.
+var (
+	dirCheckStat     = safefs.Stat
+	dirCheckMkdirAll = safefs.MkdirAll
+)
+
+// checkDirectory reports whether dirPath is a directory. A stat that does not answer
+// within timeout (a dead NFS/CIFS mount) is reported and gives answered=false: an
+// unbounded stat there blocked the run in the kernel before the lock and the storage
+// initialization, which would have disabled the secondary and kept the backup going.
+func checkDirectory(logger *logging.Logger, name, dirPath string, timeout time.Duration) (exists, answered bool) {
+	info, err := dirCheckStat(context.Background(), dirPath, timeout)
+	if errors.Is(err, safefs.ErrTimeout) {
+		logger.Debug("Directory check: stat of %s timed out after %s", dirPath, timeout)
+		logger.Warning("✗ %s not checked: %s did not answer within %s (dead/stale mount?)", name, dirPath, timeout)
+		return false, false
+	}
+	return err == nil && info.IsDir(), true
+}
+
 // ensureDirectoryExists verifies that dirPath exists and attempts to create it when missing.
 // All events are logged using the provided logger.
-func ensureDirectoryExists(logger *logging.Logger, name, path string) {
+func ensureDirectoryExists(logger *logging.Logger, name, path string, timeout time.Duration) {
 	if logger == nil {
 		return
 	}
@@ -1240,17 +1577,45 @@ func ensureDirectoryExists(logger *logging.Logger, name, path string) {
 	if dirPath == "" {
 		return
 	}
-	if utils.DirExists(dirPath) {
+	exists, answered := checkDirectory(logger, name, dirPath, timeout)
+	if !answered {
+		return
+	}
+	if exists {
 		logger.Info("✓ %s exists: %s", name, dirPath)
 		return
 	}
 
 	logger.Warning("✗ %s not found: %s", name, dirPath)
-	if err := os.MkdirAll(dirPath, defaultDirPerm); err != nil {
+	if err := dirCheckMkdirAll(context.Background(), dirPath, defaultDirPerm, timeout); err != nil {
 		logger.Warning("Failed to create %s: %v", dirPath, err)
 		return
 	}
 	logger.Info("%s created: %s", name, dirPath)
+}
+
+// reportDirectoryDryRun is ensureDirectoryExists for a dry run, which creates no
+// destination directory: a missing directory is reported with the line the checks use
+// ("[DRY RUN] Would create directory: <path>") and left missing.
+func reportDirectoryDryRun(logger *logging.Logger, name, path string, timeout time.Duration) {
+	if logger == nil {
+		return
+	}
+	dirPath := strings.TrimSpace(path)
+	if dirPath == "" {
+		return
+	}
+	exists, answered := checkDirectory(logger, name, dirPath, timeout)
+	if !answered {
+		return
+	}
+	if exists {
+		logger.Info("✓ %s exists: %s", name, dirPath)
+		return
+	}
+	logger.Warning("✗ %s not found: %s", name, dirPath)
+	logger.Debug("DRY RUN: %s %s is missing and is not created", name, dirPath)
+	logger.Info("[DRY RUN] Would create directory: %s", dirPath)
 }
 
 func isLocalPath(path string) bool {
@@ -1271,8 +1636,8 @@ func extractRemoteName(cloudRemote string) string {
 	if remote == "" {
 		return ""
 	}
-	if idx := strings.Index(remote, ":"); idx != -1 {
-		return remote[:idx]
+	if before, _, ok := strings.Cut(remote, ":"); ok {
+		return before
 	}
 	return remote
 }
